@@ -3,6 +3,7 @@ import base64
 import binascii
 import re
 import qbittorrentapi
+from requests import Response
 from .config import get_settings
 
 
@@ -21,6 +22,8 @@ class TorrentAlreadyExistsError(RuntimeError):
 
 class QbtService:
     _BTIH_PATTERN = re.compile(r"(^|[?&])xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})($|&)")
+    _LOGIN_SUCCESS_STATUSES = {200, 204}
+    _AUTH_COOKIE_NAMES = {"SID", "QBT_SID"}
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -34,7 +37,7 @@ class QbtService:
             REQUESTS_ARGS={"timeout": self.settings.qbt_request_timeout_seconds},
         )
         try:
-            client.auth_log_in()
+            self._log_in(client)
         except Exception as exc:
             raise RuntimeError(
                 "qBittorrent login failed "
@@ -42,12 +45,153 @@ class QbtService:
             ) from exc
         return client
 
+    def _log_in(self, client: qbittorrentapi.Client) -> str:
+        try:
+            login_response = self._post_auth_login(client)
+        except Exception as exc:
+            cookie_names = self._qbt_session_cookie_names(client)
+            raise RuntimeError(
+                "auth/login request failed "
+                f"(session_cookies={self._format_names(cookie_names)}): {self._format_exc(exc)}"
+            ) from exc
+
+        status_ok = login_response.status_code in self._LOGIN_SUCCESS_STATUSES
+        body = (login_response.text or "").strip()
+        body_ok = body == "Ok."
+        cookie_names = self._qbt_session_cookie_names(client)
+
+        version_response: Response | None = None
+        version_error: Exception | None = None
+        if status_ok:
+            try:
+                version_response = self._get_app_version_response(client)
+            except Exception as exc:
+                version_error = exc
+
+        version_ok = version_response is not None and version_response.status_code == 200
+        if status_ok and version_ok:
+            return (version_response.text or "").strip()
+
+        login_details = self._format_response(login_response)
+        if not status_ok:
+            raise RuntimeError(
+                "auth/login returned an unexpected HTTP status "
+                f"({login_details}, session_cookies={self._format_names(cookie_names)})"
+            )
+
+        if version_error is not None:
+            response = getattr(version_error, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if status_code in (401, 403) or not cookie_names:
+                raise RuntimeError(
+                    "auth/login did not produce a usable authenticated session "
+                    f"({login_details}, session_cookies={self._format_names(cookie_names)}, "
+                    f"app_version_check={self._format_exc(version_error)})"
+                ) from version_error
+            raise RuntimeError(
+                "auth/login returned a compatible response but app/version verification failed "
+                f"({login_details}, session_cookies={self._format_names(cookie_names)}, "
+                f"app_version_check={self._format_exc(version_error)})"
+            ) from version_error
+
+        version_details = self._format_response(version_response) if version_response is not None else "not attempted"
+        success_markers = []
+        if body_ok:
+            success_markers.append("body=Ok.")
+        if cookie_names:
+            success_markers.append(f"session_cookies={self._format_names(cookie_names)}")
+        raise RuntimeError(
+            "auth/login did not produce a verified qBittorrent session "
+            f"({login_details}, markers={self._format_names(success_markers)}, "
+            f"app_version_check={version_details})"
+        )
+
+    def _post_auth_login(self, client: qbittorrentapi.Client) -> Response:
+        client._initialize_context()
+        return client._request(
+            http_method="post",
+            api_namespace="auth",
+            api_method="login",
+            data={"username": self.settings.qbt_username, "password": self.settings.qbt_password},
+            response_class=Response,
+        )
+
     @staticmethod
-    def _format_exc(exc: Exception) -> str:
+    def _get_app_version_response(client: qbittorrentapi.Client) -> Response:
+        return client._request(
+            http_method="get",
+            api_namespace="app",
+            api_method="version",
+            response_class=Response,
+        )
+
+    @classmethod
+    def _format_exc(cls, exc: Exception) -> str:
         message = str(exc).strip()
         if message:
-            return f"{exc.__class__.__name__}: {message}"
-        return repr(exc)
+            formatted = f"{exc.__class__.__name__}: {message}"
+        else:
+            formatted = repr(exc)
+
+        response = getattr(exc, "response", None)
+        if response is not None:
+            formatted = f"{formatted} ({cls._format_response(response)})"
+        return formatted
+
+    @classmethod
+    def _format_response(cls, response: Response | None) -> str:
+        if response is None:
+            return "no response"
+
+        status = f"status={response.status_code}"
+        if response.reason:
+            status = f"{status} {response.reason}"
+
+        body = (response.text or "").strip()
+        body_detail = "body=<empty>" if not body else f"body={cls._truncate(body)!r}"
+        set_cookie_names = cls._cookie_names(getattr(response, "cookies", None))
+        if set_cookie_names:
+            return f"{status}, {body_detail}, set_cookie_names={cls._format_names(set_cookie_names)}"
+        return f"{status}, {body_detail}"
+
+    @classmethod
+    def _qbt_session_cookie_names(cls, client: qbittorrentapi.Client) -> list[str]:
+        session = getattr(client, "_http_session", None)
+        names = cls._cookie_names(getattr(session, "cookies", None))
+        return [name for name in names if cls._is_qbt_session_cookie_name(name)]
+
+    @classmethod
+    def _is_qbt_session_cookie_name(cls, name: str) -> bool:
+        return name in cls._AUTH_COOKIE_NAMES or name.startswith("QBT_SID_")
+
+    @staticmethod
+    def _cookie_names(cookie_jar) -> list[str]:
+        if cookie_jar is None:
+            return []
+
+        names: set[str] = set()
+        try:
+            for cookie in cookie_jar:
+                name = getattr(cookie, "name", None)
+                if name:
+                    names.add(str(name))
+        except TypeError:
+            pass
+
+        if not names and hasattr(cookie_jar, "keys"):
+            names.update(str(name) for name in cookie_jar.keys())
+        return sorted(names)
+
+    @staticmethod
+    def _format_names(names: list[str]) -> str:
+        return ", ".join(names) if names else "none"
+
+    @staticmethod
+    def _truncate(value: str, limit: int = 300) -> str:
+        compact = " ".join(value.split())
+        if len(compact) <= limit:
+            return compact
+        return f"{compact[:limit]}..."
 
     def add_torrent(self, magnet_uri: str, save_path: str, tags: list[str], category: str) -> None:
         client = self.client()
