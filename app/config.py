@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     qbt_password: str = "REPLACE_WITH_STRONG_PASSWORD"
     qbt_verify_certificate: bool = False
     qbt_request_timeout_seconds: int = 20
+    qbt_web_url: str | None = None
 
     intake_category: str = "intake"
     managed_tag: str = "torrent_intake"

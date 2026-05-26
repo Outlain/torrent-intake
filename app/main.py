@@ -131,6 +131,14 @@ def qbt_final_path_suggestions():
         raise HTTPException(status_code=502, detail=f"Failed to fetch qBittorrent path suggestions: {exc}") from exc
 
 
+@app.get("/qbt/transfer")
+def qbt_transfer_info():
+    try:
+        return service.qbt.transfer_info()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch qBittorrent transfer info: {exc}") from exc
+
+
 @app.get("/fs/final-path-suggestions")
 def fs_final_path_suggestions(prefix: str | None = Query(default=None)):
     try:

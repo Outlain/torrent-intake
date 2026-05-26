@@ -16,6 +16,7 @@ services:
       - TI_QBT_PASSWORD=REPLACE_WITH_STRONG_PASSWORD
       - TI_QBT_VERIFY_CERTIFICATE=false
       - TI_QBT_REQUEST_TIMEOUT_SECONDS=20
+      - TI_QBT_WEB_URL=http://localhost:8080
       - TI_INTAKE_CATEGORY=intake
       - TI_MANAGED_TAG=torrent_intake
       - TI_AUTO_CREATE_FINAL_CATEGORY=true

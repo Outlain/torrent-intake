@@ -179,6 +179,12 @@
       word-break: break-word;
     }
 
+    .meta-action {
+      display: inline-flex;
+      margin-top: 6px;
+      text-decoration: none;
+    }
+
     .form-panel {
       padding: 24px;
       margin-bottom: 0;
@@ -877,6 +883,18 @@
               <span class="meta-label">Local Free Buffer</span>
               <span class="meta-value">{{ settings.local_free_space_buffer_gib }} GiB</span>
             </div>
+            <div class="meta-card">
+              <span class="meta-label">qB Transfer</span>
+              <span id="qbt-transfer-summary" class="meta-value">Checking transfer status...</span>
+            </div>
+            <div class="meta-card">
+              <span class="meta-label">qB WebUI</span>
+              {% if settings.qbt_web_url %}
+                <a class="button-secondary meta-action" href="{{ settings.qbt_web_url }}" target="_blank" rel="noopener noreferrer">Open qBittorrent</a>
+              {% else %}
+                <span class="meta-value">Set TI_QBT_WEB_URL to show a browser-safe link.</span>
+              {% endif %}
+            </div>
           </div>
         </section>
       </details>
@@ -975,7 +993,7 @@
               </label>
             </div>
             <div class="jobs-toolbar-group">
-              <button id="retry-selected-button" class="button-secondary toolbar-button" type="button">Retry Selected</button>
+              <button id="retry-selected-button" class="button-secondary toolbar-button" type="button">Retry Failed Selected</button>
               <button id="move-selected-to-nas-button" class="button-secondary toolbar-button" type="button">Move Selected To NAS</button>
               <button id="delete-selected-button" class="button-secondary toolbar-button danger-soft" type="button">Delete Selected</button>
               <button id="retry-failed-button" class="button-secondary toolbar-button" type="button">Retry All Failed</button>
@@ -1030,6 +1048,7 @@
     const formStatus = document.getElementById('form-status');
     const submitButton = document.getElementById('submit-button');
     const refreshJobsButton = document.getElementById('refresh-jobs-button');
+    const qbtTransferSummary = document.getElementById('qbt-transfer-summary');
     const jobsMeta = document.getElementById('jobs-meta');
     const jobsToolbarStatus = document.getElementById('jobs-toolbar-status');
     const jobsTbody = document.getElementById('jobs-tbody');
@@ -1093,6 +1112,18 @@
 
     function formatFallback(value) {
       return value ? value : '-';
+    }
+
+    function formatBytes(value) {
+      if (!Number.isFinite(value) || value < 0) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+      let size = value;
+      let unitIndex = 0;
+      while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+      }
+      return unitIndex === 0 ? `${Math.round(size)} ${units[unitIndex]}` : `${size.toFixed(2)} ${units[unitIndex]}`;
     }
 
     async function readErrorDetail(response) {
@@ -1238,13 +1269,14 @@
 
     function countSelectedEligibleJobs(jobs) {
       const retryEligible = jobs.filter((job) => selectedJobIds.has(job.id) && job.state === 'error').length;
+      const retryIneligibleSelected = jobs.filter((job) => selectedJobIds.has(job.id) && job.state !== 'error').length;
       const moveNasEligible = jobs.filter(
         (job) => selectedJobIds.has(job.id) && job.state === 'waiting_for_local_space' && job.staging_actual === 'local'
       ).length;
       const deleteEligible = jobs.filter((job) => selectedJobIds.has(job.id) && job.is_terminal).length;
       const failedJobs = jobs.filter((job) => job.state === 'error').length;
       const completedJobs = jobs.filter((job) => ['done', 'infected_deleted'].includes(job.state)).length;
-      return { retryEligible, moveNasEligible, deleteEligible, failedJobs, completedJobs };
+      return { retryEligible, retryIneligibleSelected, moveNasEligible, deleteEligible, failedJobs, completedJobs };
     }
 
     function updateJobsToolbarState() {
@@ -1256,7 +1288,7 @@
       selectAllJobsCheckbox.checked = allVisibleSelected;
       selectAllJobsCheckbox.indeterminate = selectedVisibleCount > 0 && !allVisibleSelected;
 
-      const { retryEligible, moveNasEligible, deleteEligible, failedJobs, completedJobs } = countSelectedEligibleJobs(displayedJobs);
+      const { retryEligible, retryIneligibleSelected, moveNasEligible, deleteEligible, failedJobs, completedJobs } = countSelectedEligibleJobs(displayedJobs);
       retrySelectedButton.disabled = retryEligible === 0;
       moveSelectedToNasButton.disabled = moveNasEligible === 0;
       deleteSelectedButton.disabled = deleteEligible === 0;
@@ -1272,8 +1304,11 @@
       }
 
       if (!jobsToolbarFlashTimer) {
+        const skippedRetryText = retryIneligibleSelected
+          ? ` Retry only applies to intake error rows; ${retryIneligibleSelected} selected active/non-error row${retryIneligibleSelected === 1 ? '' : 's'} will be skipped.`
+          : '';
         setJobsToolbarStatus(
-          `${selectedVisibleCount} selected. Retry eligible: ${retryEligible}. Move-to-NAS eligible: ${moveNasEligible}. Delete eligible: ${deleteEligible}.`
+          `${selectedVisibleCount} selected. Retry eligible: ${retryEligible}. Move-to-NAS eligible: ${moveNasEligible}. Delete eligible: ${deleteEligible}.${skippedRetryText}`
         );
       }
     }
@@ -1331,6 +1366,23 @@
         const data = await pathsRes.json();
         knownFinalPaths = Array.isArray(data.paths) ? data.paths : [];
       } catch (error) {}
+    }
+
+    async function loadQbtTransferInfo() {
+      if (!qbtTransferSummary) return;
+      try {
+        const transferRes = await fetch('/qbt/transfer');
+        if (!transferRes.ok) throw new Error(await readErrorDetail(transferRes));
+        const transfer = await transferRes.json();
+        const downSpeed = formatBytes(Number(transfer.dl_info_speed || 0));
+        const upSpeed = formatBytes(Number(transfer.up_info_speed || 0));
+        const downTotal = formatBytes(Number(transfer.dl_info_data || 0));
+        const upTotal = formatBytes(Number(transfer.up_info_data || 0));
+        const status = transfer.connection_status ? ` · ${transfer.connection_status}` : '';
+        qbtTransferSummary.textContent = `Down ${downSpeed}/s · Up ${upSpeed}/s · Session ${downTotal} down / ${upTotal} up${status}`;
+      } catch (error) {
+        qbtTransferSummary.textContent = 'Transfer status unavailable.';
+      }
     }
 
     async function loadFinalPathSuggestions() {
@@ -1556,11 +1608,13 @@
       mobileHeroMediaQuery.addListener(syncHeroDetailsForViewport);
     }
 
+    loadQbtTransferInfo();
     Promise.all([loadCategories(), loadKnownFinalPaths()]).then(() => {
       loadFinalPathSuggestions();
       loadJobs();
       jobsRefreshTimer = setInterval(() => loadJobs({ silent: true }), 5000);
     });
+    setInterval(loadQbtTransferInfo, 10000);
   </script>
 </body>
 </html>

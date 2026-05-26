@@ -260,6 +260,21 @@ class QbtService:
     def list_torrents(self):
         return list(self.client().torrents_info())
 
+    def transfer_info(self) -> dict[str, object]:
+        response = self.client()._request(
+            http_method="get",
+            api_namespace="transfer",
+            api_method="info",
+            response_class=Response,
+        )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"invalid qBittorrent transfer info response: {self._format_response(response)}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"unexpected qBittorrent transfer info payload: {payload!r}")
+        return payload
+
     def pause(self, torrent_hash: str) -> None:
         self.client().torrents_pause(torrent_hashes=torrent_hash)
 

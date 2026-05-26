@@ -22,6 +22,22 @@ _ACTIVE_LONG_RUNNING_JOBS_LOCK = threading.Lock()
 
 class JobService:
     TERMINAL_STATES = {"done", "infected_deleted", "error"}
+    QBT_ERROR_STATES = {"error", "missingFiles"}
+    QBT_ATTENTION_STATES = {
+        "allocating",
+        "checkingDL",
+        "checkingResumeData",
+        "error",
+        "forcedMetaDL",
+        "metaDL",
+        "missingFiles",
+        "pausedDL",
+        "pausedUP",
+        "queuedDL",
+        "stalledDL",
+        "stalledUP",
+        "unknown",
+    }
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -169,6 +185,7 @@ class JobService:
 
             self._ensure_job_can_track_torrent(db, job, torrent)
             self._sync_job_from_torrent(job, torrent)
+            self._raise_for_qbt_error_state(torrent)
             self._apply_local_staging_policy(db, job, torrent)
             if job.state != "waiting_for_local_space":
                 job.state = self._state_for_retry(job, torrent)
@@ -190,6 +207,7 @@ class JobService:
             if existing_torrent is not None and tracked_job is None:
                 job.qbt_hash = getattr(existing_torrent, "hash", None) or exc.torrent_hash
                 self._sync_job_from_torrent(job, existing_torrent)
+                self._raise_for_qbt_error_state(existing_torrent)
                 self._apply_local_staging_policy(db, job, existing_torrent)
                 if job.state != "waiting_for_local_space":
                     job.state = self._state_for_retry(job, existing_torrent)
@@ -407,6 +425,10 @@ class JobService:
                 torrent = torrents_by_unique_tag.get(job.unique_tag)
             if torrent is None:
                 continue
+
+            qbt_state = getattr(torrent, "state", None)
+            if qbt_state:
+                job.last_seen_qbt_state = str(qbt_state)
 
             progress = getattr(torrent, "progress", None)
             if isinstance(progress, (int, float)):
@@ -730,6 +752,7 @@ class JobService:
 
         qbt_state = getattr(torrent, "state", None)
         self._sync_job_from_torrent(job, torrent)
+        self._raise_for_qbt_error_state(torrent)
 
         self._apply_local_staging_policy(db, job, torrent)
 
@@ -836,10 +859,13 @@ class JobService:
         return " ".join(parts[:2])
 
     def _build_activity_summary(self, job: Job, torrent) -> str | None:
-        qbt_state = getattr(torrent, "state", None) or job.last_seen_qbt_state or job.state
+        qbt_state = str(getattr(torrent, "state", None) or job.last_seen_qbt_state or job.state or "")
         is_complete = isinstance(job.progress, float) and job.progress >= 1.0
+        eta_is_infinite = isinstance(job.eta_seconds, int) and job.eta_seconds >= 8640000
         upload_states = {"uploading", "stalledUP", "forcedUP", "pausedUP", "queuedUP"}
         parts: list[str] = []
+        if qbt_state in self.QBT_ATTENTION_STATES or eta_is_infinite:
+            parts.append(f"qB {qbt_state}")
         if isinstance(job.progress, float):
             parts.append(f"{job.progress * 100:.2f}%")
         if isinstance(job.download_speed_bytes_per_s, int) and not is_complete:
@@ -854,8 +880,19 @@ class JobService:
         if parts:
             return " | ".join(parts)
         if qbt_state:
-            return str(qbt_state)
+            return f"qB {qbt_state}"
         return None
+
+    def _raise_for_qbt_error_state(self, torrent) -> None:
+        qbt_state = str(getattr(torrent, "state", "") or "")
+        if qbt_state not in self.QBT_ERROR_STATES:
+            return
+        torrent_name = getattr(torrent, "name", None) or "unknown torrent"
+        torrent_hash = getattr(torrent, "hash", None) or "unknown hash"
+        raise RuntimeError(
+            f"qBittorrent torrent '{torrent_name}' ({torrent_hash}) is in state '{qbt_state}'. "
+            "Fix it in qBittorrent or delete the qBittorrent torrent, then retry the intake job."
+        )
 
     def _try_acquire_long_running_job(self, job_id: str) -> bool:
         with _ACTIVE_LONG_RUNNING_JOBS_LOCK:

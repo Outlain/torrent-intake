@@ -49,6 +49,7 @@ Copy `.env.example` to `.env` and set values for your environment.
 | `TI_QBT_USERNAME` | Yes | qBittorrent username |
 | `TI_QBT_PASSWORD` | Yes | qBittorrent password |
 | `TI_QBT_VERIFY_CERTIFICATE` | Yes | TLS cert verification for qBittorrent |
+| `TI_QBT_WEB_URL` | No | Browser-facing qBittorrent WebUI link shown in the intake UI |
 | `TI_AUTO_CREATE_FINAL_CATEGORY` | Yes | If `true`, create missing final category in qBittorrent |
 | `TI_LOCAL_STAGING_ROOT` | Yes | Must be `/staging-local` in container |
 | `TI_NAS_STAGING_ROOT` | Yes | Usually `/downloads/torrent-intake/staging` |
