@@ -5,6 +5,14 @@ from pydantic import BaseModel, Field, field_validator
 from .config import get_settings
 
 
+BTIH_PATTERN = re.compile(r"(^|[?&])xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})($|&)", re.IGNORECASE)
+MAGNET_URI_PATTERN = re.compile(r"magnet:\?(?:(?!\s|magnet:\?).)+", re.IGNORECASE)
+
+
+def extract_magnet_uris(value: str) -> list[str]:
+    return [match.group(0).strip().rstrip("),];>") for match in MAGNET_URI_PATTERN.finditer(value or "")]
+
+
 class JobCreate(BaseModel):
     magnet_uri: str = Field(min_length=10)
     final_parent: str = Field(min_length=2)
@@ -25,13 +33,20 @@ class JobCreate(BaseModel):
     @field_validator("magnet_uri")
     @classmethod
     def validate_magnet(cls, value: str) -> str:
-        if not value.startswith("magnet:?"):
+        magnets = extract_magnet_uris(value)
+        if len(magnets) > 1:
+            raise ValueError("submit multiple magnet links through /jobs/bulk so each torrent gets its own intake job")
+        value = magnets[0] if magnets else value.strip()
+        if not value.lower().startswith("magnet:?"):
             raise ValueError("Only magnet links are supported in this MVP")
         # Require a plausible BTIH hash to avoid opaque downstream qBittorrent errors.
-        pattern = re.compile(r"(^|[?&])xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})($|&)")
-        if not pattern.search(value):
+        if not BTIH_PATTERN.search(value):
             raise ValueError("magnet_uri must include a valid xt=urn:btih hash")
         return value
+
+
+class JobBatchCreate(BaseModel):
+    jobs: list[JobCreate] = Field(min_length=1, max_length=50)
 
 
 class JobOut(BaseModel):
@@ -79,6 +94,14 @@ class JobBulkResult(BaseModel):
     processed_ids: list[str] = Field(default_factory=list)
     skipped_ids: list[str] = Field(default_factory=list)
     failed_ids: list[str] = Field(default_factory=list)
+    errors: dict[str, str] = Field(default_factory=dict)
+
+
+class JobBatchCreateResult(BaseModel):
+    requested: int
+    created: int
+    failed: int
+    jobs: list[JobOut] = Field(default_factory=list)
     errors: dict[str, str] = Field(default_factory=dict)
 
 

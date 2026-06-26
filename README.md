@@ -16,6 +16,8 @@ Given a magnet link and a final destination path, the app:
 6. Promotes clean torrents to the requested final destination.
 7. Sends Telegram notifications only for malware detection/deletion events.
 
+Bulk intake is supported from the UI textarea: paste multiple magnet links, review the detected rows, and either apply the same destination/category/staging settings to every torrent or edit them per row. The single-job `POST /jobs` endpoint rejects multi-magnet blobs; use `POST /jobs/bulk` so each magnet gets its own DB job, qBittorrent tag, and tracking lifecycle.
+
 ## Security Model
 
 - Default staging mode is local staging at `/staging-local`.
@@ -111,6 +113,7 @@ See `portainer-stack.example.yml` and adjust host paths, qBittorrent endpoint, a
 ## API Summary
 
 - `POST /jobs` submit intake job
+- `POST /jobs/bulk` submit 1-50 individually tracked intake jobs
 - `GET /jobs` list jobs
 - `GET /jobs/{job_id}` job detail
 - `POST /jobs/{job_id}/retry` retry errored job
@@ -131,6 +134,27 @@ Example job request:
   "final_parent": "/downloads/Movies",
   "final_category": "movies",
   "staging_preference": "local"
+}
+```
+
+Example bulk job request:
+
+```json
+{
+  "jobs": [
+    {
+      "magnet_uri": "magnet:?xt=urn:btih:...",
+      "final_parent": "/downloads/Movies",
+      "final_category": "movies",
+      "staging_preference": "local"
+    },
+    {
+      "magnet_uri": "magnet:?xt=urn:btih:...",
+      "final_parent": "/downloads/Shows",
+      "final_category": "tv",
+      "staging_preference": "nas"
+    }
+  ]
 }
 ```
 

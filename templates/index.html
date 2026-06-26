@@ -425,6 +425,132 @@
       color: var(--danger);
     }
 
+    .bulk-dialog {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: rgba(4, 8, 13, 0.72);
+      backdrop-filter: blur(10px);
+    }
+
+    .bulk-dialog[hidden] {
+      display: none;
+    }
+
+    .bulk-dialog-panel {
+      width: min(1180px, calc(100vw - 32px));
+      max-height: min(86vh, 900px);
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      overflow: hidden;
+      background: rgba(13, 21, 33, 0.98);
+    }
+
+    .bulk-dialog-head,
+    .bulk-dialog-controls,
+    .bulk-dialog-actions {
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .bulk-dialog-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .bulk-dialog-title {
+      margin: 0 0 6px;
+      font-size: 1.25rem;
+      letter-spacing: -0.03em;
+    }
+
+    .bulk-dialog-copy,
+    .bulk-dialog-status {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .bulk-dialog-close {
+      min-width: 42px;
+      min-height: 42px;
+      padding: 0;
+      border-radius: 999px;
+    }
+
+    .bulk-dialog-controls {
+      display: grid;
+      gap: 12px;
+    }
+
+    .bulk-same-toggle {
+      width: fit-content;
+      max-width: 100%;
+    }
+
+    .bulk-list {
+      display: grid;
+      gap: 12px;
+      padding: 18px 20px;
+      overflow-y: auto;
+    }
+
+    .bulk-row {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.35fr) minmax(160px, 0.75fr) minmax(120px, 0.55fr);
+      gap: 10px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .bulk-row-magnet {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+
+    .bulk-row-magnet strong {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--ink);
+      font-size: 0.9rem;
+    }
+
+    .bulk-row-field {
+      display: grid;
+      gap: 7px;
+    }
+
+    .bulk-row-field span {
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .bulk-dialog-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-top: 1px solid var(--line);
+      border-bottom: none;
+    }
+
+    .bulk-dialog-status.error {
+      color: var(--danger);
+    }
+
     .jobs-panel {
       padding: 22px 24px 24px;
     }
@@ -788,6 +914,32 @@
       .toolbar-button {
         width: 100%;
       }
+
+      .bulk-dialog {
+        padding: 10px;
+      }
+
+      .bulk-dialog-panel {
+        width: calc(100vw - 20px);
+        max-height: 92vh;
+      }
+
+      .bulk-dialog-head,
+      .bulk-dialog-controls,
+      .bulk-dialog-actions,
+      .bulk-list {
+        padding: 14px;
+      }
+
+      .bulk-dialog-close {
+        width: 42px;
+        flex: 0 0 auto;
+        justify-self: end;
+      }
+
+      .bulk-row {
+        grid-template-columns: 1fr;
+      }
     }
 
     @media (min-width: 1520px) {
@@ -908,7 +1060,7 @@
             <label class="field-wide">
               <span>Magnet Link</span>
               <textarea id="magnet-input" class="mono" name="magnet_uri" placeholder="magnet:?xt=urn:btih:..." spellcheck="false" required></textarea>
-              <span class="hint">Large magnets stay visible here so malformed trackers or truncated hashes are easier to spot.</span>
+              <span class="hint">Paste one magnet, or paste multiple magnet links on separate lines to review and add them as individually tracked jobs.</span>
             </label>
 
             <label class="field-wide">
@@ -968,6 +1120,32 @@
         <datalist id="final-parent-suggestions"></datalist>
       </div>
     </div>
+
+    <section id="bulk-dialog" class="bulk-dialog" aria-labelledby="bulk-dialog-title" hidden>
+      <div class="bulk-dialog-panel panel" role="dialog" aria-modal="true">
+        <div class="bulk-dialog-head">
+          <div>
+            <h2 id="bulk-dialog-title" class="bulk-dialog-title">Review Bulk Intake</h2>
+            <p id="bulk-dialog-copy" class="bulk-dialog-copy">Multiple magnet links were detected. Each row will become its own tracked intake job.</p>
+          </div>
+          <button id="bulk-dialog-close" class="button-secondary bulk-dialog-close" type="button" aria-label="Close bulk review">×</button>
+        </div>
+        <div class="bulk-dialog-controls">
+          <label class="bulk-toggle bulk-same-toggle">
+            <input id="bulk-use-same-settings" type="checkbox" checked>
+            <span>Use the form destination, category, and staging choice for every torrent</span>
+          </label>
+        </div>
+        <div id="bulk-list" class="bulk-list"></div>
+        <div class="bulk-dialog-actions">
+          <span id="bulk-dialog-status" class="bulk-dialog-status"></span>
+          <div class="jobs-toolbar-group">
+            <button id="bulk-dialog-cancel" class="button-secondary toolbar-button" type="button">Cancel</button>
+            <button id="bulk-dialog-submit" class="button-primary toolbar-button" type="button">Add Bulk Torrents</button>
+          </div>
+        </div>
+      </div>
+    </section>
 
     <div class="panel jobs-panel">
         <div class="jobs-head">
@@ -1039,6 +1217,7 @@
 
   <script>
     const heroDetails = document.getElementById('hero-details');
+    const jobForm = document.getElementById('job-form');
     const finalParentInput = document.getElementById('final-parent-input');
     const finalCategoryInput = document.getElementById('final-category-input');
     const finalCategoryCombo = document.getElementById('final-category-combo');
@@ -1060,13 +1239,24 @@
     const deleteSelectedButton = document.getElementById('delete-selected-button');
     const clearCompletedButton = document.getElementById('clear-completed-button');
     const clearFailedButton = document.getElementById('clear-failed-button');
+    const bulkDialog = document.getElementById('bulk-dialog');
+    const bulkDialogCopy = document.getElementById('bulk-dialog-copy');
+    const bulkDialogClose = document.getElementById('bulk-dialog-close');
+    const bulkDialogCancel = document.getElementById('bulk-dialog-cancel');
+    const bulkDialogSubmit = document.getElementById('bulk-dialog-submit');
+    const bulkDialogStatus = document.getElementById('bulk-dialog-status');
+    const bulkUseSameSettings = document.getElementById('bulk-use-same-settings');
+    const bulkList = document.getElementById('bulk-list');
     const defaultFinalParentPrefix = finalParentInput.dataset.defaultPrefix || '/downloads';
+    const magnetUriPattern = /magnet:\?(?:(?!\s|magnet:\?).)+/gi;
+    const btihPattern = /(^|[?&])xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})($|&)/i;
 
     let knownFinalPaths = [];
     let knownCategories = [];
     let latestJobs = [];
     let selectedJobIds = new Set();
     let jobsSortOrder = 'newest';
+    let pendingBulkMagnets = [];
     let jobsToolbarFlashTimer = null;
     let finalPathTimer = null;
     let jobsRefreshTimer = null;
@@ -1138,6 +1328,224 @@
 
       const text = await response.text();
       return text || `HTTP ${response.status}`;
+    }
+
+    function sanitizeMagnetUri(value) {
+      return String(value || '').trim().replace(/[),;\]>]+$/g, '');
+    }
+
+    function extractBtih(magnetUri) {
+      const match = String(magnetUri || '').match(btihPattern);
+      return match ? match[2].toLowerCase() : '';
+    }
+
+    function parseMagnetInput(rawValue) {
+      const magnets = [];
+      const invalidLines = [];
+      const invalidHashLines = [];
+      const duplicateLines = [];
+      const seenMagnets = new Set();
+      const lines = String(rawValue || '').split(/\r?\n/);
+
+      lines.forEach((line, lineIndex) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+
+        const matches = [...trimmed.matchAll(magnetUriPattern)].map((match) => sanitizeMagnetUri(match[0]));
+        if (matches.length === 0) {
+          invalidLines.push(lineIndex + 1);
+          return;
+        }
+
+        matches.forEach((magnetUri) => {
+          if (!btihPattern.test(magnetUri)) {
+            invalidHashLines.push(lineIndex + 1);
+            return;
+          }
+          const infoHash = extractBtih(magnetUri);
+          const duplicateKey = infoHash || magnetUri.toLowerCase();
+          if (seenMagnets.has(duplicateKey)) {
+            duplicateLines.push(lineIndex + 1);
+            return;
+          }
+          seenMagnets.add(duplicateKey);
+          magnets.push({ uri: magnetUri, line: lineIndex + 1, infoHash });
+        });
+      });
+
+      return {
+        magnets,
+        invalidLines: [...new Set(invalidLines)],
+        invalidHashLines: [...new Set(invalidHashLines)],
+        duplicateLines: [...new Set(duplicateLines)],
+      };
+    }
+
+    function describeMagnet(magnet) {
+      const nameMatch = magnet.uri.match(/(?:^|[?&])dn=([^&]+)/i);
+      if (!nameMatch) return magnet.infoHash ? `BTIH ${magnet.infoHash}` : `Line ${magnet.line}`;
+      try {
+        return decodeURIComponent(nameMatch[1].replace(/\+/g, ' '));
+      } catch (error) {
+        return nameMatch[1];
+      }
+    }
+
+    function getFormSettings() {
+      const form = new FormData(jobForm);
+      const finalCategory = String(form.get('final_category') || '').trim();
+      return {
+        final_parent: String(form.get('final_parent') || '').trim(),
+        final_category: finalCategory || null,
+        staging_preference: String(form.get('staging_preference') || 'local'),
+      };
+    }
+
+    function setBulkDialogStatus(message, isError = false) {
+      bulkDialogStatus.textContent = message || '';
+      bulkDialogStatus.classList.toggle('error', Boolean(isError));
+    }
+
+    function closeBulkDialog() {
+      bulkDialog.hidden = true;
+      pendingBulkMagnets = [];
+      bulkList.innerHTML = '';
+      setBulkDialogStatus('');
+    }
+
+    function syncBulkSettingsMode() {
+      const useSameSettings = bulkUseSameSettings.checked;
+      bulkList.querySelectorAll('.bulk-final-parent, .bulk-final-category, .bulk-staging-preference').forEach((field) => {
+        field.disabled = useSameSettings;
+      });
+    }
+
+    function createBulkRow(magnet, index, settings) {
+      const row = document.createElement('div');
+      row.className = 'bulk-row';
+      row.dataset.index = String(index);
+
+      const magnetCell = document.createElement('div');
+      magnetCell.className = 'bulk-row-magnet mono';
+      const title = document.createElement('strong');
+      title.textContent = `${index + 1}. ${describeMagnet(magnet)}`;
+      const detail = document.createElement('span');
+      detail.textContent = `Line ${magnet.line}${magnet.infoHash ? ` · ${magnet.infoHash}` : ''}`;
+      magnetCell.append(title, detail);
+      row.appendChild(magnetCell);
+
+      const pathLabel = document.createElement('label');
+      pathLabel.className = 'bulk-row-field';
+      pathLabel.innerHTML = '<span>Final Parent Path</span>';
+      const pathInput = document.createElement('input');
+      pathInput.className = 'bulk-final-parent mono';
+      pathInput.type = 'text';
+      pathInput.value = settings.final_parent;
+      pathInput.setAttribute('list', 'final-parent-suggestions');
+      pathLabel.appendChild(pathInput);
+      row.appendChild(pathLabel);
+
+      const categoryLabel = document.createElement('label');
+      categoryLabel.className = 'bulk-row-field';
+      categoryLabel.innerHTML = '<span>Category</span>';
+      const categoryInput = document.createElement('input');
+      categoryInput.className = 'bulk-final-category';
+      categoryInput.type = 'text';
+      categoryInput.value = settings.final_category || '';
+      categoryLabel.appendChild(categoryInput);
+      row.appendChild(categoryLabel);
+
+      const stagingLabel = document.createElement('label');
+      stagingLabel.className = 'bulk-row-field';
+      stagingLabel.innerHTML = '<span>Staging</span>';
+      const stagingSelect = document.createElement('select');
+      stagingSelect.className = 'bulk-staging-preference';
+      ['local', 'nas'].forEach((value) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = value === 'local' ? 'Local' : 'NAS';
+        option.selected = value === settings.staging_preference;
+        stagingSelect.appendChild(option);
+      });
+      stagingLabel.appendChild(stagingSelect);
+      row.appendChild(stagingLabel);
+
+      return row;
+    }
+
+    function openBulkDialog(magnets) {
+      pendingBulkMagnets = magnets;
+      const settings = getFormSettings();
+      bulkDialogCopy.textContent = `${magnets.length} magnet links were detected. Each row will become its own tracked intake job.`;
+      bulkUseSameSettings.checked = true;
+      bulkList.innerHTML = '';
+      magnets.forEach((magnet, index) => {
+        bulkList.appendChild(createBulkRow(magnet, index, settings));
+      });
+      syncBulkSettingsMode();
+      setBulkDialogStatus('Using the current form settings for every torrent. Uncheck the option above to edit rows individually.');
+      bulkDialog.hidden = false;
+      bulkDialogSubmit.focus();
+    }
+
+    function buildBulkPayload() {
+      const sharedSettings = getFormSettings();
+      const useSameSettings = bulkUseSameSettings.checked;
+      const jobs = pendingBulkMagnets.map((magnet, index) => {
+        if (useSameSettings) {
+          return { magnet_uri: magnet.uri, ...sharedSettings };
+        }
+
+        const row = bulkList.querySelector(`.bulk-row[data-index="${index}"]`);
+        const finalParent = row.querySelector('.bulk-final-parent').value.trim();
+        const finalCategory = row.querySelector('.bulk-final-category').value.trim();
+        const stagingPreference = row.querySelector('.bulk-staging-preference').value;
+        return {
+          magnet_uri: magnet.uri,
+          final_parent: finalParent,
+          final_category: finalCategory || null,
+          staging_preference: stagingPreference,
+        };
+      });
+      return { jobs };
+    }
+
+    function formatBatchErrors(errors) {
+      return Object.entries(errors || {})
+        .slice(0, 4)
+        .map(([index, message]) => `#${index}: ${message}`)
+        .join(' | ');
+    }
+
+    async function submitBulkDialog() {
+      const payload = buildBulkPayload();
+      bulkDialogSubmit.disabled = true;
+      setBulkDialogStatus('Adding torrents as individually tracked jobs...');
+      try {
+        const result = await postJson('/jobs/bulk', payload);
+        const failedIndexes = Object.keys(result.errors || {}).map((index) => Number(index) - 1);
+        if (result.failed > 0) {
+          const failedMagnets = failedIndexes
+            .map((index) => pendingBulkMagnets[index]?.uri)
+            .filter(Boolean);
+          magnetInput.value = failedMagnets.join('\n');
+          const detail = formatBatchErrors(result.errors);
+          setFormStatus(
+            `Bulk submit: ${result.created || 0} created, ${result.failed || 0} failed. Failed magnets were left in the textarea.${detail ? ` ${detail}` : ''}`,
+            true,
+          );
+        } else {
+          magnetInput.value = '';
+          setFormStatus(`Bulk submit complete: ${result.created || 0} torrents added as individually tracked jobs.`);
+        }
+        closeBulkDialog();
+        magnetInput.focus();
+        await loadJobs();
+      } catch (error) {
+        setBulkDialogStatus(String(error), true);
+      } finally {
+        bulkDialogSubmit.disabled = false;
+      }
     }
 
     function syncHeroDetailsForViewport() {
@@ -1461,15 +1869,39 @@
       return [...selectedJobIds];
     }
 
-    document.getElementById('job-form').addEventListener('submit', async (event) => {
+    jobForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       setFormStatus('');
       submitButton.disabled = true;
       closeCategoryMenu();
 
-      const form = new FormData(event.target);
-      const payload = Object.fromEntries(form.entries());
-      if (!payload.final_category) delete payload.final_category;
+      const parsed = parseMagnetInput(magnetInput.value);
+      const parseErrors = [];
+      if (parsed.invalidLines.length) parseErrors.push(`lines without a magnet: ${parsed.invalidLines.join(', ')}`);
+      if (parsed.invalidHashLines.length) parseErrors.push(`lines without a valid BTIH hash: ${parsed.invalidHashLines.join(', ')}`);
+      if (parsed.duplicateLines.length) parseErrors.push(`duplicate magnet lines: ${parsed.duplicateLines.join(', ')}`);
+      if (parseErrors.length) {
+        setFormStatus(`Fix bulk magnet input first (${parseErrors.join('; ')}).`, true);
+        submitButton.disabled = false;
+        return;
+      }
+      if (parsed.magnets.length === 0) {
+        setFormStatus('Paste at least one valid magnet link.', true);
+        submitButton.disabled = false;
+        return;
+      }
+      if (parsed.magnets.length > 50) {
+        setFormStatus(`Bulk intake supports up to 50 magnets at once; ${parsed.magnets.length} were detected.`, true);
+        submitButton.disabled = false;
+        return;
+      }
+      if (parsed.magnets.length > 1) {
+        openBulkDialog(parsed.magnets);
+        submitButton.disabled = false;
+        return;
+      }
+
+      const payload = { ...getFormSettings(), magnet_uri: parsed.magnets[0].uri };
 
       try {
         const res = await fetch('/jobs', {
@@ -1489,6 +1921,17 @@
       } finally {
         submitButton.disabled = false;
       }
+    });
+
+    bulkUseSameSettings.addEventListener('change', syncBulkSettingsMode);
+    bulkDialogSubmit.addEventListener('click', submitBulkDialog);
+    bulkDialogClose.addEventListener('click', closeBulkDialog);
+    bulkDialogCancel.addEventListener('click', closeBulkDialog);
+    bulkDialog.addEventListener('click', (event) => {
+      if (event.target === bulkDialog) closeBulkDialog();
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !bulkDialog.hidden) closeBulkDialog();
     });
 
     finalParentInput.addEventListener('input', () => {

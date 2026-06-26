@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .db import Base, engine, get_db
 from .models import Job
-from .schemas import CompletionEventIn, JobBulkResult, JobCreate, JobOut, JobSelectionIn
+from .schemas import CompletionEventIn, JobBatchCreate, JobBatchCreateResult, JobBulkResult, JobCreate, JobOut, JobSelectionIn
 from .service import JobService
 from .worker import worker_loop
 
@@ -83,6 +83,38 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/jobs/bulk", response_model=JobBatchCreateResult)
+def create_jobs_bulk(payload: JobBatchCreate, db: Session = Depends(get_db)):
+    result: dict[str, object] = {
+        "requested": len(payload.jobs),
+        "created": 0,
+        "failed": 0,
+        "jobs": [],
+        "errors": {},
+    }
+    created_jobs: list[Job] = []
+    errors: dict[str, str] = {}
+
+    for index, item in enumerate(payload.jobs, start=1):
+        try:
+            job = service.submit_job(
+                db,
+                magnet_uri=item.magnet_uri,
+                final_parent=item.final_parent,
+                final_category=item.final_category,
+                staging_preference=item.staging_preference,
+            )
+            created_jobs.append(job)
+        except (ValueError, RuntimeError) as exc:
+            errors[str(index)] = str(exc)
+
+    result["created"] = len(created_jobs)
+    result["failed"] = len(errors)
+    result["jobs"] = created_jobs
+    result["errors"] = errors
+    return result
 
 
 @app.get("/jobs/{job_id}", response_model=JobOut)
