@@ -117,7 +117,7 @@ See `portainer-stack.example.yml` and adjust host paths, qBittorrent endpoint, a
 - `GET /jobs` list jobs
 - `GET /jobs/{job_id}` job detail
 - `POST /jobs/{job_id}/retry` retry errored job
-- `DELETE /jobs/{job_id}` delete terminal job from intake DB
+- `DELETE /jobs/{job_id}` remove intake tracking row only; qBittorrent torrent is untouched
 - `GET /qbt/categories` list qBittorrent categories
 - `GET /qbt/final-path-suggestions` list known qB save path suggestions
 - `GET /fs/final-path-suggestions` list live directory suggestions inside the approved final roots

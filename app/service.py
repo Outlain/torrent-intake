@@ -240,8 +240,7 @@ class JobService:
         job = db.get(Job, job_id)
         if not job:
             raise LookupError("Job not found")
-        if not job.is_terminal:
-            raise ValueError("Only terminal jobs can be deleted")
+        # Intake-only removal. Never delete, pause, or modify the qBittorrent torrent here.
         db.delete(job)
         db.commit()
 

@@ -1173,7 +1173,7 @@
             <div class="jobs-toolbar-group">
               <button id="retry-selected-button" class="button-secondary toolbar-button" type="button">Retry Failed Selected</button>
               <button id="move-selected-to-nas-button" class="button-secondary toolbar-button" type="button">Move Selected To NAS</button>
-              <button id="delete-selected-button" class="button-secondary toolbar-button danger-soft" type="button">Delete Selected</button>
+              <button id="delete-selected-button" class="button-secondary toolbar-button danger-soft" type="button">Forget Selected</button>
               <button id="retry-failed-button" class="button-secondary toolbar-button" type="button">Retry All Failed</button>
               <button id="clear-completed-button" class="button-secondary toolbar-button" type="button">Clear All Completed</button>
               <button id="clear-failed-button" class="button-secondary toolbar-button danger-soft" type="button">Clear All Failed</button>
@@ -1681,7 +1681,7 @@
       const moveNasEligible = jobs.filter(
         (job) => selectedJobIds.has(job.id) && job.state === 'waiting_for_local_space' && job.staging_actual === 'local'
       ).length;
-      const deleteEligible = jobs.filter((job) => selectedJobIds.has(job.id) && job.is_terminal).length;
+      const deleteEligible = jobs.filter((job) => selectedJobIds.has(job.id)).length;
       const failedJobs = jobs.filter((job) => job.state === 'error').length;
       const completedJobs = jobs.filter((job) => ['done', 'infected_deleted'].includes(job.state)).length;
       return { retryEligible, retryIneligibleSelected, moveNasEligible, deleteEligible, failedJobs, completedJobs };
@@ -1706,7 +1706,7 @@
 
       if (selectedVisibleCount === 0) {
         if (!jobsToolbarFlashTimer) {
-          setJobsToolbarStatus(`${displayedJobs.length} jobs shown. Use the checkboxes to batch retry or delete.`);
+          setJobsToolbarStatus(`${displayedJobs.length} jobs shown. Use the checkboxes to batch retry, move, or forget tracking.`);
         }
         return;
       }
@@ -1716,7 +1716,7 @@
           ? ` Retry only applies to intake error rows; ${retryIneligibleSelected} selected active/non-error row${retryIneligibleSelected === 1 ? '' : 's'} will be skipped.`
           : '';
         setJobsToolbarStatus(
-          `${selectedVisibleCount} selected. Retry eligible: ${retryEligible}. Move-to-NAS eligible: ${moveNasEligible}. Delete eligible: ${deleteEligible}.${skippedRetryText}`
+          `${selectedVisibleCount} selected. Retry eligible: ${retryEligible}. Move-to-NAS eligible: ${moveNasEligible}. Forget eligible: ${deleteEligible}.${skippedRetryText}`
         );
       }
     }
@@ -2025,8 +2025,8 @@
       runBulkAction({
         url: '/jobs/bulk-delete',
         payload: { job_ids: jobIds },
-        confirmMessage: 'Delete selected terminal jobs from the intake history? Non-terminal rows will be skipped.',
-        label: 'Delete selected',
+        confirmMessage: 'Forget selected jobs from Intake tracking only? This will not delete, stop, pause, or remove torrents in qBittorrent.',
+        label: 'Forget selected',
       });
     });
     clearCompletedButton.addEventListener('click', () => {
