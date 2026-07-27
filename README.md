@@ -63,6 +63,10 @@ Copy `.env.example` to `.env` and set values for your environment.
 | `TI_COMPLETION_EVENT_TOKEN` | Optional | Shared secret for qB completion callback |
 | `TI_CLAMDSCAN_BINARY` | Yes | Malware scanner binary |
 | `TI_CLAMDSCAN_ARGS` | Yes | Scanner args |
+| `TI_MAX_CONCURRENT_SCANS` | No | Normal concurrent scan slots; default `2` |
+| `TI_MAX_SCAN_SLOTS` | No | Hard ceiling offered by the UI; default `4` |
+| `TI_MAX_CONCURRENT_LARGE_SCANS` | No | Concurrent scans at or above the large threshold; default `1` |
+| `TI_LARGE_SCAN_GIB` | No | Torrent size classified as a high-I/O large scan; default `100` GiB |
 | `TI_TELEGRAM_BOT_TOKEN` | Optional | Required only if Telegram alerts enabled |
 | `TI_TELEGRAM_CHAT_ID` | Optional | Required only if Telegram alerts enabled |
 
@@ -117,6 +121,11 @@ See `portainer-stack.example.yml` and adjust host paths, qBittorrent endpoint, a
 - `GET /jobs` list jobs
 - `GET /jobs/{job_id}` job detail
 - `POST /jobs/{job_id}/retry` retry errored job
+- `POST /jobs/bulk-scan-next` prioritize selected queued/active scans
+- `POST /jobs/bulk-scan-pause` pause selected scans safely after the current file
+- `POST /jobs/bulk-scan-resume` resume selected paused scans
+- `GET /scanner/status` get slots, active scans, backlog, and large-scan usage
+- `POST /scanner/slots` change scan slots within the configured hard ceiling
 - `DELETE /jobs/{job_id}` remove intake tracking row only; qBittorrent torrent is untouched
 - `GET /qbt/categories` list qBittorrent categories
 - `GET /qbt/final-path-suggestions` list known qB save path suggestions
@@ -167,7 +176,10 @@ Client -> Intake API -> qBittorrent (staging path)
                     Download completes
                           |
                           v
-                Malware scan (clamscan)
+          Durable scan queue (2 slots by default)
+                          |
+                          v
+                Malware scan (per-file checkpoints)
                   |                     |
                   | infected            | clean
                   v                     v
@@ -183,7 +195,7 @@ The intake worker only moves to scan/promotion when completion checks pass:
 - `amount_left == 0` (when available)
 - qBittorrent state is not one of active download/checking states
 
-After that it pauses the torrent, scans content, and only then promotes and resumes for seeding.
+After that it pauses the torrent, queues a durable scan, and only promotes and resumes after every file has a clean checkpoint. The completion callback returns after queueing rather than waiting for ClamAV.
 
 ## Local Capacity Guard
 
@@ -250,9 +262,16 @@ Use the provided `.gitignore` and `.dockerignore` to keep Git history and Docker
 
 ## Scanner Notes
 
-- Default scanner command is `clamscan --infected --no-summary --recursive`.
+- Default scanner command is `clamscan --infected --no-summary --recursive`. Intake invokes it once per regular file so each clean file becomes a durable checkpoint.
+- Two scan workers run by default. `TI_MAX_CONCURRENT_LARGE_SCANS=1` keeps two torrents at or above `TI_LARGE_SCAN_GIB` from competing for disk I/O.
+- The queue prefers prioritized work and smaller torrents. A long scan checks whether it should yield after `TI_SCAN_YIELD_AFTER_FILES` completed files.
+- The UI can temporarily raise the slot count up to `TI_MAX_SCAN_SLOTS`. A boost resets to `TI_MAX_CONCURRENT_SCANS` once the queued backlog is empty. Lowering slots does not kill active scanners; it only prevents new claims until usage falls under the new limit.
+- **Pause After File** is cooperative: queued work pauses immediately, while active work stops after its current file receives a clean checkpoint. The torrent remains paused in qBittorrent until intake resumes the scan and finishes promotion.
+- A torrent containing one enormous file cannot pause, yield, or checkpoint halfway through that file. A restart safely retries only that in-progress file; previously completed files are not rescanned unless their size/mtime or the scanner version changed.
+- Active scan leases and per-file progress are stored in SQLite. On container restart, stale `scanning` work returns to `scan_pending` (or `scan_paused` when a pause was requested), and post-scan move/delete actions are reconciled against qBittorrent before a terminal state is recorded.
 - Keep ClamAV signatures up to date in your deployment (for example via `freshclam` automation or a dedicated scanner sidecar).
-- You can override scanner command/flags via `TI_CLAMDSCAN_BINARY` and `TI_CLAMDSCAN_ARGS`.
+- You can override scanner command/flags via `TI_CLAMDSCAN_BINARY` and `TI_CLAMDSCAN_ARGS`; scheduler timing/retry tunables are documented in `.env.example`.
+- Run one Uvicorn application process. Scanner concurrency is managed internally; do not add `--workers` to the container command.
 
 ## Using External ClamAV Containers
 

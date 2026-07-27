@@ -34,6 +34,16 @@ class Settings(BaseSettings):
 
     clamdscan_binary: str = "clamscan"
     clamdscan_args: str = "--infected --no-summary --recursive"
+    max_concurrent_scans: int = 2
+    max_scan_slots: int = 4
+    max_concurrent_large_scans: int = 1
+    large_scan_gib: int = 100
+    scan_scheduler_interval_seconds: int = 3
+    scan_lease_seconds: int = 90
+    scan_heartbeat_seconds: int = 10
+    scan_retry_base_seconds: int = 30
+    scan_max_failures: int = 3
+    scan_yield_after_files: int = 10
 
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
@@ -54,6 +64,10 @@ class Settings(BaseSettings):
     @property
     def local_free_space_buffer_bytes(self) -> int:
         return self.local_free_space_buffer_gib * 1024 * 1024 * 1024
+
+    @property
+    def large_scan_bytes(self) -> int:
+        return self.large_scan_gib * 1024 * 1024 * 1024
 
     @property
     def allowed_final_parent_prefixes(self) -> list[str]:

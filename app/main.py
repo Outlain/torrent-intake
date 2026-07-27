@@ -11,7 +11,16 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .db import Base, engine, get_db
 from .models import Job
-from .schemas import CompletionEventIn, JobBatchCreate, JobBatchCreateResult, JobBulkResult, JobCreate, JobOut, JobSelectionIn
+from .schemas import (
+    CompletionEventIn,
+    JobBatchCreate,
+    JobBatchCreateResult,
+    JobBulkResult,
+    JobCreate,
+    JobOut,
+    JobSelectionIn,
+    ScannerSlotsUpdate,
+)
 from .service import JobService
 from .worker import worker_loop
 
@@ -45,6 +54,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=settings.ui_title, lifespan=lifespan)
 
 
+def _enrich_jobs(db: Session, jobs: list[Job]) -> list[Job]:
+    service.enrich_jobs_with_live_stats(jobs)
+    return service.scan_coordinator.enrich_jobs(db, jobs)
+
+
 def _validate_completion_event_token(token: str | None) -> None:
     expected = settings.completion_event_token
     if expected and token != expected:
@@ -65,7 +79,7 @@ def health() -> dict[str, str]:
 @app.get("/jobs", response_model=list[JobOut])
 def list_jobs(db: Session = Depends(get_db)):
     jobs = list(db.scalars(select(Job).order_by(Job.created_at.desc())))
-    return service.enrich_jobs_with_live_stats(jobs)
+    return _enrich_jobs(db, jobs)
 
 
 @app.post("/jobs", response_model=JobOut)
@@ -122,7 +136,7 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    return _enrich_jobs(db, [job])[0]
 
 
 @app.post("/jobs/{job_id}/retry", response_model=JobOut)
@@ -140,6 +154,21 @@ def retry_job(job_id: str, db: Session = Depends(get_db)):
 @app.post("/jobs/bulk-retry", response_model=JobBulkResult)
 def bulk_retry_jobs(payload: JobSelectionIn, db: Session = Depends(get_db)):
     return service.retry_jobs(db, job_ids=payload.job_ids)
+
+
+@app.post("/jobs/bulk-scan-next", response_model=JobBulkResult)
+def bulk_prioritize_scans(payload: JobSelectionIn, db: Session = Depends(get_db)):
+    return service.scan_coordinator.prioritize_jobs(db, payload.job_ids)
+
+
+@app.post("/jobs/bulk-scan-pause", response_model=JobBulkResult)
+def bulk_pause_scans(payload: JobSelectionIn, db: Session = Depends(get_db)):
+    return service.scan_coordinator.pause_jobs(db, payload.job_ids)
+
+
+@app.post("/jobs/bulk-scan-resume", response_model=JobBulkResult)
+def bulk_resume_scans(payload: JobSelectionIn, db: Session = Depends(get_db)):
+    return service.scan_coordinator.resume_jobs(db, payload.job_ids)
 
 
 @app.post("/jobs/bulk-move-to-nas", response_model=JobBulkResult)
@@ -169,6 +198,19 @@ def qbt_transfer_info():
         return service.qbt.transfer_info()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch qBittorrent transfer info: {exc}") from exc
+
+
+@app.get("/scanner/status")
+def scanner_status(db: Session = Depends(get_db)):
+    return service.scan_coordinator.scanner_status(db)
+
+
+@app.post("/scanner/slots")
+def update_scanner_slots(payload: ScannerSlotsUpdate, db: Session = Depends(get_db)):
+    try:
+        return service.scan_coordinator.set_slots(db, payload.slots)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/fs/final-path-suggestions")
@@ -278,7 +320,7 @@ def qbt_complete_event_form(
 @app.get("/ui", response_class=HTMLResponse)
 def ui(request: Request, db: Session = Depends(get_db)):
     jobs = list(db.scalars(select(Job).order_by(Job.created_at.desc()).limit(50)))
-    jobs = service.enrich_jobs_with_live_stats(jobs)
+    jobs = _enrich_jobs(db, jobs)
     return TEMPLATES.TemplateResponse(
         request,
         "index.html",

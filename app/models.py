@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -42,3 +42,78 @@ class Job(Base):
 
     threat_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ScanRun(Base):
+    __tablename__ = "scan_runs"
+
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    pause_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    root_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    total_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completed_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completed_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    current_file: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    verdict: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    scanner_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notification_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    notification_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_scan_runs_lease", "lease_expires_at"),
+        Index("ix_scan_runs_queue", "queued_at", "priority"),
+    )
+
+
+class ScanFile(Base):
+    __tablename__ = "scan_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    relative_path: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    mtime_ns: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    threat_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    scanner_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    scanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "relative_path", name="uq_scan_files_job_path"),
+        Index("ix_scan_files_job_status", "job_id", "status"),
+    )
+
+
+class ScannerControl(Base):
+    __tablename__ = "scanner_control"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    requested_slots: Mapped[int] = mapped_column(Integer, nullable=False)
+    boost_until_queue_empty: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

@@ -34,6 +34,16 @@ services:
       - TI_COMPLETION_EVENT_TOKEN=REPLACE_WITH_RANDOM_TOKEN
       - TI_CLAMDSCAN_BINARY=clamscan
       - TI_CLAMDSCAN_ARGS=--infected --no-summary --recursive
+      - TI_MAX_CONCURRENT_SCANS=2
+      - TI_MAX_SCAN_SLOTS=4
+      - TI_MAX_CONCURRENT_LARGE_SCANS=1
+      - TI_LARGE_SCAN_GIB=100
+      - TI_SCAN_SCHEDULER_INTERVAL_SECONDS=3
+      - TI_SCAN_LEASE_SECONDS=90
+      - TI_SCAN_HEARTBEAT_SECONDS=10
+      - TI_SCAN_RETRY_BASE_SECONDS=30
+      - TI_SCAN_MAX_FAILURES=3
+      - TI_SCAN_YIELD_AFTER_FILES=10
       # Optional: only used for malware detection/deletion alerts
       - TI_TELEGRAM_BOT_TOKEN=
       - TI_TELEGRAM_CHAT_ID=

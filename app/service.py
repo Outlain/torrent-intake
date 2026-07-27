@@ -4,20 +4,15 @@ import logging
 import os
 from pathlib import Path
 import shutil
-import threading
-import time
 from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .config import get_settings
-from .models import Job
+from .models import Job, ScanRun
 from .qbt import QbtService, TorrentAlreadyExistsError
-from .scanner import ScannerService
+from .scan_coordinator import SCAN_ACTION_STATES, SCAN_QUEUE_STATES, ScanCoordinator
 from .telegram import TelegramService
-
-_ACTIVE_LONG_RUNNING_JOBS: set[str] = set()
-_ACTIVE_LONG_RUNNING_JOBS_LOCK = threading.Lock()
 
 
 class JobService:
@@ -42,7 +37,7 @@ class JobService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.qbt = QbtService()
-        self.scanner = ScannerService()
+        self.scan_coordinator = ScanCoordinator()
         self.telegram = TelegramService()
         self.logger = logging.getLogger(__name__)
 
@@ -193,6 +188,7 @@ class JobService:
             db.add(job)
             db.commit()
             db.refresh(job)
+            self._queue_completed_retry(db, job)
             return job
         except TorrentAlreadyExistsError as exc:
             message = self._duplicate_torrent_message(
@@ -215,6 +211,7 @@ class JobService:
                 db.add(job)
                 db.commit()
                 db.refresh(job)
+                self._queue_completed_retry(db, job)
                 self.logger.info(
                     "Attached retry job %s to existing qBittorrent torrent %s",
                     job.id,
@@ -241,6 +238,7 @@ class JobService:
         if not job:
             raise LookupError("Job not found")
         # Intake-only removal. Never delete, pause, or modify the qBittorrent torrent here.
+        self.scan_coordinator.delete_scan_data(db, job.id)
         db.delete(job)
         db.commit()
 
@@ -556,6 +554,15 @@ class JobService:
             job.scan_completed_at = None
         if not job.deleted_at:
             job.deleted_at = None
+            job.threat_name = None
+
+    def _queue_completed_retry(self, db: Session, job: Job) -> None:
+        if job.state != "download_complete":
+            return
+        run = self.scan_coordinator.queue_job(db, job)
+        db.add_all([job, run])
+        db.commit()
+        db.refresh(job)
 
     def _sync_job_from_torrent(self, job: Job, torrent) -> None:
         if torrent is None:
@@ -671,7 +678,8 @@ class JobService:
             job.content_path = event_path
         if isinstance(size_bytes, int) and size_bytes > 0:
             job.size_bytes = size_bytes
-        self._mark(job, "completion_event_received")
+        if not job.is_terminal and job.state not in SCAN_QUEUE_STATES and job.state not in SCAN_ACTION_STATES:
+            self._mark(job, "completion_event_received")
         db.add(job)
         db.commit()
         db.refresh(job)
@@ -702,6 +710,8 @@ class JobService:
     def process_nonterminal_jobs(self, db: Session) -> None:
         jobs = list(db.scalars(select(Job).where(Job.is_terminal == False).order_by(Job.created_at.asc())))
         for job in jobs:
+            if job.state in SCAN_QUEUE_STATES or job.state in SCAN_ACTION_STATES:
+                continue
             try:
                 self._process_one(db, job, ignore_event_grace=False)
             except Exception as exc:
@@ -709,6 +719,172 @@ class JobService:
                 self._mark(job, "error", error=str(exc))
                 db.add(job)
                 db.commit()
+
+    def process_scan_actions(self, db: Session) -> None:
+        jobs = list(
+            db.scalars(
+                select(Job)
+                .where(Job.state.in_(tuple(SCAN_ACTION_STATES)))
+                .order_by(Job.updated_at.asc())
+            )
+        )
+        released_local_capacity = False
+        for job in jobs:
+            job_id = job.id
+            was_local = job.staging_actual == "local"
+            try:
+                if job.state in {"scan_clean", "promoting"}:
+                    completed = self._reconcile_clean_promotion(db, job)
+                else:
+                    completed = self._reconcile_infected_deletion(db, job)
+                released_local_capacity = released_local_capacity or (was_local and completed)
+            except Exception as exc:
+                db.rollback()
+                current = db.get(Job, job_id)
+                if current is None or current.state not in SCAN_ACTION_STATES:
+                    continue
+                message = str(exc).strip() or repr(exc)
+                self.logger.exception("Post-scan action failed for job %s; it will be retried", job_id)
+                current.last_error = f"Post-scan action will retry: {message}"
+                current.updated_at = datetime.utcnow()
+                db.add(current)
+                db.commit()
+
+        self._process_pending_infected_notifications(db)
+        if released_local_capacity:
+            self.process_waiting_for_local_space(db)
+
+    def _reconcile_clean_promotion(self, db: Session, job: Job) -> bool:
+        if job.state == "scan_clean":
+            self._mark(job, "promoting")
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+
+        torrent = self._find_live_torrent_for_job(job)
+        if torrent is None:
+            raise RuntimeError("qBittorrent torrent is unavailable during promotion")
+        self._sync_job_from_torrent(job, torrent)
+
+        self._raise_for_qbt_error_state(torrent)
+        qbt_state = str(getattr(torrent, "state", "") or "")
+        if qbt_state == "moving":
+            job.last_error = None
+            db.add(job)
+            db.commit()
+            return False
+
+        save_path = getattr(torrent, "save_path", None)
+        if not self._paths_equal(save_path, job.final_parent):
+            self.logger.info("Starting promotion for job %s to %s", job.id, job.final_parent)
+            self.qbt.pause(job.qbt_hash)
+            self.qbt.set_location(job.qbt_hash, job.final_parent)
+            job.last_error = None
+            db.add(job)
+            db.commit()
+            return False
+
+        if job.final_category:
+            resolved_category = self.qbt.resolve_or_create_category(
+                job.final_category,
+                create_if_missing=self.settings.auto_create_final_category,
+            )
+            if resolved_category != job.final_category:
+                self.logger.info(
+                    "Mapped final category for job %s from '%s' to existing '%s'",
+                    job.id,
+                    job.final_category,
+                    resolved_category,
+                )
+            job.final_category = resolved_category
+            self.qbt.set_category(job.qbt_hash, resolved_category)
+
+        self.qbt.resume(job.qbt_hash)
+        job.promoted_at = job.promoted_at or datetime.utcnow()
+        self._mark(job, "done")
+        db.add(job)
+        db.commit()
+        self.logger.info("Job %s promotion verified; torrent resumed for seeding", job.id)
+        return True
+
+    def _reconcile_infected_deletion(self, db: Session, job: Job) -> bool:
+        if job.state == "scan_infected":
+            self._mark(job, "deleting_infected")
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+
+        torrent = self._find_live_torrent_for_job(job)
+        if torrent is not None:
+            self.logger.warning(
+                "Deleting infected torrent for job %s threat=%s",
+                job.id,
+                job.threat_name or "unknown",
+            )
+            torrent_hash = getattr(torrent, "hash", None) or job.qbt_hash
+            if not torrent_hash:
+                raise RuntimeError("infected torrent has no qBittorrent hash")
+            self.qbt.delete_with_files(torrent_hash)
+            job.last_error = None
+            db.add(job)
+            db.commit()
+            return False
+
+        run = db.get(ScanRun, job.id)
+        infected_path = (run.root_path if run else None) or job.content_path
+        if self._path_has_content(infected_path):
+            raise RuntimeError(
+                "qBittorrent no longer reports the infected torrent, but its staging content still exists "
+                f"at {infected_path}; refusing to mark deletion complete"
+            )
+        job.deleted_at = job.deleted_at or datetime.utcnow()
+        self._mark(job, "infected_deleted")
+        db.add(job)
+        db.commit()
+        self.logger.warning("Infected torrent deletion verified for job %s", job.id)
+        return True
+
+    def _process_pending_infected_notifications(self, db: Session) -> None:
+        retry_before = datetime.utcnow() - timedelta(seconds=60)
+        rows = list(
+            db.execute(
+                select(Job, ScanRun)
+                .join(ScanRun, ScanRun.job_id == Job.id)
+                .where(
+                    Job.state == "infected_deleted",
+                    ScanRun.verdict == "infected",
+                    ScanRun.notification_sent_at.is_(None),
+                )
+            )
+        )
+        for job, run in rows:
+            if run.notification_last_error and run.updated_at > retry_before:
+                continue
+            try:
+                self.telegram.send_infected_deleted(
+                    torrent_name=job.torrent_name,
+                    qbt_hash=job.qbt_hash,
+                    staging_path=run.root_path or job.content_path,
+                    final_parent=job.final_parent,
+                    threat_name=job.threat_name,
+                )
+            except Exception as exc:
+                self.logger.exception("Malware notification failed for job %s; it will be retried", job.id)
+                run.notification_last_error = str(exc).strip() or repr(exc)
+                run.updated_at = datetime.utcnow()
+                job.last_error = f"Malware notification will retry: {run.notification_last_error}"
+                job.updated_at = datetime.utcnow()
+                db.add_all([job, run])
+                db.commit()
+                continue
+            run.notification_sent_at = datetime.utcnow()
+            run.notification_last_error = None
+            run.updated_at = datetime.utcnow()
+            if job.last_error and job.last_error.startswith("Malware notification will retry:"):
+                job.last_error = None
+                job.updated_at = datetime.utcnow()
+            db.add_all([job, run])
+            db.commit()
 
     def process_waiting_for_local_space(self, db: Session) -> None:
         jobs = list(
@@ -729,6 +905,8 @@ class JobService:
                 db.commit()
 
     def _process_one(self, db: Session, job: Job, *, ignore_event_grace: bool) -> None:
+        if job.state in SCAN_QUEUE_STATES or job.state in SCAN_ACTION_STATES:
+            return
         if not job.qbt_hash:
             self._resolve_hash_for_job(db, job)
             return
@@ -749,7 +927,6 @@ class JobService:
             raise RuntimeError(f"Torrent {job.qbt_hash} not found in qBittorrent")
         self._ensure_job_can_track_torrent(db, job, torrent)
 
-        qbt_state = getattr(torrent, "state", None)
         self._sync_job_from_torrent(job, torrent)
         self._raise_for_qbt_error_state(torrent)
 
@@ -764,18 +941,15 @@ class JobService:
             job.completion_event_received_at
             and datetime.utcnow() >= job.completion_event_received_at + timedelta(seconds=self.settings.completion_grace_seconds)
         )
-        if (job.download_complete_at and job.state in {"download_complete", "completion_event_received", "downloading", "scanning"}) and (event_ready or not job.completion_event_received_at):
-            if not self._try_acquire_long_running_job(job.id):
-                self.logger.info("Skipping duplicate scan/finalize attempt for job %s state=%s", job.id, job.state)
-                return
-            try:
-                self._mark(job, "scanning")
-                db.add(job)
-                db.commit()
-                db.refresh(job)
-                self._scan_and_finalize(job)
-            finally:
-                self._release_long_running_job(job.id)
+        if (
+            job.download_complete_at
+            and job.state in {"download_complete", "completion_event_received", "downloading"}
+            and (event_ready or not job.completion_event_received_at)
+        ):
+            run = self.scan_coordinator.queue_job(db, job)
+            db.add_all([job, run])
+            db.commit()
+            return
 
         db.add(job)
         db.commit()
@@ -892,17 +1066,6 @@ class JobService:
             f"qBittorrent torrent '{torrent_name}' ({torrent_hash}) is in state '{qbt_state}'. "
             "Fix it in qBittorrent or delete the qBittorrent torrent, then retry the intake job."
         )
-
-    def _try_acquire_long_running_job(self, job_id: str) -> bool:
-        with _ACTIVE_LONG_RUNNING_JOBS_LOCK:
-            if job_id in _ACTIVE_LONG_RUNNING_JOBS:
-                return False
-            _ACTIVE_LONG_RUNNING_JOBS.add(job_id)
-            return True
-
-    def _release_long_running_job(self, job_id: str) -> None:
-        with _ACTIVE_LONG_RUNNING_JOBS_LOCK:
-            _ACTIVE_LONG_RUNNING_JOBS.discard(job_id)
 
     def _path_within_local_staging(self, path_value: str | None) -> bool:
         if not path_value:
@@ -1071,64 +1234,23 @@ class JobService:
             current_remaining_bytes=current_remaining_bytes,
         )
 
-    def _scan_and_finalize(self, job: Job) -> None:
-        if not job.content_path:
-            torrent = self._find_live_torrent_for_job(job)
-            job.content_path = getattr(torrent, "content_path", None) or job.content_path
-        if not job.content_path:
-            raise RuntimeError("content_path is not available for completed torrent")
+    @staticmethod
+    def _path_has_content(path_value: str | None) -> bool:
+        if not path_value or not os.path.lexists(path_value):
+            return False
+        path = Path(path_value)
+        if path.is_dir() and not path.is_symlink():
+            try:
+                next(path.iterdir())
+            except StopIteration:
+                return False
+        return True
 
-        self.qbt.pause(job.qbt_hash)
-        self.logger.info("Scanning job %s path=%s", job.id, job.content_path)
-        scan_started = time.monotonic()
-        result = self.scanner.scan_path(job.content_path)
-        scan_duration_seconds = time.monotonic() - scan_started
-        job.scan_completed_at = datetime.utcnow()
-        self.logger.info(
-            "Scan finished for job %s clean=%s infected=%s duration_seconds=%.2f",
-            job.id,
-            result.clean,
-            result.infected,
-            scan_duration_seconds,
-        )
-
-        if result.infected:
-            threat = result.threat_name or "unknown"
-            self.qbt.delete_with_files(job.qbt_hash)
-            job.threat_name = threat
-            job.deleted_at = datetime.utcnow()
-            self.telegram.send_infected_deleted(
-                torrent_name=job.torrent_name,
-                qbt_hash=job.qbt_hash,
-                staging_path=job.content_path,
-                final_parent=job.final_parent,
-                threat_name=threat,
-            )
-            self._mark(job, "infected_deleted")
-            self.logger.warning("Infected job deleted: job=%s threat=%s", job.id, threat)
-            return
-
-        self._mark(job, "promoting")
-        self.logger.info("Promoting clean job %s to %s", job.id, job.final_parent)
-        self.qbt.set_location(job.qbt_hash, job.final_parent)
-        if job.final_category:
-            resolved_category = self.qbt.resolve_or_create_category(
-                job.final_category,
-                create_if_missing=self.settings.auto_create_final_category,
-            )
-            if resolved_category != job.final_category:
-                self.logger.info(
-                    "Mapped final category for job %s from '%s' to existing '%s'",
-                    job.id,
-                    job.final_category,
-                    resolved_category,
-                )
-            job.final_category = resolved_category
-            self.qbt.set_category(job.qbt_hash, resolved_category)
-        self.qbt.resume(job.qbt_hash)
-        job.promoted_at = datetime.utcnow()
-        self._mark(job, "done")
-        self.logger.info("Job %s complete and resumed for seeding", job.id)
+    @staticmethod
+    def _paths_equal(left: str | None, right: str | None) -> bool:
+        if not left or not right:
+            return False
+        return os.path.normpath(left) == os.path.normpath(right)
 
     def _is_torrent_complete(self, torrent) -> bool:
         progress = float(getattr(torrent, "progress", 0) or 0)

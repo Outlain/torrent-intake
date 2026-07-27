@@ -663,6 +663,45 @@
       color: var(--danger);
     }
 
+    .scanner-toolbar-row {
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }
+
+    .scanner-status-card {
+      display: grid;
+      gap: 3px;
+      flex: 1 1 360px;
+      min-width: 280px;
+      padding: 11px 13px;
+      border-radius: 14px;
+      border: 1px solid rgba(222, 125, 54, 0.22);
+      background: linear-gradient(135deg, rgba(222, 125, 54, 0.1), rgba(255, 255, 255, 0.025));
+    }
+
+    .scanner-status-card strong {
+      color: var(--ink);
+      font-size: 0.9rem;
+    }
+
+    .scanner-status-card span,
+    .scanner-status-card small {
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    .scanner-status-card span {
+      font-size: 0.88rem;
+    }
+
+    .scanner-status-card small {
+      font-size: 0.78rem;
+    }
+
+    .scanner-status-card.error span {
+      color: var(--danger);
+    }
+
     .table-wrap {
       display: block;
       overflow-x: auto;
@@ -807,12 +846,14 @@
 
     .state-pill[data-state="downloading"],
     .state-pill[data-state="waiting_for_qbt_hash"],
-    .state-pill[data-state="retrying"] {
+    .state-pill[data-state="retrying"],
+    .state-pill[data-state="scan_pending"] {
       background: rgba(181, 93, 45, 0.12);
       color: var(--accent-deep);
     }
 
-    .state-pill[data-state="waiting_for_local_space"] {
+    .state-pill[data-state="waiting_for_local_space"],
+    .state-pill[data-state="scan_paused"] {
       background: rgba(233, 178, 77, 0.14);
       color: var(--warning);
     }
@@ -820,6 +861,7 @@
     .state-pill[data-state="download_complete"],
     .state-pill[data-state="completion_event_received"],
     .state-pill[data-state="scanning"],
+    .state-pill[data-state="scan_clean"],
     .state-pill[data-state="promoting"] {
       background: rgba(155, 95, 17, 0.12);
       color: var(--warning);
@@ -830,6 +872,8 @@
       color: var(--success);
     }
 
+    .state-pill[data-state="scan_infected"],
+    .state-pill[data-state="deleting_infected"],
     .state-pill[data-state="infected_deleted"],
     .state-pill[data-state="error"] {
       background: rgba(153, 47, 47, 0.14);
@@ -913,6 +957,11 @@
 
       .toolbar-button {
         width: 100%;
+      }
+
+      .scanner-status-card {
+        width: 100%;
+        min-width: 0;
       }
 
       .bulk-dialog {
@@ -1179,6 +1228,24 @@
               <button id="clear-failed-button" class="button-secondary toolbar-button danger-soft" type="button">Clear All Failed</button>
             </div>
           </div>
+          <div class="jobs-toolbar-row scanner-toolbar-row">
+            <div class="scanner-status-card" id="scanner-status-card">
+              <strong>Scan Queue</strong>
+              <span id="scanner-status">Loading scanner status...</span>
+              <small>Extra slots increase disk I/O, CPU, and memory use. Boosts above the default reset when the queue clears; only one large scan runs at once.</small>
+            </div>
+            <div class="jobs-toolbar-group">
+              <label class="toolbar-field">
+                <span>Scan slots</span>
+                <select id="scanner-slots-select" class="toolbar-select" aria-label="Concurrent scan slots">
+                  <option value="2">2 (default)</option>
+                </select>
+              </label>
+              <button id="scan-next-button" class="button-secondary toolbar-button" type="button">Scan Next</button>
+              <button id="pause-scan-button" class="button-secondary toolbar-button" type="button" title="An active scan pauses safely after its current file finishes.">Pause After File</button>
+              <button id="resume-scan-button" class="button-secondary toolbar-button" type="button">Resume Scan</button>
+            </div>
+          </div>
           <div class="jobs-toolbar-status" id="jobs-toolbar-status">No jobs selected.</div>
         </div>
 
@@ -1239,6 +1306,12 @@
     const deleteSelectedButton = document.getElementById('delete-selected-button');
     const clearCompletedButton = document.getElementById('clear-completed-button');
     const clearFailedButton = document.getElementById('clear-failed-button');
+    const scannerStatusCard = document.getElementById('scanner-status-card');
+    const scannerStatus = document.getElementById('scanner-status');
+    const scannerSlotsSelect = document.getElementById('scanner-slots-select');
+    const scanNextButton = document.getElementById('scan-next-button');
+    const pauseScanButton = document.getElementById('pause-scan-button');
+    const resumeScanButton = document.getElementById('resume-scan-button');
     const bulkDialog = document.getElementById('bulk-dialog');
     const bulkDialogCopy = document.getElementById('bulk-dialog-copy');
     const bulkDialogClose = document.getElementById('bulk-dialog-close');
@@ -1328,6 +1401,65 @@
 
       const text = await response.text();
       return text || `HTTP ${response.status}`;
+    }
+
+    function renderScannerStatus(status) {
+      const defaultSlots = Math.max(Number(status.default_slots || 1), 1);
+      const requestedSlots = Math.max(Number(status.requested_slots || defaultSlots), 1);
+      const hardMaxSlots = Math.max(Number(status.hard_max_slots || defaultSlots), 1);
+      scannerSlotsSelect.innerHTML = '';
+      for (let slots = 1; slots <= hardMaxSlots; slots += 1) {
+        const option = document.createElement('option');
+        option.value = String(slots);
+        if (slots === defaultSlots) {
+          option.textContent = `${slots} (default)`;
+        } else if (slots > defaultSlots) {
+          option.textContent = `${slots} (temporary boost)`;
+        } else {
+          option.textContent = String(slots);
+        }
+        scannerSlotsSelect.appendChild(option);
+      }
+      scannerSlotsSelect.value = String(Math.min(requestedSlots, hardMaxSlots));
+
+      const mode = status.boost_until_queue_empty
+        ? `temporary ${requestedSlots}-slot boost`
+        : `${requestedSlots} slot${requestedSlots === 1 ? '' : 's'}`;
+      const boostHint = Number(status.queued || 0) > 0 && requestedSlots === defaultSlots && hardMaxSlots > defaultSlots
+        ? ' | temporary boost available'
+        : '';
+      scannerStatus.textContent = `${status.active || 0} active, ${status.queued || 0} queued, ${status.paused || 0} paused | ${status.active_large || 0}/${status.max_large_scans || 1} large | ${mode}${boostHint}`;
+      scannerStatusCard.classList.remove('error');
+    }
+
+    async function loadScannerStatus() {
+      try {
+        const response = await fetch('/scanner/status');
+        if (!response.ok) throw new Error(await readErrorDetail(response));
+        renderScannerStatus(await response.json());
+      } catch (error) {
+        scannerStatus.textContent = `Scanner status unavailable: ${error}`;
+        scannerStatusCard.classList.add('error');
+      }
+    }
+
+    async function updateScannerSlots() {
+      const slots = Number(scannerSlotsSelect.value);
+      scannerSlotsSelect.disabled = true;
+      try {
+        const status = await postJson('/scanner/slots', { slots });
+        renderScannerStatus(status);
+        flashJobsToolbarStatus(
+          slots > Number(status.default_slots || 1)
+            ? `Scanner boosted to ${slots} slots until the queue clears.`
+            : `Scanner set to ${slots} slot${slots === 1 ? '' : 's'}.`
+        );
+      } catch (error) {
+        flashJobsToolbarStatus(String(error), true);
+        await loadScannerStatus();
+      } finally {
+        scannerSlotsSelect.disabled = false;
+      }
     }
 
     function sanitizeMagnetUri(value) {
@@ -1682,9 +1814,28 @@
         (job) => selectedJobIds.has(job.id) && job.state === 'waiting_for_local_space' && job.staging_actual === 'local'
       ).length;
       const deleteEligible = jobs.filter((job) => selectedJobIds.has(job.id)).length;
+      const scanNextEligible = jobs.filter(
+        (job) => selectedJobIds.has(job.id) && ['scan_pending', 'scanning', 'scan_paused'].includes(job.state)
+      ).length;
+      const pauseScanEligible = jobs.filter(
+        (job) => selectedJobIds.has(job.id) && ['scan_pending', 'scanning'].includes(job.state)
+      ).length;
+      const resumeScanEligible = jobs.filter(
+        (job) => selectedJobIds.has(job.id) && job.state === 'scan_paused'
+      ).length;
       const failedJobs = jobs.filter((job) => job.state === 'error').length;
       const completedJobs = jobs.filter((job) => ['done', 'infected_deleted'].includes(job.state)).length;
-      return { retryEligible, retryIneligibleSelected, moveNasEligible, deleteEligible, failedJobs, completedJobs };
+      return {
+        retryEligible,
+        retryIneligibleSelected,
+        moveNasEligible,
+        deleteEligible,
+        scanNextEligible,
+        pauseScanEligible,
+        resumeScanEligible,
+        failedJobs,
+        completedJobs,
+      };
     }
 
     function updateJobsToolbarState() {
@@ -1696,17 +1847,30 @@
       selectAllJobsCheckbox.checked = allVisibleSelected;
       selectAllJobsCheckbox.indeterminate = selectedVisibleCount > 0 && !allVisibleSelected;
 
-      const { retryEligible, retryIneligibleSelected, moveNasEligible, deleteEligible, failedJobs, completedJobs } = countSelectedEligibleJobs(displayedJobs);
+      const {
+        retryEligible,
+        retryIneligibleSelected,
+        moveNasEligible,
+        deleteEligible,
+        scanNextEligible,
+        pauseScanEligible,
+        resumeScanEligible,
+        failedJobs,
+        completedJobs,
+      } = countSelectedEligibleJobs(displayedJobs);
       retrySelectedButton.disabled = retryEligible === 0;
       moveSelectedToNasButton.disabled = moveNasEligible === 0;
       deleteSelectedButton.disabled = deleteEligible === 0;
+      scanNextButton.disabled = scanNextEligible === 0;
+      pauseScanButton.disabled = pauseScanEligible === 0;
+      resumeScanButton.disabled = resumeScanEligible === 0;
       retryFailedButton.disabled = failedJobs === 0;
       clearCompletedButton.disabled = completedJobs === 0;
       clearFailedButton.disabled = failedJobs === 0;
 
       if (selectedVisibleCount === 0) {
         if (!jobsToolbarFlashTimer) {
-          setJobsToolbarStatus(`${displayedJobs.length} jobs shown. Use the checkboxes to batch retry, move, or forget tracking.`);
+          setJobsToolbarStatus(`${displayedJobs.length} jobs shown. Select scan rows to prioritize, pause safely, or resume; every row can be forgotten without touching qBittorrent.`);
         }
         return;
       }
@@ -1716,7 +1880,7 @@
           ? ` Retry only applies to intake error rows; ${retryIneligibleSelected} selected active/non-error row${retryIneligibleSelected === 1 ? '' : 's'} will be skipped.`
           : '';
         setJobsToolbarStatus(
-          `${selectedVisibleCount} selected. Retry eligible: ${retryEligible}. Move-to-NAS eligible: ${moveNasEligible}. Forget eligible: ${deleteEligible}.${skippedRetryText}`
+          `${selectedVisibleCount} selected. Scan next: ${scanNextEligible}. Pause: ${pauseScanEligible}. Resume: ${resumeScanEligible}. Retry: ${retryEligible}. Move-to-NAS: ${moveNasEligible}. Forget: ${deleteEligible}.${skippedRetryText}`
         );
       }
     }
@@ -1858,7 +2022,7 @@
       try {
         const result = await postJson(url, payload);
         dropSelection([...(result.processed_ids || []), ...(result.failed_ids || [])]);
-        await loadJobs({ silent: true });
+        await Promise.all([loadJobs({ silent: true }), loadScannerStatus()]);
         flashJobsToolbarStatus(formatBulkResult(label, result), Boolean(result.failed));
       } catch (error) {
         flashJobsToolbarStatus(String(error), true);
@@ -1966,7 +2130,11 @@
         closeCategoryMenu();
       }
     });
-    refreshJobsButton.addEventListener('click', () => loadJobs());
+    refreshJobsButton.addEventListener('click', () => {
+      loadJobs();
+      loadScannerStatus();
+    });
+    scannerSlotsSelect.addEventListener('change', updateScannerSlots);
     jobsSortSelect.addEventListener('change', () => {
       jobsSortOrder = jobsSortSelect.value;
       renderJobs(latestJobs);
@@ -2008,6 +2176,33 @@
         url: '/jobs/bulk-move-to-nas',
         payload: { job_ids: jobIds },
         label: 'Move selected to NAS',
+      });
+    });
+    scanNextButton.addEventListener('click', () => {
+      const jobIds = getSelectedJobIds();
+      if (jobIds.length === 0) return;
+      runBulkAction({
+        url: '/jobs/bulk-scan-next',
+        payload: { job_ids: jobIds },
+        label: 'Prioritize scan',
+      });
+    });
+    pauseScanButton.addEventListener('click', () => {
+      const jobIds = getSelectedJobIds();
+      if (jobIds.length === 0) return;
+      runBulkAction({
+        url: '/jobs/bulk-scan-pause',
+        payload: { job_ids: jobIds },
+        label: 'Pause scan',
+      });
+    });
+    resumeScanButton.addEventListener('click', () => {
+      const jobIds = getSelectedJobIds();
+      if (jobIds.length === 0) return;
+      runBulkAction({
+        url: '/jobs/bulk-scan-resume',
+        payload: { job_ids: jobIds },
+        label: 'Resume scan',
       });
     });
     retryFailedButton.addEventListener('click', () => {
@@ -2052,10 +2247,14 @@
     }
 
     loadQbtTransferInfo();
+    loadScannerStatus();
     Promise.all([loadCategories(), loadKnownFinalPaths()]).then(() => {
       loadFinalPathSuggestions();
       loadJobs();
-      jobsRefreshTimer = setInterval(() => loadJobs({ silent: true }), 5000);
+      jobsRefreshTimer = setInterval(() => {
+        loadJobs({ silent: true });
+        loadScannerStatus();
+      }, 5000);
     });
     setInterval(loadQbtTransferInfo, 10000);
   </script>

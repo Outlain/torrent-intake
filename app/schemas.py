@@ -78,12 +78,27 @@ class JobOut(BaseModel):
     download_speed_bytes_per_s: int | None = None
     upload_speed_bytes_per_s: int | None = None
     activity_summary: str | None = None
+    scan_priority: int = 0
+    scan_pause_requested: bool = False
+    scan_total_files: int = 0
+    scan_completed_files: int = 0
+    scan_total_bytes: int = 0
+    scan_completed_bytes: int = 0
+    scan_current_file: str | None = None
+    scan_queue_position: int | None = None
+    scan_attempts: int = 0
+    scan_last_error: str | None = None
+    scan_is_large: bool = False
 
     model_config = {"from_attributes": True}
 
 
 class JobSelectionIn(BaseModel):
     job_ids: list[str] = Field(default_factory=list)
+
+
+class ScannerSlotsUpdate(BaseModel):
+    slots: int = Field(ge=1)
 
 
 class JobBulkResult(BaseModel):

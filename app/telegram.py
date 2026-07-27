@@ -25,4 +25,5 @@ class TelegramService:
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         with httpx.Client(timeout=10) as client:
-            client.post(url, json={"chat_id": chat_id, "text": text})
+            response = client.post(url, json={"chat_id": chat_id, "text": text})
+            response.raise_for_status()
