@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -70,9 +70,14 @@ class ScanRun(Base):
     total_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     completed_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     current_file: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_file_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     verdict: Mapped[str | None] = mapped_column(String(16), nullable=True)
     scanner_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    engine_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    database_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    database_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    policy_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     notification_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     notification_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -101,12 +106,19 @@ class ScanFile(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     threat_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     scanner_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    engine_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    database_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    database_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    policy_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scan_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    scan_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     scanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("job_id", "relative_path", name="uq_scan_files_job_path"),
         Index("ix_scan_files_job_status", "job_id", "status"),
+        Index("ix_scan_files_job_status_scanned", "job_id", "status", "scanned_at"),
     )
 
 
@@ -116,4 +128,7 @@ class ScannerControl(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     requested_slots: Mapped[int] = mapped_column(Integer, nullable=False)
     boost_until_queue_empty: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    maintenance_mode: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    maintenance_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    maintenance_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

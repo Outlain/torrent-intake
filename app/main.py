@@ -9,7 +9,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .config import get_settings
-from .db import Base, engine, get_db
+from .db import Base, engine, get_db, upgrade_schema
 from .models import Job
 from .schemas import (
     CompletionEventIn,
@@ -19,6 +19,7 @@ from .schemas import (
     JobCreate,
     JobOut,
     JobSelectionIn,
+    ScannerMaintenanceUpdate,
     ScannerSlotsUpdate,
 )
 from .service import JobService
@@ -42,6 +43,7 @@ worker_task: asyncio.Task | None = None
 async def lifespan(app: FastAPI):
     global worker_stop_event, worker_task
     Base.metadata.create_all(bind=engine)
+    upgrade_schema()
     worker_stop_event = asyncio.Event()
     worker_task = asyncio.create_task(worker_loop(worker_stop_event))
     yield
@@ -211,6 +213,18 @@ def update_scanner_slots(payload: ScannerSlotsUpdate, db: Session = Depends(get_
         return service.scan_coordinator.set_slots(db, payload.slots)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/scanner/maintenance")
+def update_scanner_maintenance(
+    payload: ScannerMaintenanceUpdate,
+    db: Session = Depends(get_db),
+):
+    return service.scan_coordinator.set_maintenance(
+        db,
+        enabled=payload.enabled,
+        reason=payload.reason,
+    )
 
 
 @app.get("/fs/final-path-suggestions")

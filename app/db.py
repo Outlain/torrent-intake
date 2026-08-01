@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import get_settings
 
@@ -23,6 +23,70 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, futu
 
 class Base(DeclarativeBase):
     pass
+
+
+SCHEMA_ADDITIONS: dict[str, dict[str, str]] = {
+    "scan_runs": {
+        "current_file_started_at": "DATETIME",
+        "engine_version": "VARCHAR(128)",
+        "database_version": "VARCHAR(64)",
+        "database_updated_at": "DATETIME",
+        "policy_version": "VARCHAR(128)",
+    },
+    "scan_files": {
+        "engine_version": "VARCHAR(128)",
+        "database_version": "VARCHAR(64)",
+        "database_updated_at": "DATETIME",
+        "policy_version": "VARCHAR(128)",
+        "scan_started_at": "DATETIME",
+        "scan_duration_seconds": "FLOAT",
+    },
+    "scanner_control": {
+        "maintenance_mode": "BOOLEAN NOT NULL DEFAULT 0",
+        "maintenance_reason": "TEXT",
+        "maintenance_started_at": "DATETIME",
+    },
+}
+
+SCHEMA_INDEXES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "ix_scan_files_job_status_scanned": (
+        "scan_files",
+        ("job_id", "status", "scanned_at"),
+    ),
+}
+
+
+def upgrade_schema(bind: Engine = engine) -> None:
+    """Apply additive migrations for installations created before migrations existed."""
+    inspector = inspect(bind)
+    existing_tables = set(inspector.get_table_names())
+    existing_indexes = {
+        table_name: {index["name"] for index in inspector.get_indexes(table_name)}
+        for table_name in existing_tables
+    }
+    with bind.begin() as connection:
+        for table_name, additions in SCHEMA_ADDITIONS.items():
+            if table_name not in existing_tables:
+                continue
+            existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name, definition in additions.items():
+                if column_name in existing_columns:
+                    continue
+                connection.execute(
+                    text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {definition}')
+                )
+        for index_name, (table_name, columns) in SCHEMA_INDEXES.items():
+            if table_name not in existing_tables:
+                continue
+            if index_name in existing_indexes.get(table_name, set()):
+                continue
+            column_sql = ", ".join(f'"{column}"' for column in columns)
+            connection.execute(
+                text(
+                    f'CREATE INDEX IF NOT EXISTS "{index_name}" '
+                    f'ON "{table_name}" ({column_sql})'
+                )
+            )
 
 
 def get_db():

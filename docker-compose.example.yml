@@ -35,8 +35,12 @@ services:
       - TI_COMPLETION_GRACE_SECONDS=15
       - TI_COMPLETION_EVENT_TOKEN=REPLACE_WITH_RANDOM_TOKEN
 
-      - TI_CLAMDSCAN_BINARY=clamscan
-      - TI_CLAMDSCAN_ARGS=--infected --no-summary --recursive
+      - TI_SCANNER_BACKEND=clamd
+      - TI_CLAMD_SOCKET_PATH=/run/clamav/clamd.sock
+      - TI_SCANNER_POLICY_VERSION=clamav-policy-v1
+      - TI_SCANNER_MAX_FILE_MIB=2000
+      - TI_SCANNER_DEFINITIONS_WARN_HOURS=36
+      - TI_SCANNER_DEFINITIONS_STALE_HOURS=72
       - TI_MAX_CONCURRENT_SCANS=2
       - TI_MAX_SCAN_SLOTS=4
       - TI_MAX_CONCURRENT_LARGE_SCANS=1
@@ -58,10 +62,37 @@ services:
       - /opt/docker/torrent-intake-data/logs:/app/logs
       - /opt/torrent-intake/staging:/staging-local
       - /mnt/media:/downloads
-      # Optional: shared ClamAV signatures from external updater container
-      # - /mnt/media/docker/clamav/defs:/var/lib/clamav:ro
+      - clamav-socket:/run/clamav
 
     ports:
       - "8095:8000"
 
+    depends_on:
+      clamav:
+        condition: service_healthy
+
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  clamav:
+    # Feature tag follows 1.5.x security patches when the stack pulls again.
+    image: clamav/clamav:1.5_base
+    pull_policy: always
+    container_name: torrent-intake-clamav
+    restart: unless-stopped
+    environment:
+      - CLAMAV_NO_MILTERD=true
+      - CLAMD_STARTUP_TIMEOUT=1800
+      - FRESHCLAM_CHECKS=12
+    volumes:
+      - clamav-database:/var/lib/clamav
+      - clamav-socket:/tmp
+      - ./clamav/clamd.conf:/etc/clamav/clamd.conf:ro
+      # Paths must exactly match the app container because SCAN sends a path.
+      - /opt/torrent-intake/staging:/staging-local:ro
+      - /mnt/media:/downloads:ro
+    # ClamAV recommends roughly 4 GiB RAM; do not deploy this sidecar on a
+    # host that cannot provide enough memory during concurrent DB reloads.
+
+volumes:
+  clamav-database:
+  clamav-socket:

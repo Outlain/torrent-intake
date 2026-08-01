@@ -85,10 +85,18 @@ class JobOut(BaseModel):
     scan_total_bytes: int = 0
     scan_completed_bytes: int = 0
     scan_current_file: str | None = None
+    scan_current_file_started_at: datetime | None = None
     scan_queue_position: int | None = None
     scan_attempts: int = 0
     scan_last_error: str | None = None
     scan_is_large: bool = False
+    scan_progress_percent: float | None = None
+    scan_eta_seconds: int | None = None
+    scan_eta_confidence: str | None = None
+    scan_engine_version: str | None = None
+    scan_database_version: str | None = None
+    scan_database_updated_at: datetime | None = None
+    scan_policy_version: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -99,6 +107,11 @@ class JobSelectionIn(BaseModel):
 
 class ScannerSlotsUpdate(BaseModel):
     slots: int = Field(ge=1)
+
+
+class ScannerMaintenanceUpdate(BaseModel):
+    enabled: bool
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class JobBulkResult(BaseModel):

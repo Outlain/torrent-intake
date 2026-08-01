@@ -11,7 +11,7 @@ Given a magnet link and a final destination path, the app:
 1. Creates a tracked intake job.
 2. Adds the torrent to qBittorrent with controlled category/tags.
 3. Stages download data in either local staging or NAS staging.
-4. Scans completed content with ClamAV (`clamscan` by default).
+4. Scans completed content through a persistent ClamAV daemon (`clamd`).
 5. Deletes infected torrents and files.
 6. Promotes clean torrents to the requested final destination.
 7. Sends Telegram notifications only for malware detection/deletion events.
@@ -28,6 +28,9 @@ Bulk intake is supported from the UI textarea: paste multiple magnet links, revi
 - If a job was requested as `nas`, it stays on NAS (no move back to local).
 - Final paths must live under an explicit allowlist of approved roots. By default that is just `TI_FINAL_PARENT_PREFIX` (`/downloads`).
 - Malware scan runs before any promotion step.
+- New scans are blocked when ClamAV is unavailable or definitions exceed the configured stale threshold.
+- Scanner engine/policy changes invalidate old file checkpoints; routine signature updates do not restart long scans.
+- Files above the configured ClamAV limit fail closed as a scanner safety error. They are never reported as clean or treated as malware.
 - On infection, torrent and files are deleted; no promotion occurs.
 - Telegram alerts are sent only on infection/deletion.
 
@@ -39,6 +42,9 @@ These are the required in-container paths:
 - Local staging inside app container: `/staging-local`
 - App persistent data: `/app/data`
 - App logs: `/app/logs`
+- Shared ClamAV socket in the app: `/run/clamav/clamd.sock`
+
+The ClamAV sidecar must mount `/staging-local`, `/downloads`, and every additional final root at exactly the same in-container paths as Torrent Intake. The daemon receives file paths over the Unix socket; it does not receive file contents over the network.
 
 ## Required Environment Variables
 
@@ -61,8 +67,12 @@ Copy `.env.example` to `.env` and set values for your environment.
 | `TI_LOCAL_MAX_GIB` | Yes | Hard per-torrent local staging cutoff; larger local-preference jobs move to NAS staging automatically |
 | `TI_LOCAL_FREE_SPACE_BUFFER_GIB` | Yes | Free-space buffer kept on local staging mount when aggregating active local reservations |
 | `TI_COMPLETION_EVENT_TOKEN` | Optional | Shared secret for qB completion callback |
-| `TI_CLAMDSCAN_BINARY` | Yes | Malware scanner binary |
-| `TI_CLAMDSCAN_ARGS` | Yes | Scanner args |
+| `TI_SCANNER_BACKEND` | Yes | `clamd` for the provided sidecar; `command` is a diagnostic/backward-compatible fallback |
+| `TI_CLAMD_SOCKET_PATH` | With clamd | Shared Unix socket path, default `/run/clamav/clamd.sock` |
+| `TI_SCANNER_POLICY_VERSION` | Yes | Operator-controlled policy revision included in checkpoint identity |
+| `TI_SCANNER_MAX_FILE_MIB` | Yes | Fail-closed per-file maximum; must match `clamd.conf` |
+| `TI_SCANNER_DEFINITIONS_WARN_HOURS` | No | Signature-age warning threshold, default `36` |
+| `TI_SCANNER_DEFINITIONS_STALE_HOURS` | No | Signature age that blocks new file scans, default `72` |
 | `TI_MAX_CONCURRENT_SCANS` | No | Normal concurrent scan slots; default `2` |
 | `TI_MAX_SCAN_SLOTS` | No | Hard ceiling offered by the UI; default `4` |
 | `TI_MAX_CONCURRENT_LARGE_SCANS` | No | Concurrent scans at or above the large threshold; default `1` |
@@ -80,6 +90,11 @@ The app container should mount:
 - host logs -> `/app/logs`
 - host local staging -> `/staging-local`
 - NAS mount -> `/downloads`
+- shared `clamav-socket` volume -> `/run/clamav`
+
+The ClamAV sidecar mounts the same staging/library paths read-only, a persistent definitions volume at `/var/lib/clamav`, and the same socket volume at `/tmp`.
+
+The `clamav` user inside the sidecar must be able to read completed qBittorrent files. Keep the mounts read-only and correct host file/directory modes or ACLs if the UI reports permission-denied scan errors. The first start with an empty definitions volume may take several minutes while FreshClam downloads the initial databases.
 
 Example host paths (examples only):
 
@@ -103,9 +118,30 @@ services:
       - /opt/docker/torrent-intake-data/logs:/app/logs
       - /opt/torrent-intake/staging:/staging-local
       - /mnt/media:/downloads
+      - clamav-socket:/run/clamav
     ports:
       - "8095:8000"
+    depends_on:
+      clamav:
+        condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  clamav:
+    image: clamav/clamav:1.5_base
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      - FRESHCLAM_CHECKS=12
+    volumes:
+      - clamav-database:/var/lib/clamav
+      - clamav-socket:/tmp
+      - ./clamav/clamd.conf:/etc/clamav/clamd.conf:ro
+      - /opt/torrent-intake/staging:/staging-local:ro
+      - /mnt/media:/downloads:ro
+
+volumes:
+  clamav-database:
+  clamav-socket:
 ```
 
 If you prefer local builds instead of pulling from GHCR, replace `image:` with `build: .`.
@@ -126,6 +162,7 @@ See `portainer-stack.example.yml` and adjust host paths, qBittorrent endpoint, a
 - `POST /jobs/bulk-scan-resume` resume selected paused scans
 - `GET /scanner/status` get slots, active scans, backlog, and large-scan usage
 - `POST /scanner/slots` change scan slots within the configured hard ceiling
+- `POST /scanner/maintenance` drain after current files and block/re-enable new scans
 - `DELETE /jobs/{job_id}` remove intake tracking row only; qBittorrent torrent is untouched
 - `GET /qbt/categories` list qBittorrent categories
 - `GET /qbt/final-path-suggestions` list known qB save path suggestions
@@ -262,50 +299,53 @@ Use the provided `.gitignore` and `.dockerignore` to keep Git history and Docker
 
 ## Scanner Notes
 
-- Default scanner command is `clamscan --infected --no-summary --recursive`. Intake invokes it once per regular file so each clean file becomes a durable checkpoint.
+- The provided sidecar keeps one `clamd` engine resident instead of loading signatures for every file. It runs `freshclam` automatically and persists definitions in the `clamav-database` volume.
+- Scanner status reports daemon availability, engine version, signature version/date/age, policy identity, queue capacity, and maintenance drain state. Definitions warn at 36 hours and block new file scans at 72 hours by default.
+- A stale or temporarily unavailable daemon defers work without incrementing scanner failure attempts. An already-running file may finish, then the job returns to the queue before another file starts.
 - Two scan workers run by default. `TI_MAX_CONCURRENT_LARGE_SCANS=1` keeps two torrents at or above `TI_LARGE_SCAN_GIB` from competing for disk I/O.
-- The queue prefers prioritized work and smaller torrents. A long scan checks whether it should yield after `TI_SCAN_YIELD_AFTER_FILES` completed files.
-- The UI can temporarily raise the slot count up to `TI_MAX_SCAN_SLOTS`. A boost resets to `TI_MAX_CONCURRENT_SCANS` once the queued backlog is empty. Lowering slots does not kill active scanners; it only prevents new claims until usage falls under the new limit.
-- **Pause After File** is cooperative: queued work pauses immediately, while active work stops after its current file receives a clean checkpoint. The torrent remains paused in qBittorrent until intake resumes the scan and finishes promotion.
-- A torrent containing one enormous file cannot pause, yield, or checkpoint halfway through that file. A restart safely retries only that in-progress file; previously completed files are not rescanned unless their size/mtime or the scanner version changed.
-- Active scan leases and per-file progress are stored in SQLite. On container restart, stale `scanning` work returns to `scan_pending` (or `scan_paused` when a pause was requested), and post-scan move/delete actions are reconciled against qBittorrent before a terminal state is recorded.
-- Keep ClamAV signatures up to date in your deployment (for example via `freshclam` automation or a dedicated scanner sidecar).
-- You can override scanner command/flags via `TI_CLAMDSCAN_BINARY` and `TI_CLAMDSCAN_ARGS`; scheduler timing/retry tunables are documented in `.env.example`.
-- Run one Uvicorn application process. Scanner concurrency is managed internally; do not add `--workers` to the container command.
+- The queue prefers explicitly prioritized work and smaller torrents. A long scan checks whether it should yield after `TI_SCAN_YIELD_AFTER_FILES` completed files.
+- The UI can temporarily raise slots up to `TI_MAX_SCAN_SLOTS`. A boost resets to `TI_MAX_CONCURRENT_SCANS` once the backlog clears. Lowering slots never kills active work.
+- **Prioritize Scan** applies only to selected queued/active scans. It never resumes a paused scan. **Pause After File** is cooperative: queued work pauses immediately; active work checkpoints its current file first.
+- Progress is the exact ratio of checkpointed bytes (or files when byte totals are unavailable). ClamAV does not expose reliable intra-file progress, so the active file is shown as indeterminate. ETA begins after three measured files and includes a confidence rating; it is withdrawn when the current file no longer resembles the learned model.
+- Active leases, manifests, timings, and per-file checkpoints are stored in SQLite. A container restart retries only the interrupted file. Definition-only updates preserve checkpoints; file size/mtime, engine, or policy changes invalidate the affected unfinished scan safely.
+- Run one Uvicorn application process. Scanner concurrency is managed internally; do not add `--workers`.
 
-## Using External ClamAV Containers
+### ClamAV Limits
 
-If you already run sidecar containers like:
+ClamAV cannot scan an individual file larger than approximately 2 GiB. The provided policy uses a 2000 MiB ceiling in both the app and `clamd.conf`. A 500 GiB torrent made of smaller files is supported; a torrent containing a single file above that ceiling is not.
 
-- `clamav_defs_updater` (freshclam loop)
-- `clamav_scheduled` (periodic full-library scan/quarantine)
-- `clamav_notifier` (log-based Telegram alerts)
+`AlertExceedsMax yes` converts configured size/recursion limit hits into `Heuristics.Limits.Exceeded...` results. Torrent Intake treats those as scanner-policy errors, not malware: promotion is blocked, but no torrent or file is auto-deleted. Review the error, adjust an explicitly audited policy if appropriate, increment `TI_SCANNER_POLICY_VERSION`, and retry.
 
-you can and should keep them. They are complementary to intake scanning.
+ClamAV recommends substantial memory for daemon operation and concurrent signature reloads. Plan for roughly 4 GiB rather than constraining the sidecar to 2 GiB. See the [official Docker guidance](https://docs.clamav.net/manual/Installing/Docker.html) and the [upstream limit definitions](https://github.com/Cisco-Talos/clamav/blob/main/etc/clamd.conf.sample).
 
-Important behavior:
+### Updates And Maintenance
 
-- Torrent Intake scanning is a pre-promotion gate on each completed intake job.
-- Scheduled full scans are defense-in-depth for your broader library.
-- They are not redundant, especially when staging locally at `/staging-local` (outside `/downloads`).
+Routine signature updates require no operator action. The sidecar checks 12 times per day, validates downloaded databases, and `clamd` reloads them concurrently. Files already scanning continue on the old in-memory engine; subsequent files use the new definitions. Signature revisions are recorded per file and do not discard completed checkpoints.
 
-Recommended integration for `torrent-intake`:
+Engine/software updates are separate. The `clamav/clamav:1.5_base` feature tag follows 1.5.x patch/security releases when the image is pulled, but a normal container restart does not fetch a new image. Use this workflow:
 
-1. Mount shared ClamAV definitions into this container:
-   - `/mnt/media/docker/clamav/defs:/var/lib/clamav:ro`
-2. Keep `TI_CLAMDSCAN_BINARY=clamscan` unless you intentionally provide `clamdscan` in this same container image.
-3. Keep intake Telegram alerts for intake malware deletion events; keep your sidecar notifier for scheduled scanner findings if desired.
+1. Click **Start Maintenance**.
+2. Wait until scanner status says **maintenance ready: drained**.
+3. Pull and recreate only the `clamav` sidecar.
+4. Confirm the UI reports a healthy daemon and the intended engine version.
+5. Click **End Maintenance**.
 
-Without fresh definitions available to intake scanner, detection quality may be poor or scanner may fail due to missing/outdated DB files.
+```bash
+docker compose -f docker-compose.example.yml pull clamav
+docker compose -f docker-compose.example.yml up -d --no-deps clamav
+```
+
+Maintenance stops new files and lets each active scan finish its current file; it does not kill or restart ClamAV itself. Torrent Intake intentionally has no Docker socket. If ClamAV or the app is restarted unexpectedly, the current file returns to pending without losing earlier checkpoints or consuming a failure attempt.
+
+If you change `clamd.conf` limits or policy rather than only updating signatures, increment `TI_SCANNER_POLICY_VERSION`. Engine/policy changes force a one-time rescan of completed files in unfinished jobs; normal signature updates do not.
+
+The `command` backend remains available for diagnostics or legacy deployments through `TI_CLAMDSCAN_BINARY` and `TI_CLAMDSCAN_ARGS`. It is not the recommended normal workflow. Existing scheduled full-library scanners remain useful defense-in-depth and can run alongside the pre-promotion gate.
 
 ## Build and Run Locally
 
 ```bash
 docker build -t torrent-intake-mvp:local .
-docker run --rm -p 8095:8000 --env-file .env \
-  -v /opt/docker/torrent-intake-data/data:/app/data \
-  -v /opt/docker/torrent-intake-data/logs:/app/logs \
-  -v /opt/torrent-intake/staging:/staging-local \
-  -v /mnt/media:/downloads \
-  torrent-intake-mvp:local
+docker compose -f docker-compose.example.yml up -d
 ```
+
+For a local app build, replace the app service's `image:` line with `build: .`. The sidecar is required when `TI_SCANNER_BACKEND=clamd`.

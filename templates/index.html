@@ -698,8 +698,110 @@
       font-size: 0.78rem;
     }
 
-    .scanner-status-card.error span {
+    .scanner-status-card.error span,
+    .scanner-status-card.error small {
       color: var(--danger);
+    }
+
+    .scanner-status-card.warning {
+      border-color: rgba(233, 178, 77, 0.42);
+      background: linear-gradient(135deg, rgba(233, 178, 77, 0.12), rgba(255, 255, 255, 0.025));
+    }
+
+    .scanner-status-card.warning span,
+    .scanner-status-card.warning small,
+    .scanner-status-card.maintenance span,
+    .scanner-status-card.maintenance small {
+      color: var(--warning);
+    }
+
+    .scanner-status-card.maintenance {
+      border-color: rgba(233, 178, 77, 0.42);
+    }
+
+    .scanner-controls {
+      display: grid;
+      gap: 8px;
+      flex: 1 1 520px;
+    }
+
+    .scanner-control-group {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .toolbar-group-label {
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .scan-activity {
+      min-width: 260px;
+    }
+
+    .scan-activity > * + * {
+      margin-top: 7px;
+    }
+
+    .scan-activity-copy {
+      line-height: 1.42;
+    }
+
+    .scan-progress-meta {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 6px 12px;
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+
+    .scan-progress-track {
+      position: relative;
+      height: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(152, 168, 191, 0.15);
+    }
+
+    .scan-progress-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--accent-deep), var(--accent), #f4bd68);
+      transition: width 300ms ease;
+    }
+
+    .scan-progress-track.is-active::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      width: 30%;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.32), transparent);
+      animation: scan-current-file 1.6s linear infinite;
+    }
+
+    .scan-current-note {
+      color: var(--muted);
+      font-size: 0.73rem;
+      line-height: 1.35;
+    }
+
+    @keyframes scan-current-file {
+      from { transform: translateX(-110%); }
+      to { transform: translateX(440%); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .scan-progress-track.is-active::after {
+        animation: none;
+        opacity: 0.35;
+      }
     }
 
     .table-wrap {
@@ -964,6 +1066,20 @@
         min-width: 0;
       }
 
+      .scanner-controls,
+      .scanner-control-group {
+        width: 100%;
+      }
+
+      .scanner-control-group {
+        align-items: stretch;
+        justify-content: stretch;
+      }
+
+      .toolbar-group-label {
+        width: 100%;
+      }
+
       .bulk-dialog {
         padding: 10px;
       }
@@ -1218,6 +1334,17 @@
                   <option value="oldest">Oldest first</option>
                 </select>
               </label>
+              <label class="toolbar-field">
+                <span>View</span>
+                <select id="jobs-filter-select" class="toolbar-select">
+                  <option value="all">All jobs</option>
+                  <option value="downloading">Downloads</option>
+                  <option value="scan_queue">Scan queue</option>
+                  <option value="scan_paused">Paused scans</option>
+                  <option value="failed">Failed</option>
+                  <option value="completed">Completed</option>
+                </select>
+              </label>
             </div>
             <div class="jobs-toolbar-group">
               <button id="retry-selected-button" class="button-secondary toolbar-button" type="button">Retry Failed Selected</button>
@@ -1232,18 +1359,25 @@
             <div class="scanner-status-card" id="scanner-status-card">
               <strong>Scan Queue</strong>
               <span id="scanner-status">Loading scanner status...</span>
-              <small>Extra slots increase disk I/O, CPU, and memory use. Boosts above the default reset when the queue clears; only one large scan runs at once.</small>
+              <small id="scanner-health">Checking ClamAV engine and signature age...</small>
             </div>
-            <div class="jobs-toolbar-group">
-              <label class="toolbar-field">
-                <span>Scan slots</span>
-                <select id="scanner-slots-select" class="toolbar-select" aria-label="Concurrent scan slots">
-                  <option value="2">2 (default)</option>
-                </select>
-              </label>
-              <button id="scan-next-button" class="button-secondary toolbar-button" type="button">Scan Next</button>
-              <button id="pause-scan-button" class="button-secondary toolbar-button" type="button" title="An active scan pauses safely after its current file finishes.">Pause After File</button>
-              <button id="resume-scan-button" class="button-secondary toolbar-button" type="button">Resume Scan</button>
+            <div class="scanner-controls">
+              <div class="scanner-control-group">
+                <span class="toolbar-group-label">Global scanner</span>
+                <label class="toolbar-field">
+                  <span>Slots</span>
+                  <select id="scanner-slots-select" class="toolbar-select" aria-label="Concurrent scan slots">
+                    <option value="2">2 (default)</option>
+                  </select>
+                </label>
+                <button id="scanner-maintenance-button" class="button-secondary toolbar-button" type="button" title="Stop new scans and let active scans finish their current file before ClamAV maintenance.">Start Maintenance</button>
+              </div>
+              <div class="scanner-control-group">
+                <span class="toolbar-group-label">Selected scans</span>
+                <button id="scan-next-button" class="button-secondary toolbar-button" type="button" title="Move selected queued scans ahead without resuming paused scans.">Prioritize Scan</button>
+                <button id="pause-scan-button" class="button-secondary toolbar-button" type="button" title="Queued scans pause immediately. An active scan pauses safely after its current file finishes.">Pause After File</button>
+                <button id="resume-scan-button" class="button-secondary toolbar-button" type="button">Resume Scan</button>
+              </div>
             </div>
           </div>
           <div class="jobs-toolbar-status" id="jobs-toolbar-status">No jobs selected.</div>
@@ -1300,6 +1434,7 @@
     const jobsTbody = document.getElementById('jobs-tbody');
     const selectAllJobsCheckbox = document.getElementById('select-all-jobs');
     const jobsSortSelect = document.getElementById('jobs-sort-select');
+    const jobsFilterSelect = document.getElementById('jobs-filter-select');
     const retrySelectedButton = document.getElementById('retry-selected-button');
     const moveSelectedToNasButton = document.getElementById('move-selected-to-nas-button');
     const retryFailedButton = document.getElementById('retry-failed-button');
@@ -1308,7 +1443,9 @@
     const clearFailedButton = document.getElementById('clear-failed-button');
     const scannerStatusCard = document.getElementById('scanner-status-card');
     const scannerStatus = document.getElementById('scanner-status');
+    const scannerHealth = document.getElementById('scanner-health');
     const scannerSlotsSelect = document.getElementById('scanner-slots-select');
+    const scannerMaintenanceButton = document.getElementById('scanner-maintenance-button');
     const scanNextButton = document.getElementById('scan-next-button');
     const pauseScanButton = document.getElementById('pause-scan-button');
     const resumeScanButton = document.getElementById('resume-scan-button');
@@ -1329,6 +1466,8 @@
     let latestJobs = [];
     let selectedJobIds = new Set();
     let jobsSortOrder = 'newest';
+    let jobsFilter = 'all';
+    let currentScannerStatus = null;
     let pendingBulkMagnets = [];
     let jobsToolbarFlashTimer = null;
     let finalPathTimer = null;
@@ -1389,6 +1528,17 @@
       return unitIndex === 0 ? `${Math.round(size)} ${units[unitIndex]}` : `${size.toFixed(2)} ${units[unitIndex]}`;
     }
 
+    function formatDuration(value) {
+      const seconds = Math.max(Number(value || 0), 0);
+      if (seconds < 60) return `${Math.max(Math.round(seconds), 1)}s`;
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes}m`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return `${hours}h ${minutes % 60}m`;
+      const days = Math.floor(hours / 24);
+      return `${days}d ${hours % 24}h`;
+    }
+
     async function readErrorDetail(response) {
       const contentType = response.headers.get('content-type') || '';
       if (contentType.includes('application/json')) {
@@ -1404,6 +1554,7 @@
     }
 
     function renderScannerStatus(status) {
+      currentScannerStatus = status;
       const defaultSlots = Math.max(Number(status.default_slots || 1), 1);
       const requestedSlots = Math.max(Number(status.requested_slots || defaultSlots), 1);
       const hardMaxSlots = Math.max(Number(status.hard_max_slots || defaultSlots), 1);
@@ -1428,8 +1579,27 @@
       const boostHint = Number(status.queued || 0) > 0 && requestedSlots === defaultSlots && hardMaxSlots > defaultSlots
         ? ' | temporary boost available'
         : '';
-      scannerStatus.textContent = `${status.active || 0} active, ${status.queued || 0} queued, ${status.paused || 0} paused | ${status.active_large || 0}/${status.max_large_scans || 1} large | ${mode}${boostHint}`;
-      scannerStatusCard.classList.remove('error');
+      const maintenanceText = status.maintenance_mode
+        ? (status.maintenance_drained ? ' | maintenance ready: drained' : ' | maintenance: draining current files')
+        : '';
+      scannerStatus.textContent = `${status.active || 0} active, ${status.queued || 0} queued, ${status.paused || 0} paused | ${status.active_large || 0}/${status.max_large_scans || 1} large | ${mode}${boostHint}${maintenanceText}`;
+
+      const health = status.health || {};
+      const engine = health.engine_version ? `engine ${health.engine_version}` : 'engine unknown';
+      const definitions = health.database_version ? `definitions ${health.database_version}` : 'definitions unknown';
+      const hasDefinitionAge = health.definitions_age_hours !== null && health.definitions_age_hours !== undefined;
+      const age = hasDefinitionAge && Number.isFinite(Number(health.definitions_age_hours))
+        ? `${Number(health.definitions_age_hours).toFixed(1)}h old`
+        : 'age unknown';
+      scannerHealth.textContent = `${health.message || 'Scanner health unavailable.'} ${engine}; ${definitions}, ${age}.`;
+
+      scannerStatusCard.classList.remove('error', 'warning', 'maintenance');
+      if (status.maintenance_mode) scannerStatusCard.classList.add('maintenance');
+      if (health.status === 'warning') scannerStatusCard.classList.add('warning');
+      if (health.can_scan === false && !status.maintenance_mode) scannerStatusCard.classList.add('error');
+
+      scannerMaintenanceButton.textContent = status.maintenance_mode ? 'End Maintenance' : 'Start Maintenance';
+      scannerMaintenanceButton.classList.toggle('danger-soft', Boolean(status.maintenance_mode));
     }
 
     async function loadScannerStatus() {
@@ -1439,6 +1609,7 @@
         renderScannerStatus(await response.json());
       } catch (error) {
         scannerStatus.textContent = `Scanner status unavailable: ${error}`;
+        scannerHealth.textContent = 'No ClamAV health details are available.';
         scannerStatusCard.classList.add('error');
       }
     }
@@ -1459,6 +1630,31 @@
         await loadScannerStatus();
       } finally {
         scannerSlotsSelect.disabled = false;
+      }
+    }
+
+    async function updateScannerMaintenance() {
+      const enable = !Boolean(currentScannerStatus && currentScannerStatus.maintenance_mode);
+      if (enable && !confirm('Start scanner maintenance? No new files will start. Active scans will finish only their current file, checkpoint it, and then drain back to the queue.')) {
+        return;
+      }
+      scannerMaintenanceButton.disabled = true;
+      try {
+        const status = await postJson('/scanner/maintenance', {
+          enabled: enable,
+          reason: enable ? 'Operator requested maintenance from the UI' : null,
+        });
+        renderScannerStatus(status);
+        flashJobsToolbarStatus(
+          enable
+            ? 'Scanner maintenance started. Wait for the status to say drained before replacing/restarting ClamAV.'
+            : 'Scanner maintenance ended. Queued scans may start again.'
+        );
+      } catch (error) {
+        flashJobsToolbarStatus(String(error), true);
+        await loadScannerStatus();
+      } finally {
+        scannerMaintenanceButton.disabled = false;
       }
     }
 
@@ -1783,12 +1979,61 @@
       const td = document.createElement('td');
       td.className = 'cell-last-error';
       const value = job.last_error || job.activity_summary || '-';
+      const copy = document.createElement('div');
+      copy.className = 'scan-activity-copy';
+      copy.textContent = value;
       if (job.last_error) {
         td.classList.add('activity-error');
       } else if (job.activity_summary) {
         td.classList.add('activity-detail');
       }
-      td.textContent = value;
+      td.appendChild(copy);
+
+      const hasProgress = job.scan_progress_percent !== null && job.scan_progress_percent !== undefined;
+      const progress = Number(job.scan_progress_percent);
+      const scanStates = ['scan_pending', 'scanning', 'scan_paused', 'scan_clean', 'promoting', 'scan_infected', 'deleting_infected'];
+      if (scanStates.includes(job.state) && hasProgress && Number.isFinite(progress)) {
+        td.classList.add('scan-activity');
+        const meta = document.createElement('div');
+        meta.className = 'scan-progress-meta';
+
+        const completedLabel = document.createElement('span');
+        const basis = Number(job.scan_total_bytes || 0) > 0 ? 'bytes checkpointed' : 'files checkpointed';
+        completedLabel.textContent = `${Math.min(Math.max(progress, 0), 100).toFixed(1)}% ${basis}`;
+        meta.appendChild(completedLabel);
+
+        const etaLabel = document.createElement('span');
+        const hasEta = job.scan_eta_seconds !== null && job.scan_eta_seconds !== undefined;
+        if (hasEta && Number.isFinite(Number(job.scan_eta_seconds))) {
+          etaLabel.textContent = `ETA ${formatDuration(job.scan_eta_seconds)} · ${job.scan_eta_confidence || 'low'} confidence`;
+        } else if (job.state === 'scanning') {
+          etaLabel.textContent = job.scan_eta_confidence === 'low' ? 'ETA suspended: current file is atypical' : 'Learning ETA';
+        } else {
+          etaLabel.textContent = `${job.scan_completed_files || 0}/${job.scan_total_files || 0} files`;
+        }
+        meta.appendChild(etaLabel);
+        td.appendChild(meta);
+
+        const track = document.createElement('div');
+        track.className = `scan-progress-track${job.state === 'scanning' ? ' is-active' : ''}`;
+        track.setAttribute('role', 'progressbar');
+        track.setAttribute('aria-label', 'Completed scan checkpoints');
+        track.setAttribute('aria-valuemin', '0');
+        track.setAttribute('aria-valuemax', '100');
+        track.setAttribute('aria-valuenow', String(Math.min(Math.max(progress, 0), 100)));
+        const fill = document.createElement('div');
+        fill.className = 'scan-progress-fill';
+        fill.style.width = `${Math.min(Math.max(progress, 0), 100)}%`;
+        track.appendChild(fill);
+        td.appendChild(track);
+
+        if (job.state === 'scanning' && job.scan_current_file) {
+          const note = document.createElement('div');
+          note.className = 'scan-current-note';
+          note.textContent = 'Current file progress is indeterminate; the exact percentage advances only after that file is safely checkpointed.';
+          td.appendChild(note);
+        }
+      }
       return td;
     }
 
@@ -1799,7 +2044,17 @@
     }
 
     function getDisplayedJobs() {
-      return [...latestJobs].sort(compareJobsByCreatedAt);
+      return latestJobs.filter((job) => {
+        const scanStates = ['scan_pending', 'scanning', 'scan_paused', 'scan_clean', 'promoting', 'scan_infected', 'deleting_infected'];
+        if (jobsFilter === 'scan_queue') return scanStates.includes(job.state);
+        if (jobsFilter === 'scan_paused') return job.state === 'scan_paused';
+        if (jobsFilter === 'failed') return job.state === 'error';
+        if (jobsFilter === 'completed') return ['done', 'infected_deleted'].includes(job.state);
+        if (jobsFilter === 'downloading') {
+          return !scanStates.includes(job.state) && !['done', 'infected_deleted', 'error'].includes(job.state);
+        }
+        return true;
+      }).sort(compareJobsByCreatedAt);
     }
 
     function pruneSelection() {
@@ -1815,7 +2070,7 @@
       ).length;
       const deleteEligible = jobs.filter((job) => selectedJobIds.has(job.id)).length;
       const scanNextEligible = jobs.filter(
-        (job) => selectedJobIds.has(job.id) && ['scan_pending', 'scanning', 'scan_paused'].includes(job.state)
+        (job) => selectedJobIds.has(job.id) && ['scan_pending', 'scanning'].includes(job.state)
       ).length;
       const pauseScanEligible = jobs.filter(
         (job) => selectedJobIds.has(job.id) && ['scan_pending', 'scanning'].includes(job.state)
@@ -1823,8 +2078,8 @@
       const resumeScanEligible = jobs.filter(
         (job) => selectedJobIds.has(job.id) && job.state === 'scan_paused'
       ).length;
-      const failedJobs = jobs.filter((job) => job.state === 'error').length;
-      const completedJobs = jobs.filter((job) => ['done', 'infected_deleted'].includes(job.state)).length;
+      const failedJobs = latestJobs.filter((job) => job.state === 'error').length;
+      const completedJobs = latestJobs.filter((job) => ['done', 'infected_deleted'].includes(job.state)).length;
       return {
         retryEligible,
         retryIneligibleSelected,
@@ -1880,21 +2135,21 @@
           ? ` Retry only applies to intake error rows; ${retryIneligibleSelected} selected active/non-error row${retryIneligibleSelected === 1 ? '' : 's'} will be skipped.`
           : '';
         setJobsToolbarStatus(
-          `${selectedVisibleCount} selected. Scan next: ${scanNextEligible}. Pause: ${pauseScanEligible}. Resume: ${resumeScanEligible}. Retry: ${retryEligible}. Move-to-NAS: ${moveNasEligible}. Forget: ${deleteEligible}.${skippedRetryText}`
+          `${selectedVisibleCount} selected. Prioritize: ${scanNextEligible}. Pause: ${pauseScanEligible}. Resume: ${resumeScanEligible}. Retry: ${retryEligible}. Move-to-NAS: ${moveNasEligible}. Forget: ${deleteEligible}.${skippedRetryText}`
         );
       }
     }
 
     function renderJobs(jobs) {
       jobsTbody.innerHTML = '';
-      const sortedJobs = [...jobs].sort(compareJobsByCreatedAt);
+      const sortedJobs = getDisplayedJobs();
 
       if (!Array.isArray(sortedJobs) || sortedJobs.length === 0) {
         const row = document.createElement('tr');
         row.className = 'empty-row';
         const cell = document.createElement('td');
         cell.colSpan = 8;
-        cell.textContent = 'No jobs yet.';
+        cell.textContent = latestJobs.length ? 'No jobs match this view.' : 'No jobs yet.';
         row.appendChild(cell);
         jobsTbody.appendChild(row);
         updateJobsToolbarState();
@@ -2030,7 +2285,8 @@
     }
 
     function getSelectedJobIds() {
-      return [...selectedJobIds];
+      const displayedIds = new Set(getDisplayedJobs().map((job) => job.id));
+      return [...selectedJobIds].filter((jobId) => displayedIds.has(jobId));
     }
 
     jobForm.addEventListener('submit', async (event) => {
@@ -2135,8 +2391,13 @@
       loadScannerStatus();
     });
     scannerSlotsSelect.addEventListener('change', updateScannerSlots);
+    scannerMaintenanceButton.addEventListener('click', updateScannerMaintenance);
     jobsSortSelect.addEventListener('change', () => {
       jobsSortOrder = jobsSortSelect.value;
+      renderJobs(latestJobs);
+    });
+    jobsFilterSelect.addEventListener('change', () => {
+      jobsFilter = jobsFilterSelect.value;
       renderJobs(latestJobs);
     });
     selectAllJobsCheckbox.addEventListener('change', () => {

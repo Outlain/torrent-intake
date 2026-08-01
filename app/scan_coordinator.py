@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from statistics import fmean
 from uuid import uuid4
 
 from sqlalchemy import delete, func, or_, select, update
@@ -16,7 +17,15 @@ from .config import get_settings
 from .db import SessionLocal
 from .models import Job, ScanFile, ScanRun, ScannerControl
 from .qbt import QbtService
-from .scanner import ScanInterrupted, ScannerService
+from .scanner import (
+    ScanInterrupted,
+    ScannerDefinitionsStale,
+    ScannerIdentity,
+    ScannerPolicyError,
+    ScannerService,
+    ScannerUnavailable,
+    parse_scanner_version,
+)
 
 
 SCAN_QUEUE_STATES = {"scan_pending", "scanning", "scan_paused"}
@@ -76,6 +85,7 @@ class ScanCoordinator:
         run.lease_expires_at = None
         run.heartbeat_at = None
         run.current_file = None
+        run.current_file_started_at = None
         run.verdict = None
         run.last_error = None
         run.updated_at = now
@@ -114,11 +124,16 @@ class ScanCoordinator:
                 run.lease_expires_at = None
                 run.heartbeat_at = None
                 run.current_file = None
+                run.current_file_started_at = None
                 run.updated_at = now
                 db.execute(
                     update(ScanFile)
                     .where(ScanFile.job_id == job.id, ScanFile.status == "scanning")
-                    .values(status="pending")
+                    .values(
+                        status="pending",
+                        scan_started_at=None,
+                        scan_duration_seconds=None,
+                    )
                 )
             elif job.state == "scan_pending" and run.queued_at is None:
                 run.queued_at = now
@@ -129,6 +144,10 @@ class ScanCoordinator:
         self.recover_interrupted_scans(db)
         now = datetime.utcnow()
         control = self.ensure_control(db)
+        if control.maintenance_mode:
+            return []
+        if not self.scanner.health().can_scan:
+            return []
         active_rows = list(
             db.execute(
                 select(Job, ScanRun)
@@ -196,6 +215,7 @@ class ScanCoordinator:
             run.lease_expires_at = now + timedelta(seconds=self._lease_seconds())
             run.next_attempt_at = None
             run.current_file = None
+            run.current_file_started_at = None
             run.attempts += 1
             run.updated_at = now
             db.add(run)
@@ -222,6 +242,7 @@ class ScanCoordinator:
                 return
 
             try:
+                identity = self.scanner.require_healthy(force=True)
                 torrent = self._find_torrent(job)
                 if torrent is None:
                     raise RuntimeError("qBittorrent torrent is temporarily unavailable")
@@ -239,13 +260,12 @@ class ScanCoordinator:
                 db.commit()
 
                 self.qbt.pause(torrent_hash)
-                scanner_version = self.scanner.scanner_version()
                 self._prepare_manifest(
                     db,
                     job,
                     run,
                     content_path,
-                    scanner_version,
+                    identity,
                     heartbeat=lambda: self._heartbeat(claim, stop_event),
                 )
 
@@ -262,11 +282,34 @@ class ScanCoordinator:
                         job.state = "scan_paused"
                         job.updated_at = datetime.utcnow()
                         run.current_file = None
+                        run.current_file_started_at = None
                         run.updated_at = datetime.utcnow()
                         self._release_lease(run)
                         db.add_all([job, run])
                         db.commit()
                         return
+                    if self._maintenance_requested(db):
+                        self._defer_claim(
+                            db,
+                            claim,
+                            "Scanner maintenance requested; scan drained after the current file.",
+                        )
+                        return
+
+                    identity = self.scanner.require_healthy(force=True)
+                    if self._identity_requires_reset(run, identity):
+                        self._prepare_manifest(
+                            db,
+                            job,
+                            run,
+                            content_path,
+                            identity,
+                            heartbeat=lambda: self._heartbeat(claim, stop_event),
+                        )
+                        continue
+                    self._sync_run_identity(run, identity)
+                    db.add(run)
+                    db.commit()
 
                     scan_file = db.scalar(
                         select(ScanFile)
@@ -282,7 +325,7 @@ class ScanCoordinator:
                             job,
                             run,
                             content_path,
-                            scanner_version,
+                            identity,
                             heartbeat=lambda: self._heartbeat(claim, stop_event),
                         )
                         db.expire_all()
@@ -309,8 +352,10 @@ class ScanCoordinator:
                     scan_file.status = "scanning"
                     scan_file.attempts += 1
                     scan_file.last_error = None
+                    scan_file.scan_started_at = datetime.utcnow()
                     run.current_file = scan_file.relative_path
-                    run.heartbeat_at = datetime.utcnow()
+                    run.current_file_started_at = scan_file.scan_started_at
+                    run.heartbeat_at = scan_file.scan_started_at
                     run.lease_expires_at = run.heartbeat_at + timedelta(seconds=self._lease_seconds())
                     run.updated_at = run.heartbeat_at
                     db.add_all([scan_file, run])
@@ -318,6 +363,7 @@ class ScanCoordinator:
 
                     result = self.scanner.scan_path(
                         str(absolute_path),
+                        identity=identity,
                         heartbeat=lambda: self._heartbeat(claim, stop_event),
                         should_stop=stop_event.is_set,
                     )
@@ -331,12 +377,20 @@ class ScanCoordinator:
 
                     scan_file.status = "infected" if result.infected else "clean"
                     scan_file.threat_name = result.threat_name
-                    scan_file.scanner_version = scanner_version
+                    scan_file.scanner_version = result.identity.raw_version
+                    scan_file.engine_version = result.identity.engine_version
+                    scan_file.database_version = result.identity.database_version
+                    scan_file.database_updated_at = result.identity.database_updated_at
+                    scan_file.policy_version = result.identity.policy_version
+                    scan_file.scan_started_at = result.scan_started_at
+                    scan_file.scan_duration_seconds = result.duration_seconds
                     scan_file.scanned_at = datetime.utcnow()
                     scan_file.last_error = None
                     run.completed_files += 1
                     run.completed_bytes += scan_file.size_bytes
                     run.current_file = None
+                    run.current_file_started_at = None
+                    self._sync_run_identity(run, result.identity)
                     run.failure_count = 0
                     run.last_error = None
                     run.updated_at = datetime.utcnow()
@@ -376,6 +430,11 @@ class ScanCoordinator:
                         db.add_all([job, run])
                         db.commit()
                         return
+            except (ScannerUnavailable, ScannerDefinitionsStale) as exc:
+                self._defer_claim(db, claim, str(exc), retry_after_seconds=30)
+            except ScannerPolicyError as exc:
+                self.logger.error("Scanner policy rejected job %s: %s", claim.job_id, exc)
+                self._handle_policy_failure(db, claim, str(exc))
             except ScanInterrupted as exc:
                 self._handle_interruption(db, claim, str(exc))
             except Exception as exc:
@@ -384,6 +443,7 @@ class ScanCoordinator:
 
     def scanner_status(self, db: Session) -> dict[str, object]:
         control = self.ensure_control(db)
+        health = self.scanner.health()
         now = datetime.utcnow()
         active = list(
             db.execute(
@@ -409,6 +469,11 @@ class ScanCoordinator:
             "queued": queued,
             "paused": paused,
             "boost_until_queue_empty": control.boost_until_queue_empty,
+            "maintenance_mode": control.maintenance_mode,
+            "maintenance_reason": control.maintenance_reason,
+            "maintenance_started_at": control.maintenance_started_at,
+            "maintenance_drained": control.maintenance_mode and not active,
+            "health": health.as_dict(),
         }
 
     def set_slots(self, db: Session, slots: int) -> dict[str, object]:
@@ -420,6 +485,23 @@ class ScanCoordinator:
         control.updated_at = datetime.utcnow()
         db.add(control)
         db.commit()
+        return self.scanner_status(db)
+
+    def set_maintenance(
+        self,
+        db: Session,
+        enabled: bool,
+        reason: str | None = None,
+    ) -> dict[str, object]:
+        control = self.ensure_control(db)
+        control.maintenance_mode = enabled
+        control.maintenance_reason = (reason or "").strip() or None if enabled else None
+        control.maintenance_started_at = datetime.utcnow() if enabled else None
+        control.updated_at = datetime.utcnow()
+        db.add(control)
+        db.commit()
+        if not enabled:
+            self.scanner.clear_health_cache()
         return self.scanner_status(db)
 
     def prioritize_jobs(self, db: Session, job_ids: list[str]) -> dict[str, object]:
@@ -458,9 +540,19 @@ class ScanCoordinator:
             job.scan_total_bytes = run.total_bytes if run else 0
             job.scan_completed_bytes = run.completed_bytes if run else 0
             job.scan_current_file = run.current_file if run else None
+            job.scan_current_file_started_at = run.current_file_started_at if run else None
             job.scan_queue_position = positions.get(job.id)
             job.scan_attempts = run.attempts if run else 0
             job.scan_last_error = run.last_error if run else None
+            job.scan_progress_percent = self._progress_percent(run)
+            job.scan_eta_seconds = None
+            job.scan_eta_confidence = None
+            if run and job.state == "scanning":
+                job.scan_eta_seconds, job.scan_eta_confidence = self._estimate_eta(db, run)
+            job.scan_engine_version = run.engine_version if run else None
+            job.scan_database_version = run.database_version if run else None
+            job.scan_database_updated_at = run.database_updated_at if run else None
+            job.scan_policy_version = run.policy_version if run else None
             job.scan_is_large = self._is_large(job, run) if run else (
                 isinstance(job.size_bytes, int) and job.size_bytes >= self.settings.large_scan_bytes
             )
@@ -474,7 +566,7 @@ class ScanCoordinator:
         job: Job,
         run: ScanRun,
         content_path: str,
-        scanner_version: str | None,
+        identity: ScannerIdentity,
         *,
         heartbeat: Callable[[], bool] | None = None,
     ) -> None:
@@ -482,11 +574,30 @@ class ScanCoordinator:
         manifest = self._filesystem_manifest(root, heartbeat=heartbeat)
         if heartbeat and not heartbeat():
             raise ScanInterrupted("scan lease was lost while preparing the manifest")
+        oversized = next(
+            (
+                (relative_path, size_bytes)
+                for relative_path, size_bytes, _ in manifest
+                if size_bytes > self.settings.scanner_max_file_bytes
+            ),
+            None,
+        )
+        if oversized:
+            relative_path, size_bytes = oversized
+            raise ScannerPolicyError(
+                f"{relative_path} is {size_bytes} bytes, above the configured ClamAV safety "
+                f"limit of {self.settings.scanner_max_file_bytes} bytes. The torrent was not "
+                "marked clean because ClamAV cannot fully inspect that file."
+            )
         root_changed = run.root_path != str(root)
+        legacy_engine = parse_scanner_version(run.scanner_version or "")[0]
+        stored_engine = run.engine_version or legacy_engine
         version_changed = bool(
-            run.scanner_version
-            and scanner_version
-            and run.scanner_version != scanner_version
+            run.root_path
+            and (
+                stored_engine != identity.engine_version
+                or run.policy_version != identity.policy_version
+            )
         )
         if root_changed:
             db.execute(delete(ScanFile).where(ScanFile.job_id == job.id))
@@ -517,7 +628,7 @@ class ScanCoordinator:
                 item.size_bytes != size_bytes
                 or item.mtime_ns != mtime_ns
                 or version_changed
-                or item.status == "scanning"
+                or item.status not in {"pending", "clean"}
             ):
                 item.size_bytes = size_bytes
                 item.mtime_ns = mtime_ns
@@ -525,6 +636,12 @@ class ScanCoordinator:
                 item.threat_name = None
                 item.scanned_at = None
                 item.scanner_version = None
+                item.engine_version = None
+                item.database_version = None
+                item.database_updated_at = None
+                item.policy_version = None
+                item.scan_started_at = None
+                item.scan_duration_seconds = None
                 item.last_error = None
                 db.add(item)
 
@@ -535,8 +652,11 @@ class ScanCoordinator:
         run.completed_files = sum(1 for item in files if item.status == "clean")
         run.total_bytes = sum(item.size_bytes for item in files)
         run.completed_bytes = sum(item.size_bytes for item in files if item.status == "clean")
-        run.scanner_version = scanner_version
+        self._sync_run_identity(run, identity)
         run.current_file = None
+        run.current_file_started_at = None
+        if version_changed:
+            run.verdict = None
         run.updated_at = datetime.utcnow()
         db.add(run)
         db.commit()
@@ -594,10 +714,17 @@ class ScanCoordinator:
             scan_file.status = "pending"
             scan_file.scanned_at = None
             scan_file.scanner_version = None
+            scan_file.engine_version = None
+            scan_file.database_version = None
+            scan_file.database_updated_at = None
+            scan_file.policy_version = None
+            scan_file.scan_started_at = None
+            scan_file.scan_duration_seconds = None
 
     def _finish_clean_scan(self, db: Session, job: Job, run: ScanRun) -> None:
         run.verdict = "clean"
         run.current_file = None
+        run.current_file_started_at = None
         run.last_error = None
         run.updated_at = datetime.utcnow()
         job.scan_completed_at = datetime.utcnow()
@@ -637,13 +764,19 @@ class ScanCoordinator:
         db.execute(
             update(ScanFile)
             .where(ScanFile.job_id == job.id, ScanFile.status == "scanning")
-            .values(status="pending", last_error=message)
+            .values(
+                status="pending",
+                scan_started_at=None,
+                scan_duration_seconds=None,
+                last_error=message,
+            )
         )
         job.state = "scan_paused" if run.pause_requested else "scan_pending"
         job.updated_at = datetime.utcnow()
         run.queued_at = datetime.utcnow()
         run.last_error = message
         run.current_file = None
+        run.current_file_started_at = None
         run.updated_at = datetime.utcnow()
         self._release_lease(run)
         db.add_all([job, run])
@@ -659,11 +792,17 @@ class ScanCoordinator:
         db.execute(
             update(ScanFile)
             .where(ScanFile.job_id == job.id, ScanFile.status == "scanning")
-            .values(status="pending", last_error=message)
+            .values(
+                status="pending",
+                scan_started_at=None,
+                scan_duration_seconds=None,
+                last_error=message,
+            )
         )
         run.failure_count += 1
         run.last_error = message
         run.current_file = None
+        run.current_file_started_at = None
         run.updated_at = datetime.utcnow()
         self._release_lease(run)
 
@@ -679,6 +818,78 @@ class ScanCoordinator:
             job.is_terminal = False
             job.last_error = f"Scan interrupted; retrying in {delay}s: {message}"
         job.updated_at = datetime.utcnow()
+        db.add_all([job, run])
+        db.commit()
+
+    def _defer_claim(
+        self,
+        db: Session,
+        claim: ScanClaim,
+        message: str,
+        *,
+        retry_after_seconds: int = 0,
+    ) -> None:
+        db.rollback()
+        job = db.get(Job, claim.job_id)
+        run = db.get(ScanRun, claim.job_id)
+        if not job or not run or run.worker_id != claim.worker_id:
+            return
+        db.execute(
+            update(ScanFile)
+            .where(ScanFile.job_id == job.id, ScanFile.status == "scanning")
+            .values(
+                status="pending",
+                scan_started_at=None,
+                scan_duration_seconds=None,
+                last_error=message,
+            )
+        )
+        now = datetime.utcnow()
+        job.state = "scan_paused" if run.pause_requested else "scan_pending"
+        job.is_terminal = False
+        job.last_error = message
+        job.updated_at = now
+        run.queued_at = now
+        run.next_attempt_at = (
+            now + timedelta(seconds=max(retry_after_seconds, 0))
+            if retry_after_seconds
+            else None
+        )
+        run.last_error = message
+        run.current_file = None
+        run.current_file_started_at = None
+        run.updated_at = now
+        self._release_lease(run)
+        db.add_all([job, run])
+        db.commit()
+
+    def _handle_policy_failure(self, db: Session, claim: ScanClaim, message: str) -> None:
+        db.rollback()
+        job = db.get(Job, claim.job_id)
+        run = db.get(ScanRun, claim.job_id)
+        if not job or not run or run.worker_id != claim.worker_id:
+            return
+        db.execute(
+            update(ScanFile)
+            .where(ScanFile.job_id == job.id, ScanFile.status == "scanning")
+            .values(
+                status="error",
+                scan_duration_seconds=None,
+                last_error=message,
+            )
+        )
+        now = datetime.utcnow()
+        job.state = "error"
+        job.is_terminal = True
+        job.last_error = f"Scanner safety check blocked promotion: {message}"
+        job.updated_at = now
+        run.verdict = "error"
+        run.last_error = message
+        run.current_file = None
+        run.current_file_started_at = None
+        run.next_attempt_at = None
+        run.updated_at = now
+        self._release_lease(run)
         db.add_all([job, run])
         db.commit()
 
@@ -704,18 +915,14 @@ class ScanCoordinator:
         job = db.get(Job, job_id)
         if not job:
             raise LookupError("Job not found")
-        if job.state not in SCAN_QUEUE_STATES:
-            raise ValueError("Only queued, active, or paused scans can be prioritized")
+        if job.state not in {"scan_pending", "scanning"}:
+            raise ValueError("Only queued or active scans can be prioritized; resume paused scans explicitly")
         run = db.get(ScanRun, job.id)
         if run is None:
             run = ScanRun(job_id=job.id)
         run.priority = max(run.priority or 0, 100)
-        run.pause_requested = False
         run.queued_at = datetime.utcnow()
         run.updated_at = datetime.utcnow()
-        if job.state == "scan_paused":
-            job.state = "scan_pending"
-            job.updated_at = datetime.utcnow()
         db.add_all([job, run])
         db.commit()
 
@@ -792,6 +999,117 @@ class ScanCoordinator:
         if candidate != root and root not in candidate.parents:
             raise RuntimeError(f"scan file escaped its root: {relative_path}")
         return candidate
+
+    def _maintenance_requested(self, db: Session) -> bool:
+        return bool(
+            db.scalar(
+                select(ScannerControl.maintenance_mode).where(ScannerControl.id == 1)
+            )
+        )
+
+    def _identity_requires_reset(self, run: ScanRun, identity: ScannerIdentity) -> bool:
+        if not run.root_path:
+            return False
+        legacy_engine = parse_scanner_version(run.scanner_version or "")[0]
+        stored_engine = run.engine_version or legacy_engine
+        return (
+            stored_engine != identity.engine_version
+            or run.policy_version != identity.policy_version
+        )
+
+    @staticmethod
+    def _sync_run_identity(run: ScanRun, identity: ScannerIdentity) -> None:
+        run.scanner_version = identity.raw_version
+        run.engine_version = identity.engine_version
+        run.database_version = identity.database_version
+        run.database_updated_at = identity.database_updated_at
+        run.policy_version = identity.policy_version
+
+    @staticmethod
+    def _progress_percent(run: ScanRun | None) -> float | None:
+        if run is None:
+            return None
+        if run.total_bytes > 0:
+            return round(min(max(run.completed_bytes / run.total_bytes * 100, 0.0), 100.0), 1)
+        if run.total_files > 0:
+            return round(min(max(run.completed_files / run.total_files * 100, 0.0), 100.0), 1)
+        if run.verdict == "clean":
+            return 100.0
+        return None
+
+    def _estimate_eta(self, db: Session, run: ScanRun) -> tuple[int | None, str | None]:
+        samples = list(
+            db.scalars(
+                select(ScanFile)
+                .where(
+                    ScanFile.job_id == run.job_id,
+                    ScanFile.status == "clean",
+                    ScanFile.scan_duration_seconds.is_not(None),
+                    ScanFile.scan_duration_seconds > 0,
+                )
+                .order_by(ScanFile.scanned_at.desc())
+                .limit(100)
+            )
+        )
+        if len(samples) < 3:
+            return None, None
+
+        remaining_count, remaining_bytes = db.execute(
+            select(func.count(), func.coalesce(func.sum(ScanFile.size_bytes), 0)).where(
+                ScanFile.job_id == run.job_id,
+                ScanFile.status.in_(("pending", "scanning")),
+            )
+        ).one()
+        if not remaining_count:
+            return 0, "high"
+
+        mib = 1024 * 1024
+        sizes = [sample.size_bytes / mib for sample in samples]
+        durations = [float(sample.scan_duration_seconds or 0) for sample in samples]
+        mean_size = fmean(sizes)
+        mean_duration = fmean(durations)
+        variance = sum((size - mean_size) ** 2 for size in sizes)
+        if variance > 1e-9:
+            slope = max(
+                sum(
+                    (size - mean_size) * (duration - mean_duration)
+                    for size, duration in zip(sizes, durations)
+                )
+                / variance,
+                0.0,
+            )
+            intercept = max(mean_duration - slope * mean_size, 0.05)
+        else:
+            slope = 0.0
+            intercept = max(mean_duration, 0.05)
+
+        estimate = intercept * int(remaining_count) + slope * (int(remaining_bytes) / mib)
+        predictions = [intercept + slope * size for size in sizes]
+        relative_error = fmean(
+            abs(predicted - duration) / max(duration, 0.1)
+            for predicted, duration in zip(predictions, durations)
+        )
+
+        current = db.scalar(
+            select(ScanFile).where(
+                ScanFile.job_id == run.job_id,
+                ScanFile.status == "scanning",
+            )
+        )
+        if current and current.scan_started_at:
+            elapsed = max((datetime.utcnow() - current.scan_started_at).total_seconds(), 0.0)
+            predicted_current = intercept + slope * (current.size_bytes / mib)
+            if elapsed > max(predicted_current * 2, 60):
+                return None, "low"
+            estimate -= min(elapsed, predicted_current)
+
+        if len(samples) >= 30 and relative_error <= 0.35:
+            confidence = "high"
+        elif len(samples) >= 10 and relative_error <= 0.75:
+            confidence = "medium"
+        else:
+            confidence = "low"
+        return max(int(estimate + 0.5), 0), confidence
 
     def _scan_activity_summary(self, job: Job, run: ScanRun | None) -> str:
         state_labels = {
