@@ -28,15 +28,15 @@ jobs:
           docker compose -f portainer-stack.example.yml config --quiet
 
       - name: Build application image
-        run: docker build --tag torrent-intake-mvp:test .
+        run: docker build --tag torrent-intake:test .
 
       - name: Run application tests in the built image
-        run: docker run --rm --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python torrent-intake-mvp:test -m unittest discover -s /workspace/tests -v
+        run: docker run --rm --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python torrent-intake:test -m unittest discover -s /workspace/tests -v
 
       - name: Verify application hardening compatibility
         run: |
-          docker run --rm --entrypoint id torrent-intake-mvp:test -u | grep -qx 10001
-          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m --entrypoint python torrent-intake-mvp:test -c 'import app.scanner, app.paths, app.torrent_guard'
+          docker run --rm --entrypoint id torrent-intake:test -u | grep -qx 10001
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m --entrypoint python torrent-intake:test -c 'import app.scanner, app.paths, app.torrent_guard'
 
       - name: Build ClamD image
         run: docker build --file Dockerfile.clamd --tag torrent-intake-clamd:test .
@@ -54,9 +54,9 @@ jobs:
 
       - name: Validate arm64 builds
         run: |
-          docker buildx build --platform linux/arm64 --load --tag torrent-intake-mvp:test-arm64 .
+          docker buildx build --platform linux/arm64 --load --tag torrent-intake:test-arm64 .
           docker buildx build --platform linux/arm64 --load --file Dockerfile.clamd --tag torrent-intake-clamd:test-arm64 .
-          docker run --rm --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python torrent-intake-mvp:test-arm64 -m unittest discover -s /workspace/tests -v
+          docker run --rm --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python torrent-intake:test-arm64 -m unittest discover -s /workspace/tests -v
 
   publish:
     if: github.event_name != 'pull_request'
@@ -68,7 +68,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - image: torrent-intake-mvp
+          - image: torrent-intake
             dockerfile: Dockerfile
           - image: torrent-intake-clamd
             dockerfile: Dockerfile.clamd
