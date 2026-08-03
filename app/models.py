@@ -112,6 +112,7 @@ class ScanFile(Base):
     database_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     database_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     policy_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scan_method: Mapped[str | None] = mapped_column(String(64), nullable=True)
     scan_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     scan_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     scanned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

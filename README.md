@@ -35,11 +35,22 @@ manifest, streams the descriptor, then verifies both descriptor and pathname
 identity again. ClamAV limit detections, malformed replies, unavailable/stale
 definitions, and socket failures never become clean verdicts.
 
-The default per-file limit is `2000 MiB`, matching the bounded sidecar. A larger
-file or a `Heuristics.Limits.Exceeded`/stream-limit reply becomes a durable
-`scan_failed` event with `failure_kind=scan_policy_limit`; the job enters an error
-state and the paused torrent is not promoted. Media extensions are not an
-allow-list because an extension is not proof of content type or safety.
+The native per-file ClamD limit remains `2000 MiB`. That is now a routing boundary,
+not the application's final ceiling. A larger file is accepted only when
+`ffprobe` identifies an approved container with a real video stream and no
+unsupported stream or attachment type. Torrent Intake then reads every byte in
+independent `1024 MiB` ClamD windows with a `1024 KiB` overlap. The overlap keeps
+signatures crossing a window edge visible; one large-media scan slot is used by
+default. Device, inode, size, mtime, and ctime are still checked throughout.
+
+This policy is intentionally recorded as `large_media_full_byte_windows`, not a
+native whole-file ClamAV verdict. ClamD sees all raw bytes and `ffprobe` validates
+the container, but whole-file hashes and parsers cannot span independent ClamD
+windows. The default bounded ceiling is `100 GiB`, so normal 5-50 GiB MKV/MP4
+files can complete without being skipped. Oversized archives, disk images,
+executables, audio-only files, unknown formats, unsafe media attachments, files
+above the configured ceiling, and any limit/error response remain held with no
+clean verdict. A filename extension never selects the large-media path.
 
 ## qBittorrent safety gates
 
@@ -161,10 +172,18 @@ show all bounded scanner settings. Important values include:
 | `TI_NAS_STAGING_ROOT` | `/downloads/torrent-intake/staging` | exact NAS staging boundary |
 | `TI_FINAL_PARENT_PREFIX` | `/downloads` | primary allowed media root |
 | `TI_FINAL_PARENT_PREFIXES` | empty | optional additional mounted media roots |
-| `TI_SCANNER_MAX_FILE_MIB` | `2000` | per-file fail-closed ClamD bound |
+| `TI_SCANNER_MAX_FILE_MIB` | `2000` | native ClamD boundary; larger verified videos use the large-media route |
+| `TI_SCANNER_POLICY_VERSION` | `clamav-policy-v3-large-media` | checkpoint policy identity; changing it deliberately reschedules prior file checkpoints |
 | `TI_SCANNER_SCAN_TIMEOUT_SECONDS` | `1200` | total per-file client deadline |
+| `TI_LARGE_MEDIA_ENABLED` | `true` | enable verified oversized-video routing |
+| `TI_LARGE_MEDIA_MAX_FILE_GIB` | `100` | hard ceiling for one oversized video |
+| `TI_LARGE_MEDIA_CHUNK_MIB` | `1024` | independent ClamD window, below the native limit |
+| `TI_LARGE_MEDIA_OVERLAP_KIB` | `1024` | repeated bytes between adjacent windows |
+| `TI_LARGE_MEDIA_PROBE_TIMEOUT_SECONDS` | `120` | ffprobe container-validation deadline |
+| `TI_LARGE_MEDIA_SCAN_TIMEOUT_SECONDS` | `21600` | total large-video scan deadline |
 | `TI_MAX_CONCURRENT_SCANS` | `2` | normal scan slots |
 | `TI_MAX_SCAN_SLOTS` | `4` | operator hard ceiling |
+| `TI_LARGE_SCAN_GIB` | `2` | jobs at/above this size use the bounded large-scan slot |
 | `TI_INFECTED_ACTION` | `hold` | `hold`, `quarantine`, or `delete` |
 
 Local capacity control retains the existing behavior: a hard per-torrent local
@@ -240,9 +259,11 @@ docker compose -f docker-compose.example.yml up -d
 ```
 
 At startup SQLAlchemy creates new tables and `upgrade_schema()` applies additive,
-idempotent columns/indexes to existing SQLite databases. Back up the database
-before the first deployment. Per-file scan state and interrupted actions are
-recovered automatically.
+idempotent columns/indexes to existing SQLite databases, including the per-file
+`scan_method` audit field. Back up the database before the first deployment.
+Per-file scan state and interrupted actions are recovered automatically. The
+large-media policy-version change intentionally invalidates old clean
+checkpoints so eligible files are evaluated under the new route once.
 
 ```sh
 docker build -t torrent-intake-mvp:test .

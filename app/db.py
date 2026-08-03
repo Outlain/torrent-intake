@@ -67,6 +67,7 @@ SCHEMA_ADDITIONS: dict[str, dict[str, str]] = {
         "database_version": "VARCHAR(64)",
         "database_updated_at": "DATETIME",
         "policy_version": "VARCHAR(128)",
+        "scan_method": "VARCHAR(64)",
         "scan_started_at": "DATETIME",
         "scan_duration_seconds": "FLOAT",
     },

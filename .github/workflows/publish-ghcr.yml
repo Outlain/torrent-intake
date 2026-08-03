@@ -36,6 +36,7 @@ jobs:
       - name: Verify application hardening compatibility
         run: |
           docker run --rm --entrypoint id torrent-intake:test -u | grep -qx 10001
+          docker run --rm --entrypoint ffprobe torrent-intake:test -version
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m --entrypoint python torrent-intake:test -c 'import app.scanner, app.paths, app.torrent_guard'
 
       - name: Build ClamD image

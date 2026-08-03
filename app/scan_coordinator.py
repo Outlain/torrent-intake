@@ -411,6 +411,7 @@ class ScanCoordinator:
                     scan_file.database_version = result.identity.database_version
                     scan_file.database_updated_at = result.identity.database_updated_at
                     scan_file.policy_version = result.identity.policy_version
+                    scan_file.scan_method = result.scan_method
                     scan_file.scan_started_at = result.scan_started_at
                     scan_file.scan_duration_seconds = result.duration_seconds
                     scan_file.scanned_at = datetime.utcnow()
@@ -614,21 +615,6 @@ class ScanCoordinator:
         manifest = self._filesystem_manifest(root, heartbeat=heartbeat)
         if heartbeat and not heartbeat():
             raise ScanInterrupted("scan lease was lost while preparing the manifest")
-        oversized = next(
-            (
-                (relative_path, size_bytes)
-                for relative_path, size_bytes, *_ in manifest
-                if size_bytes > self.settings.scanner_max_file_bytes
-            ),
-            None,
-        )
-        if oversized:
-            relative_path, size_bytes = oversized
-            raise ScannerPolicyError(
-                f"{relative_path} is {size_bytes} bytes, above the configured ClamAV safety "
-                f"limit of {self.settings.scanner_max_file_bytes} bytes. The torrent was not "
-                "marked clean because ClamAV cannot fully inspect that file."
-            )
         root_changed = run.root_path != str(root)
         legacy_engine = parse_scanner_version(run.scanner_version or "")[0]
         stored_engine = run.engine_version or legacy_engine
@@ -689,6 +675,7 @@ class ScanCoordinator:
                 item.database_version = None
                 item.database_updated_at = None
                 item.policy_version = None
+                item.scan_method = None
                 item.scan_started_at = None
                 item.scan_duration_seconds = None
                 item.last_error = None
@@ -785,6 +772,7 @@ class ScanCoordinator:
             scan_file.database_version = None
             scan_file.database_updated_at = None
             scan_file.policy_version = None
+            scan_file.scan_method = None
             scan_file.scan_started_at = None
             scan_file.scan_duration_seconds = None
 

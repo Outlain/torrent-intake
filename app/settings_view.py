@@ -202,6 +202,46 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         "Definition age in hours at which scanning fails closed until current definitions are available.",
         safety_critical=True,
     ),
+    "large_media_enabled": SettingSpec(
+        "ClamAV scanner",
+        "Large-media scanner",
+        "Routes oversized, verified video containers through full-byte overlapping ClamD windows instead of treating them as clean or skipping them.",
+        safety_critical=True,
+    ),
+    "large_media_max_file_gib": SettingSpec(
+        "ClamAV scanner",
+        "Maximum large-media size",
+        "Hard GiB ceiling for the bounded large-media path. Larger individual files remain held without a clean verdict.",
+        safety_critical=True,
+    ),
+    "large_media_chunk_mib": SettingSpec(
+        "ClamAV scanner",
+        "Large-media ClamD window",
+        "MiB sent in each independent ClamD window. It must remain below the native ClamD stream limit.",
+        safety_critical=True,
+    ),
+    "large_media_overlap_kib": SettingSpec(
+        "ClamAV scanner",
+        "Large-media window overlap",
+        "KiB repeated between neighboring windows so signatures crossing a window boundary are still visible.",
+        safety_critical=True,
+    ),
+    "large_media_probe_timeout_seconds": SettingSpec(
+        "ClamAV scanner",
+        "Media validation timeout",
+        "Maximum time allowed for ffprobe to verify the real container and stream layout of an oversized file.",
+    ),
+    "large_media_scan_timeout_seconds": SettingSpec(
+        "ClamAV scanner",
+        "Large-media scan timeout",
+        "Total deadline for validating and reading every window of one oversized video file.",
+    ),
+    "ffprobe_binary": SettingSpec(
+        "ClamAV scanner",
+        "ffprobe executable",
+        "Image-provided ffprobe path used to validate oversized media. The Docker image installs it at build time.",
+        safety_critical=True,
+    ),
     "max_concurrent_scans": SettingSpec(
         "Scan scheduling",
         "Default concurrent scans",
