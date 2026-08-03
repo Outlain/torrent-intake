@@ -2,6 +2,9 @@
 .git
 .gitignore
 .github
+tests/
+docker-compose*.yml
+portainer-stack*.yml
 
 # Local configuration/secrets
 .env

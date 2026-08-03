@@ -1,98 +1,123 @@
 services:
   torrent-intake:
-    # Option A (recommended for deployment): pull from GHCR
-    image: ghcr.io/outlain/torrent-intake-mvp:latest
-    # Option B (local build): comment image and uncomment build
-    # build: /opt/docker/torrent-intake
-
+    image: ghcr.io/${GITHUB_OWNER:-outlain}/torrent-intake-mvp:${IMAGE_TAG:-latest}
     container_name: torrent-intake
+    user: "${INTAKE_UID:-10001}:${INTAKE_GID:-10001}"
+    init: true
     restart: unless-stopped
-
+    read_only: true
     environment:
-      - TI_DEBUG=false
-      - TI_DATABASE_URL=sqlite:////app/data/torrent_intake.db
-
-      - TI_QBT_HOST=http://qbittorrent:8080
-      - TI_QBT_USERNAME=admin
-      - TI_QBT_PASSWORD=REPLACE_WITH_STRONG_PASSWORD
-      - TI_QBT_VERIFY_CERTIFICATE=false
-      - TI_QBT_REQUEST_TIMEOUT_SECONDS=20
-      - TI_QBT_WEB_URL=http://localhost:8080
-
-      - TI_INTAKE_CATEGORY=intake
-      - TI_MANAGED_TAG=torrent_intake
-      - TI_AUTO_CREATE_FINAL_CATEGORY=true
-      - TI_LOCAL_STAGING_ROOT=/staging-local
-      - TI_NAS_STAGING_ROOT=/downloads/torrent-intake/staging
-      - TI_FINAL_PARENT_PREFIX=/downloads
-      - TI_FINAL_PARENT_PREFIXES=/downloads,/downloads2,/downloads3
-      # Aggregate local overflow policy for jobs still under TI_LOCAL_MAX_GIB
-      - TI_LOCAL_OVERFLOW_POLICY=queue
-      # Hard per-torrent cutoff. Larger local-preference torrents move to NAS immediately.
-      - TI_LOCAL_MAX_GIB=200
-      - TI_LOCAL_FREE_SPACE_BUFFER_GIB=5
-      - TI_POLLING_INTERVAL_SECONDS=300
-      - TI_COMPLETION_GRACE_SECONDS=15
-      - TI_COMPLETION_EVENT_TOKEN=REPLACE_WITH_RANDOM_TOKEN
-
-      - TI_SCANNER_BACKEND=clamd
-      - TI_CLAMD_SOCKET_PATH=/run/clamav/clamd.sock
-      - TI_SCANNER_POLICY_VERSION=clamav-policy-v1
-      - TI_SCANNER_MAX_FILE_MIB=2000
-      - TI_SCANNER_DEFINITIONS_WARN_HOURS=36
-      - TI_SCANNER_DEFINITIONS_STALE_HOURS=72
-      - TI_MAX_CONCURRENT_SCANS=2
-      - TI_MAX_SCAN_SLOTS=4
-      - TI_MAX_CONCURRENT_LARGE_SCANS=1
-      - TI_LARGE_SCAN_GIB=100
-      - TI_SCAN_SCHEDULER_INTERVAL_SECONDS=3
-      - TI_SCAN_LEASE_SECONDS=90
-      - TI_SCAN_HEARTBEAT_SECONDS=10
-      - TI_SCAN_RETRY_BASE_SECONDS=30
-      - TI_SCAN_MAX_FAILURES=3
-      - TI_SCAN_YIELD_AFTER_FILES=10
-
-      # Optional: only used for malware detection/deletion alerts
-      - TI_TELEGRAM_BOT_TOKEN=
-      - TI_TELEGRAM_CHAT_ID=
-
+      TI_DEBUG: "false"
+      TI_DATABASE_URL: sqlite:////app/data/torrent_intake.db
+      # Keep this URL compatible with the qBittorrent/Gluetun network arrangement.
+      TI_QBT_HOST: ${TI_QBT_HOST:-http://qbittorrent:8080}
+      TI_QBT_USERNAME: ${TI_QBT_USERNAME:-admin}
+      TI_QBT_PASSWORD: ${TI_QBT_PASSWORD:?set TI_QBT_PASSWORD in .env}
+      TI_QBT_VERIFY_CERTIFICATE: "false"
+      TI_QBT_REQUEST_TIMEOUT_SECONDS: "20"
+      TI_QBT_WEB_URL: ${TI_QBT_WEB_URL:-http://localhost:8080}
+      TI_INTAKE_CATEGORY: intake
+      TI_MANAGED_TAG: torrent_intake
+      TI_AUTO_CREATE_FINAL_CATEGORY: "true"
+      TI_LOCAL_STAGING_ROOT: /staging-local
+      TI_NAS_STAGING_ROOT: /downloads/torrent-intake/staging
+      TI_FINAL_PARENT_PREFIX: /downloads
+      TI_FINAL_PARENT_PREFIXES: ${TI_FINAL_PARENT_PREFIXES:-}
+      TI_LOCAL_OVERFLOW_POLICY: ${TI_LOCAL_OVERFLOW_POLICY:-queue}
+      TI_LOCAL_MAX_GIB: ${TI_LOCAL_MAX_GIB:-200}
+      TI_LOCAL_FREE_SPACE_BUFFER_GIB: ${TI_LOCAL_FREE_SPACE_BUFFER_GIB:-5}
+      TI_POLLING_INTERVAL_SECONDS: ${TI_POLLING_INTERVAL_SECONDS:-300}
+      TI_COMPLETION_GRACE_SECONDS: "15"
+      TI_COMPLETION_EVENT_TOKEN: ${TI_COMPLETION_EVENT_TOKEN:?set TI_COMPLETION_EVENT_TOKEN in .env}
+      TI_SCANNER_BACKEND: clamd
+      TI_CLAMD_SOCKET_PATH: /run/clamav/clamd.sock
+      TI_SCANNER_POLICY_VERSION: clamav-policy-v2-instream
+      TI_SCANNER_MAX_FILE_MIB: ${TI_SCANNER_MAX_FILE_MIB:-2000}
+      TI_SCANNER_HEALTH_CACHE_SECONDS: "15"
+      TI_SCANNER_CONNECT_TIMEOUT_SECONDS: "5"
+      TI_SCANNER_SCAN_TIMEOUT_SECONDS: ${TI_SCANNER_SCAN_TIMEOUT_SECONDS:-1200}
+      TI_SCANNER_DEFINITIONS_WARN_HOURS: "36"
+      TI_SCANNER_DEFINITIONS_STALE_HOURS: "48"
+      TI_MAX_CONCURRENT_SCANS: ${TI_MAX_CONCURRENT_SCANS:-2}
+      TI_MAX_SCAN_SLOTS: ${TI_MAX_SCAN_SLOTS:-4}
+      TI_MAX_CONCURRENT_LARGE_SCANS: ${TI_MAX_CONCURRENT_LARGE_SCANS:-1}
+      TI_LARGE_SCAN_GIB: ${TI_LARGE_SCAN_GIB:-100}
+      TI_SCAN_SCHEDULER_INTERVAL_SECONDS: "3"
+      TI_SCAN_LEASE_SECONDS: "90"
+      TI_SCAN_HEARTBEAT_SECONDS: "10"
+      TI_SCAN_RETRY_BASE_SECONDS: "30"
+      TI_SCAN_MAX_FAILURES: "3"
+      TI_SCAN_YIELD_AFTER_FILES: "10"
+      TI_PAUSE_CONFIRMATION_TIMEOUT_SECONDS: "30"
+      TI_INFECTED_ACTION: ${TI_INFECTED_ACTION:-hold}
+      TI_QUARANTINE_ROOT: /quarantine
+      TI_EVENT_DIR: /events
     volumes:
-      # Example host paths only; replace to match your host
-      - /opt/docker/torrent-intake-data/data:/app/data
-      - /opt/docker/torrent-intake-data/logs:/app/logs
-      - /opt/torrent-intake/staging:/staging-local
-      - /mnt/media:/downloads
-      - clamav-socket:/run/clamav
-
+      - /opt/docker/torrent-intake/data:/app/data:rw
+      - /mnt/bulk/docker/torrent-intake/staging:/staging-local:rw
+      - /mnt/media:/downloads:rw
+      - /opt/docker/clamav-shared/events/torrent-intake:/events:rw
+      - /opt/docker/clamav-shared/quarantine/torrent-intake:/quarantine:rw
+      - clamav-socket:/run/clamav:rw
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
     ports:
-      - "8095:8000"
-
+      # The intake UI/API has no user authentication.
+      - "127.0.0.1:${TI_UI_HOST_PORT:-8095}:8000"
     depends_on:
-      clamav:
+      torrent-intake-clamd:
         condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2.0
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-  clamav:
-    # Feature tag follows 1.5.x security patches when the stack pulls again.
-    image: clamav/clamav:1.5_base
-    pull_policy: always
-    container_name: torrent-intake-clamav
+  torrent-intake-clamd:
+    image: ghcr.io/${GITHUB_OWNER:-outlain}/torrent-intake-clamd:${IMAGE_TAG:-latest}
+    container_name: torrent-intake-clamd
+    user: "${INTAKE_UID:-10001}:${INTAKE_GID:-10001}"
+    init: true
     restart: unless-stopped
+    read_only: true
+    network_mode: none
     environment:
-      - CLAMAV_NO_MILTERD=true
-      - CLAMD_STARTUP_TIMEOUT=1800
-      - FRESHCLAM_CHECKS=12
+      DEFINITIONS_DIR: /var/lib/clamav
+      DEFINITIONS_WAIT_TIMEOUT: "1800"
+      DEFINITIONS_MAX_AGE_SECONDS: ${DEFINITIONS_MAX_AGE_SECONDS:-172800}
+      CLAMD_SOCKET: /run/clamav/clamd.sock
     volumes:
-      - clamav-database:/var/lib/clamav
-      - clamav-socket:/tmp
-      - ./clamav/clamd.conf:/etc/clamav/clamd.conf:ro
-      # Paths must exactly match the app container because SCAN sends a path.
-      - /opt/torrent-intake/staging:/staging-local:ro
-      - /mnt/media:/downloads:ro
-    # ClamAV recommends roughly 4 GiB RAM; do not deploy this sidecar on a
-    # host that cannot provide enough memory during concurrent DB reloads.
+      - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
+      - clamav-socket:/run/clamav:rw
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 4g
+    cpus: 2.0
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
-  clamav-database:
   clamav-socket:

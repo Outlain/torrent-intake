@@ -52,6 +52,17 @@ class ScanCheckpointTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.engine.dispose()
 
+    def test_manifest_rejects_symlinked_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "content"
+            root.mkdir()
+            outside = base / "outside.bin"
+            outside.write_bytes(b"outside")
+            (root / "escape.bin").symlink_to(outside)
+            with self.assertRaisesRegex(RuntimeError, "symbolic-link file"):
+                self.coordinator._filesystem_manifest(root)
+
     def test_definition_update_preserves_checkpoint_but_engine_update_resets_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory, Session(self.engine) as db:
             path = Path(directory) / "payload.bin"

@@ -975,7 +975,10 @@
     }
 
     .state-pill[data-state="scan_infected"],
+    .state-pill[data-state="quarantining_infected"],
     .state-pill[data-state="deleting_infected"],
+    .state-pill[data-state="infected_held"],
+    .state-pill[data-state="infected_quarantined"],
     .state-pill[data-state="infected_deleted"],
     .state-pill[data-state="error"] {
       background: rgba(153, 47, 47, 0.14);
@@ -1991,7 +1994,7 @@
 
       const hasProgress = job.scan_progress_percent !== null && job.scan_progress_percent !== undefined;
       const progress = Number(job.scan_progress_percent);
-      const scanStates = ['scan_pending', 'scanning', 'scan_paused', 'scan_clean', 'promoting', 'scan_infected', 'deleting_infected'];
+      const scanStates = ['scan_pending', 'scanning', 'scan_paused', 'scan_clean', 'promoting', 'scan_infected', 'quarantining_infected', 'deleting_infected'];
       if (scanStates.includes(job.state) && hasProgress && Number.isFinite(progress)) {
         td.classList.add('scan-activity');
         const meta = document.createElement('div');
@@ -2045,13 +2048,13 @@
 
     function getDisplayedJobs() {
       return latestJobs.filter((job) => {
-        const scanStates = ['scan_pending', 'scanning', 'scan_paused', 'scan_clean', 'promoting', 'scan_infected', 'deleting_infected'];
+        const scanStates = ['scan_pending', 'scanning', 'scan_paused', 'scan_clean', 'promoting', 'scan_infected', 'quarantining_infected', 'deleting_infected'];
         if (jobsFilter === 'scan_queue') return scanStates.includes(job.state);
         if (jobsFilter === 'scan_paused') return job.state === 'scan_paused';
         if (jobsFilter === 'failed') return job.state === 'error';
-        if (jobsFilter === 'completed') return ['done', 'infected_deleted'].includes(job.state);
+        if (jobsFilter === 'completed') return ['done', 'infected_held', 'infected_quarantined', 'infected_deleted'].includes(job.state);
         if (jobsFilter === 'downloading') {
-          return !scanStates.includes(job.state) && !['done', 'infected_deleted', 'error'].includes(job.state);
+          return !scanStates.includes(job.state) && !['done', 'infected_held', 'infected_quarantined', 'infected_deleted', 'error'].includes(job.state);
         }
         return true;
       }).sort(compareJobsByCreatedAt);
@@ -2079,7 +2082,7 @@
         (job) => selectedJobIds.has(job.id) && job.state === 'scan_paused'
       ).length;
       const failedJobs = latestJobs.filter((job) => job.state === 'error').length;
-      const completedJobs = latestJobs.filter((job) => ['done', 'infected_deleted'].includes(job.state)).length;
+      const completedJobs = latestJobs.filter((job) => ['done', 'infected_held', 'infected_quarantined', 'infected_deleted'].includes(job.state)).length;
       return {
         retryEligible,
         retryIneligibleSelected,

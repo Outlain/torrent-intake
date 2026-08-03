@@ -1,21 +1,44 @@
+import os
+from pathlib import Path
+
 from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import get_settings
 
 settings = get_settings()
 
 connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+if settings.database_url.startswith("sqlite"):
+    # The job database can contain private magnet parameters. Keep SQLite's
+    # database, WAL, and shared-memory files private even if the host directory's
+    # group is shared with other media services.
+    os.umask(0o077)
 engine = create_engine(settings.database_url, connect_args=connect_args, future=True)
+
+
+def _secure_sqlite_files(database_url: str) -> None:
+    database = make_url(database_url).database
+    if not database or database == ":memory:":
+        return
+    path = Path(database)
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            candidate.chmod(0o600)
+        except FileNotFoundError:
+            continue
 
 
 if settings.database_url.startswith("sqlite"):
     @event.listens_for(engine, "connect")
     def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+        _secure_sqlite_files(settings.database_url)
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
+        _secure_sqlite_files(settings.database_url)
 
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
@@ -26,6 +49,9 @@ class Base(DeclarativeBase):
 
 
 SCHEMA_ADDITIONS: dict[str, dict[str, str]] = {
+    "jobs": {
+        "quarantine_path": "TEXT",
+    },
     "scan_runs": {
         "current_file_started_at": "DATETIME",
         "engine_version": "VARCHAR(128)",
@@ -34,6 +60,9 @@ SCHEMA_ADDITIONS: dict[str, dict[str, str]] = {
         "policy_version": "VARCHAR(128)",
     },
     "scan_files": {
+        "ctime_ns": "INTEGER",
+        "device": "INTEGER",
+        "inode": "INTEGER",
         "engine_version": "VARCHAR(128)",
         "database_version": "VARCHAR(64)",
         "database_updated_at": "DATETIME",

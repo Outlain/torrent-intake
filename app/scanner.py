@@ -4,10 +4,9 @@ import hashlib
 import json
 import os
 import re
-import shlex
-import signal
 import socket
-import subprocess
+import stat
+import struct
 import threading
 import time
 from collections.abc import Callable
@@ -17,9 +16,11 @@ from email.utils import parsedate_to_datetime
 
 from .config import get_settings
 
-
 VERSION_PATTERN = re.compile(r"ClamAV\s+([^/\s]+)/([^/\s]+)/([^\r\n]+)", re.IGNORECASE)
 LIMIT_DETECTION_PREFIX = "heuristics.limits.exceeded"
+STREAM_CHUNK_BYTES = 1024 * 1024
+MAX_REPLY_BYTES = 1024 * 1024
+FileIdentity = tuple[int, int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -113,16 +114,20 @@ def parse_scan_response(response: str) -> tuple[bool, str | None]:
     if response.endswith(": OK") or response == "OK":
         return False, None
     if response.endswith(" FOUND"):
-        suffix = response.rsplit(": ", 1)[-1]
-        threat_name = suffix.removesuffix(" FOUND").strip() or "unknown"
+        threat_name = response.rsplit(": ", 1)[-1].removesuffix(" FOUND").strip() or "unknown"
         if threat_name.lower().startswith(LIMIT_DETECTION_PREFIX):
             raise ScannerPolicyError(
-                f"ClamAV could not fully inspect this file because a configured limit was exceeded: {threat_name}"
+                "ClamAV could not fully inspect this file because a configured limit was exceeded: "
+                f"{threat_name}"
             )
         return True, threat_name
     if response.endswith(" ERROR"):
         raise RuntimeError(f"scanner could not inspect the file: {response}")
     raise RuntimeError(f"unexpected scanner response: {response}")
+
+
+def file_identity(info: os.stat_result) -> FileIdentity:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 class ScannerService:
@@ -134,13 +139,10 @@ class ScannerService:
 
     def policy_version(self) -> str:
         policy = {
-            "backend": self.settings.scanner_backend,
+            "backend": "clamd-instream",
             "max_file_bytes": self.settings.scanner_max_file_bytes,
             "policy_version": self.settings.scanner_policy_version,
         }
-        if self.settings.scanner_backend == "command":
-            policy["command_binary"] = self.settings.clamdscan_binary
-            policy["command_args"] = self.settings.clamdscan_args
         fingerprint = hashlib.sha256(
             json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()[:12]
@@ -184,94 +186,79 @@ class ScannerService:
         identity: ScannerIdentity | None = None,
         heartbeat: Callable[[], bool] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        expected_file_identity: FileIdentity | None = None,
     ) -> ScanResult:
         identity = identity or self.require_healthy(force=True)
         try:
-            size_bytes = os.stat(path, follow_symlinks=False).st_size
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except OSError as exc:
             raise RuntimeError(f"scan file is unavailable: {path}: {exc}") from exc
-        if size_bytes > self.settings.scanner_max_file_bytes:
-            raise ScannerPolicyError(
-                f"file is {size_bytes} bytes, above the configured ClamAV safety limit of "
-                f"{self.settings.scanner_max_file_bytes} bytes: {path}"
-            )
-        if should_stop and should_stop():
-            raise ScanInterrupted("scan interrupted before the current file started")
-
-        started_at = datetime.utcnow()
-        started = time.monotonic()
-        if self.settings.scanner_backend == "clamd":
-            infected, threat_name, output = self._scan_with_clamd(
+        try:
+            initial_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(initial_stat.st_mode):
+                raise ScannerPolicyError(f"refusing to scan a non-regular file: {path}")
+            expected = file_identity(initial_stat)
+            if expected_file_identity is not None and expected != expected_file_identity:
+                raise RuntimeError(f"scan file identity changed before ClamD received it: {path}")
+            if initial_stat.st_size > self.settings.scanner_max_file_bytes:
+                raise ScannerPolicyError(
+                    f"file is {initial_stat.st_size} bytes, above the configured ClamAV safety limit of "
+                    f"{self.settings.scanner_max_file_bytes} bytes: {path}"
+                )
+            if should_stop and should_stop():
+                raise ScanInterrupted("scan interrupted before the current file started")
+            started_at = datetime.utcnow()
+            started = time.monotonic()
+            infected, threat_name, output = self._scan_descriptor(
+                descriptor,
                 path,
+                expected,
                 heartbeat=heartbeat,
                 should_stop=should_stop,
             )
-        else:
-            infected, threat_name, output = self._scan_with_command(
-                path,
-                heartbeat=heartbeat,
-                should_stop=should_stop,
+            return ScanResult(
+                clean=not infected,
+                infected=infected,
+                identity=identity,
+                scan_started_at=started_at,
+                duration_seconds=max(time.monotonic() - started, 0.0),
+                threat_name=threat_name,
+                raw_output=output,
             )
-        return ScanResult(
-            clean=not infected,
-            infected=infected,
-            identity=identity,
-            scan_started_at=started_at,
-            duration_seconds=max(time.monotonic() - started, 0.0),
-            threat_name=threat_name,
-            raw_output=output,
-        )
+        finally:
+            os.close(descriptor)
 
     def _load_health(self) -> ScannerHealth:
         checked_at = datetime.utcnow()
         try:
-            raw_version = self._version_output()
-        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            raw_version = self._version_output().strip()
+        except (OSError, RuntimeError) as exc:
             return ScannerHealth(
                 status="unavailable",
                 can_scan=False,
                 message=f"ClamAV is unavailable: {exc}",
                 checked_at=checked_at,
             )
-
         engine_version, database_version, database_updated_at = parse_scanner_version(raw_version)
         identity = ScannerIdentity(
-            backend=self.settings.scanner_backend,
+            backend="clamd-instream",
             engine_version=engine_version,
             database_version=database_version,
             database_updated_at=database_updated_at,
             policy_version=self.policy_version(),
             raw_version=raw_version[:255],
         )
-        if not engine_version:
+        if not engine_version or database_updated_at is None:
             return ScannerHealth(
                 status="unavailable",
                 can_scan=False,
-                message=f"ClamAV returned an unrecognized version response: {raw_version[:180]}",
+                message="ClamAV version or signature freshness could not be verified; scans are blocked.",
                 checked_at=checked_at,
                 identity=identity,
             )
-        if database_updated_at is None:
-            return ScannerHealth(
-                status="warning",
-                can_scan=False,
-                message=(
-                    "ClamAV is available, but signature freshness could not be verified; "
-                    "new scans are blocked."
-                ),
-                checked_at=checked_at,
-                identity=identity,
-            )
-
-        definitions_age_hours = max(
-            (checked_at - database_updated_at).total_seconds() / 3600,
-            0.0,
-        )
+        definitions_age_hours = max((checked_at - database_updated_at).total_seconds() / 3600, 0.0)
         stale_hours = max(self.settings.scanner_definitions_stale_hours, 1)
-        warning_hours = min(
-            max(self.settings.scanner_definitions_warn_hours, 1),
-            stale_hours,
-        )
+        warning_hours = min(max(self.settings.scanner_definitions_warn_hours, 1), stale_hours)
         if definitions_age_hours >= stale_hours:
             return ScannerHealth(
                 status="stale",
@@ -284,181 +271,132 @@ class ScannerService:
                 identity=identity,
                 definitions_age_hours=definitions_age_hours,
             )
-        if definitions_age_hours >= warning_hours:
-            return ScannerHealth(
-                status="warning",
-                can_scan=True,
-                message=(
-                    f"ClamAV definitions are {definitions_age_hours:.1f} hours old; "
-                    f"scanning will stop if they reach {stale_hours} hours."
-                ),
-                checked_at=checked_at,
-                identity=identity,
-                definitions_age_hours=definitions_age_hours,
-            )
+        status = "warning" if definitions_age_hours >= warning_hours else "healthy"
+        message = (
+            f"ClamAV definitions are {definitions_age_hours:.1f} hours old."
+            if status == "warning"
+            else "ClamAV daemon and definitions are healthy."
+        )
         return ScannerHealth(
-            status="healthy",
+            status=status,
             can_scan=True,
-            message="ClamAV daemon and definitions are healthy.",
+            message=message,
             checked_at=checked_at,
             identity=identity,
             definitions_age_hours=definitions_age_hours,
         )
 
     def _version_output(self) -> str:
-        if self.settings.scanner_backend == "clamd":
-            return self._clamd_request("VERSION").strip()
-        proc = subprocess.run(
-            [self.settings.clamdscan_binary, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
-        if proc.returncode != 0:
-            raise RuntimeError(f"version command exited {proc.returncode}: {output}")
-        if not output:
-            raise RuntimeError("version command returned no output")
-        return output.splitlines()[0]
+        return self._clamd_request("VERSION")
 
     def _clamd_request(self, command: str) -> str:
-        path = self.settings.clamd_socket_path
+        socket_path = self.settings.clamd_socket_path
         timeout = max(self.settings.scanner_connect_timeout_seconds, 1)
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(timeout)
-                client.connect(path)
-                client.sendall(b"z" + command.encode("utf-8") + b"\0")
-                chunks: list[bytes] = []
-                while True:
-                    chunk = client.recv(4096)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    if b"\0" in chunk:
-                        break
+                client.connect(socket_path)
+                client.sendall(b"z" + command.encode("ascii") + b"\0")
+                raw = self._receive_reply(client)
         except OSError as exc:
-            raise ScannerUnavailable(f"cannot connect to clamd socket {path}: {exc}") from exc
-        output = b"".join(chunks).split(b"\0", 1)[0].decode("utf-8", errors="replace")
-        if not output:
-            raise ScannerUnavailable("clamd returned no response")
-        return output
+            raise ScannerUnavailable(f"cannot connect to clamd socket {socket_path}: {exc}") from exc
+        return raw.decode("utf-8", errors="replace")
 
-    def _scan_with_clamd(
+    def _scan_descriptor(
         self,
+        descriptor: int,
         path: str,
+        expected: FileIdentity,
         *,
         heartbeat: Callable[[], bool] | None,
         should_stop: Callable[[], bool] | None,
     ) -> tuple[bool, str | None, str]:
-        if "\0" in path or "\n" in path or "\r" in path:
-            raise ScannerPolicyError("clamd cannot safely scan a path containing a line break or NUL byte")
         socket_path = self.settings.clamd_socket_path
         interval = min(max(int(self.settings.scan_heartbeat_seconds), 1), 30)
+        timeout = max(int(self.settings.scanner_scan_timeout_seconds), 60)
+        deadline = time.monotonic() + timeout
+
+        def check_deadline() -> None:
+            if time.monotonic() >= deadline:
+                self.clear_health_cache()
+                raise ScannerUnavailable(
+                    f"ClamD scan exceeded the configured {timeout}-second timeout"
+                )
+
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(max(self.settings.scanner_connect_timeout_seconds, 1))
                 client.connect(socket_path)
-                client.sendall(b"zSCAN " + os.fsencode(path) + b"\0")
+                client.sendall(b"zINSTREAM\0")
                 client.settimeout(interval)
-                chunks: list[bytes] = []
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                last_heartbeat = time.monotonic()
                 while True:
-                    try:
-                        chunk = client.recv(4096)
-                    except socket.timeout:
-                        keep_running = heartbeat() if heartbeat else True
-                        if (should_stop and should_stop()) or not keep_running:
-                            raise ScanInterrupted("scan interrupted; the current file will be retried")
-                        continue
+                    check_deadline()
+                    if should_stop and should_stop():
+                        raise ScanInterrupted("scan interrupted; the current file will be retried")
+                    chunk = os.read(descriptor, STREAM_CHUNK_BYTES)
                     if not chunk:
                         break
-                    chunks.append(chunk)
-                    if b"\0" in chunk:
-                        break
+                    client.sendall(struct.pack("!I", len(chunk)) + chunk)
+                    if time.monotonic() - last_heartbeat >= interval:
+                        if heartbeat and not heartbeat():
+                            raise ScanInterrupted("scan lease was lost; the current file will be retried")
+                        last_heartbeat = time.monotonic()
+                client.sendall(struct.pack("!I", 0))
+
+                def on_timeout() -> None:
+                    check_deadline()
+                    if (should_stop and should_stop()) or (heartbeat and not heartbeat()):
+                        raise ScanInterrupted("scan interrupted; the current file will be retried")
+
+                raw_reply = self._receive_reply(client, on_timeout=on_timeout)
         except ScanInterrupted:
             raise
         except OSError as exc:
             self.clear_health_cache()
             raise ScannerUnavailable(f"lost connection to clamd socket {socket_path}: {exc}") from exc
-
-        output = b"".join(chunks).split(b"\0", 1)[0].decode("utf-8", errors="replace")
+        self._verify_file_identity(descriptor, path, expected)
+        output = raw_reply.decode("utf-8", errors="replace")
         infected, threat_name = parse_scan_response(output)
         return infected, threat_name, output
 
-    def _scan_with_command(
-        self,
-        path: str,
-        *,
-        heartbeat: Callable[[], bool] | None,
-        should_stop: Callable[[], bool] | None,
-    ) -> tuple[bool, str | None, str]:
-        args = [self.settings.clamdscan_binary, *shlex.split(self.settings.clamdscan_args), path]
-        try:
-            proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            self.clear_health_cache()
-            raise ScannerUnavailable(f"failed to start scanner: {exc}") from exc
-
-        output = ""
-        interval = min(max(int(self.settings.scan_heartbeat_seconds), 1), 30)
+    @staticmethod
+    def _receive_reply(
+        client: socket.socket,
+        on_timeout: Callable[[], None] | None = None,
+    ) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
         while True:
             try:
-                stdout, _ = proc.communicate(timeout=interval)
-                output = stdout or ""
-                break
-            except subprocess.TimeoutExpired:
-                try:
-                    keep_running = heartbeat() if heartbeat else True
-                except Exception:
-                    self._stop_process(proc)
+                chunk = client.recv(4096)
+            except socket.timeout:
+                if on_timeout is None:
                     raise
-                if (should_stop and should_stop()) or not keep_running:
-                    self._stop_process(proc)
-                    raise ScanInterrupted("scan interrupted; the current file will be retried")
-
-        limit_match = re.search(r"(Heuristics\.Limits\.Exceeded[^\s:]*)", output, re.IGNORECASE)
-        if limit_match:
-            raise ScannerPolicyError(
-                f"ClamAV could not fully inspect this file because a configured limit was exceeded: "
-                f"{limit_match.group(1)}"
-            )
-        if proc.returncode == 0:
-            return False, None, output
-        if proc.returncode == 1:
-            for line in output.splitlines():
-                if line.endswith(" FOUND") and ": " in line:
-                    threat = line.rsplit(": ", 1)[-1].removesuffix(" FOUND").strip() or "unknown"
-                    return True, threat, output
-            return True, "unknown", output
-        if proc.returncode in {2, 70}:
-            raise RuntimeError(f"scanner failed with exit code {proc.returncode}: {output.strip()}")
-        raise RuntimeError(f"scanner exited unexpectedly with code {proc.returncode}: {output.strip()}")
+                on_timeout()
+                continue
+            if not chunk:
+                raise RuntimeError("clamd closed the connection without a complete reply")
+            terminator = chunk.find(b"\0")
+            selected = chunk if terminator < 0 else chunk[:terminator]
+            chunks.append(selected)
+            total += len(selected)
+            if total > MAX_REPLY_BYTES:
+                raise RuntimeError("clamd returned an oversized reply")
+            if terminator >= 0:
+                return b"".join(chunks)
 
     @staticmethod
-    def _stop_process(proc: subprocess.Popen[str]) -> None:
-        if proc.poll() is not None:
-            return
+    def _verify_file_identity(descriptor: int, path: str, expected: FileIdentity) -> None:
+        descriptor_info = os.fstat(descriptor)
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            proc.communicate()
-            return
-        except OSError:
-            proc.terminate()
-        try:
-            proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                proc.communicate()
-                return
-            except OSError:
-                proc.kill()
-            proc.communicate(timeout=5)
+            path_info = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(f"scan file vanished or was replaced while ClamD scanned it: {path}") from exc
+        if (
+            not stat.S_ISREG(path_info.st_mode)
+            or file_identity(descriptor_info) != expected
+            or file_identity(path_info) != expected
+        ):
+            raise RuntimeError(f"scan file identity changed while ClamD scanned it: {path}")

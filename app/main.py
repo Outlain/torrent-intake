@@ -1,6 +1,8 @@
 from __future__ import annotations
 import asyncio
+import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, Response, status
@@ -63,7 +65,9 @@ def _enrich_jobs(db: Session, jobs: list[Job]) -> list[Job]:
 
 def _validate_completion_event_token(token: str | None) -> None:
     expected = settings.completion_event_token
-    if expected and token != expected:
+    if not expected:
+        raise HTTPException(status_code=503, detail="Completion event authentication is not configured")
+    if token is None or not hmac.compare_digest(token, expected):
         logger.warning("Rejected qB completion event due to invalid token")
         raise HTTPException(status_code=403, detail="Invalid completion event token")
 
@@ -75,6 +79,15 @@ def root() -> RedirectResponse:
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    scanner = service.scan_coordinator.scanner.health()
+    data_dir = Path("/app/data")
+    event_dir = Path(settings.event_dir)
+    if not data_dir.is_dir() or not os.access(data_dir, os.R_OK | os.W_OK | os.X_OK):
+        raise HTTPException(status_code=503, detail="persistent data directory is unavailable")
+    if not event_dir.is_dir() or not os.access(event_dir, os.R_OK | os.W_OK | os.X_OK):
+        raise HTTPException(status_code=503, detail="event directory is unavailable")
+    if not scanner.can_scan:
+        raise HTTPException(status_code=503, detail=scanner.message)
     return {"status": "ok"}
 
 
@@ -253,7 +266,10 @@ def bulk_delete_jobs(payload: JobSelectionIn, db: Session = Depends(get_db)):
 
 @app.post("/jobs/clear-completed", response_model=JobBulkResult)
 def clear_completed_jobs(db: Session = Depends(get_db)):
-    return service.delete_jobs_by_states(db, states={"done", "infected_deleted"})
+    return service.delete_jobs_by_states(
+        db,
+        states={"done", "infected_held", "infected_quarantined", "infected_deleted"},
+    )
 
 
 @app.post("/jobs/clear-failed", response_model=JobBulkResult)

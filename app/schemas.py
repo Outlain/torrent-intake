@@ -3,6 +3,7 @@ from typing import Literal
 import re
 from pydantic import BaseModel, Field, field_validator
 from .config import get_settings
+from .paths import canonical_final_parent
 
 
 BTIH_PATTERN = re.compile(r"(^|[?&])xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})($|&)", re.IGNORECASE)
@@ -22,13 +23,7 @@ class JobCreate(BaseModel):
     @field_validator("final_parent")
     @classmethod
     def validate_final_parent(cls, value: str) -> str:
-        settings = get_settings()
-        for prefix in settings.allowed_final_parent_prefixes:
-            normalized = prefix.rstrip("/")
-            if value == normalized or value.startswith(f"{normalized}/"):
-                return value
-        allowed = ", ".join(settings.allowed_final_parent_prefixes)
-        raise ValueError(f"final_parent must be inside one of: {allowed}")
+        return canonical_final_parent(value, get_settings())
 
     @field_validator("magnet_uri")
     @classmethod
@@ -72,6 +67,7 @@ class JobOut(BaseModel):
     content_path: str | None
     last_seen_qbt_state: str | None
     threat_name: str | None
+    quarantine_path: str | None
     last_error: str | None
     progress: float | None = None
     eta_seconds: int | None = None

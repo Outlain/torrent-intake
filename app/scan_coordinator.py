@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -15,8 +16,10 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .db import SessionLocal
+from .event_writer import emit_event
 from .models import Job, ScanFile, ScanRun, ScannerControl
 from .qbt import QbtService
+from .torrent_guard import TorrentSafetyGuard
 from .scanner import (
     ScanInterrupted,
     ScannerDefinitionsStale,
@@ -29,7 +32,13 @@ from .scanner import (
 
 
 SCAN_QUEUE_STATES = {"scan_pending", "scanning", "scan_paused"}
-SCAN_ACTION_STATES = {"scan_clean", "promoting", "scan_infected", "deleting_infected"}
+SCAN_ACTION_STATES = {
+    "scan_clean",
+    "promoting",
+    "scan_infected",
+    "quarantining_infected",
+    "deleting_infected",
+}
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,7 @@ class ScanCoordinator:
         self.settings = get_settings()
         self.qbt = QbtService()
         self.scanner = ScannerService()
+        self.guard = TorrentSafetyGuard()
         self.logger = logging.getLogger(__name__)
 
     def ensure_control(self, db: Session) -> ScannerControl:
@@ -247,19 +257,23 @@ class ScanCoordinator:
                 if torrent is None:
                     raise RuntimeError("qBittorrent torrent is temporarily unavailable")
 
-                torrent_hash = getattr(torrent, "hash", None) or job.qbt_hash
-                if not torrent_hash:
-                    raise RuntimeError("qBittorrent torrent has no usable hash")
-                content_path = getattr(torrent, "content_path", None) or job.content_path
-                if not content_path:
-                    raise RuntimeError("content_path is not available for scanning")
+                torrent_hash = self.guard.validate_common(
+                    db, job, torrent, require_paused=False
+                )
                 job.qbt_hash = torrent_hash
-                job.content_path = content_path
                 job.last_seen_qbt_state = getattr(torrent, "state", None)
                 db.add(job)
                 db.commit()
 
                 self.qbt.pause(torrent_hash)
+                torrent = self._wait_for_paused_torrent(db, job, claim, stop_event)
+                content_path = str(
+                    self.guard.validate_staging(db, job, torrent, require_paused=True)
+                )
+                job.content_path = content_path
+                job.last_seen_qbt_state = getattr(torrent, "state", None)
+                db.add(job)
+                db.commit()
                 self._prepare_manifest(
                     db,
                     job,
@@ -342,6 +356,14 @@ class ScanCoordinator:
                         ) or 0
                         if pending_files:
                             continue
+                        torrent = self._find_torrent(job)
+                        if torrent is None:
+                            raise RuntimeError("qBittorrent torrent disappeared before clean-scan completion")
+                        verified_content = self.guard.validate_staging(
+                            db, job, torrent, require_paused=True
+                        )
+                        if Path(run.root_path or "").resolve() != verified_content:
+                            raise RuntimeError("torrent content path changed during scanning")
                         self._finish_clean_scan(db, job, run)
                         return
 
@@ -366,6 +388,13 @@ class ScanCoordinator:
                         identity=identity,
                         heartbeat=lambda: self._heartbeat(claim, stop_event),
                         should_stop=stop_event.is_set,
+                        expected_file_identity=(
+                            int(scan_file.device),
+                            int(scan_file.inode),
+                            scan_file.size_bytes,
+                            scan_file.mtime_ns,
+                            int(scan_file.ctime_ns),
+                        ),
                     )
 
                     db.expire_all()
@@ -403,6 +432,17 @@ class ScanCoordinator:
                         job.state = "scan_infected"
                         job.updated_at = datetime.utcnow()
                         self._release_lease(run)
+                        emit_event(
+                            "threat_detected",
+                            "critical",
+                            "Malware detected in torrent intake",
+                            event_id=f"{job.id}-threat-{scan_file.id}",
+                            source_path=str(absolute_path),
+                            threat_name=job.threat_name,
+                            action_success=False,
+                            job_id=job.id,
+                            torrent_hash=job.qbt_hash,
+                        )
                         db.add_all([job, run])
                         db.commit()
                         return
@@ -577,7 +617,7 @@ class ScanCoordinator:
         oversized = next(
             (
                 (relative_path, size_bytes)
-                for relative_path, size_bytes, _ in manifest
+                for relative_path, size_bytes, *_ in manifest
                 if size_bytes > self.settings.scanner_max_file_bytes
             ),
             None,
@@ -607,12 +647,12 @@ class ScanCoordinator:
             item.relative_path: item
             for item in db.scalars(select(ScanFile).where(ScanFile.job_id == job.id))
         }
-        current_paths = {relative_path for relative_path, _, _ in manifest}
+        current_paths = {relative_path for relative_path, *_ in manifest}
         for relative_path, item in existing.items():
             if relative_path not in current_paths:
                 db.delete(item)
 
-        for relative_path, size_bytes, mtime_ns in manifest:
+        for relative_path, size_bytes, mtime_ns, ctime_ns, device, inode in manifest:
             item = existing.get(relative_path)
             if item is None:
                 item = ScanFile(
@@ -620,6 +660,9 @@ class ScanCoordinator:
                     relative_path=relative_path,
                     size_bytes=size_bytes,
                     mtime_ns=mtime_ns,
+                    ctime_ns=ctime_ns,
+                    device=device,
+                    inode=inode,
                     status="pending",
                 )
                 db.add(item)
@@ -627,11 +670,17 @@ class ScanCoordinator:
             if (
                 item.size_bytes != size_bytes
                 or item.mtime_ns != mtime_ns
+                or item.ctime_ns != ctime_ns
+                or item.device != device
+                or item.inode != inode
                 or version_changed
                 or item.status not in {"pending", "clean"}
             ):
                 item.size_bytes = size_bytes
                 item.mtime_ns = mtime_ns
+                item.ctime_ns = ctime_ns
+                item.device = device
+                item.inode = inode
                 item.status = "pending"
                 item.threat_name = None
                 item.scanned_at = None
@@ -666,18 +715,18 @@ class ScanCoordinator:
         root: Path,
         *,
         heartbeat: Callable[[], bool] | None = None,
-    ) -> list[tuple[str, int, int]]:
+    ) -> list[tuple[str, int, int, int, int, int]]:
         if not root.exists():
             raise RuntimeError(f"scan path does not exist: {root}")
         if root.is_symlink():
             raise RuntimeError(f"scan path cannot be a symbolic link: {root}")
         if root.is_file():
             stat = root.stat()
-            return [(".", stat.st_size, stat.st_mtime_ns)]
+            return [(".", stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev, stat.st_ino)]
         if not root.is_dir():
             raise RuntimeError(f"scan path is not a regular file or directory: {root}")
 
-        manifest: list[tuple[str, int, int]] = []
+        manifest: list[tuple[str, int, int, int, int, int]] = []
         files_seen = 0
         for current_root, directories, filenames in os.walk(root):
             if heartbeat and not heartbeat():
@@ -698,7 +747,16 @@ class ScanCoordinator:
                 if root not in resolved.parents:
                     raise RuntimeError(f"scan file escaped its root: {candidate}")
                 stat = resolved.stat()
-                manifest.append((resolved.relative_to(root).as_posix(), stat.st_size, stat.st_mtime_ns))
+                manifest.append(
+                    (
+                        resolved.relative_to(root).as_posix(),
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        stat.st_ctime_ns,
+                        stat.st_dev,
+                        stat.st_ino,
+                    )
+                )
                 files_seen += 1
                 if files_seen % 256 == 0 and heartbeat and not heartbeat():
                     raise ScanInterrupted("scan lease was lost while preparing the manifest")
@@ -708,9 +766,18 @@ class ScanCoordinator:
         if not absolute_path.exists() or not absolute_path.is_file() or absolute_path.is_symlink():
             raise RuntimeError(f"scan file is unavailable or unsafe: {absolute_path}")
         stat = absolute_path.stat()
-        if stat.st_size != scan_file.size_bytes or stat.st_mtime_ns != scan_file.mtime_ns:
+        if (
+            stat.st_size != scan_file.size_bytes
+            or stat.st_mtime_ns != scan_file.mtime_ns
+            or stat.st_ctime_ns != scan_file.ctime_ns
+            or stat.st_dev != scan_file.device
+            or stat.st_ino != scan_file.inode
+        ):
             scan_file.size_bytes = stat.st_size
             scan_file.mtime_ns = stat.st_mtime_ns
+            scan_file.ctime_ns = stat.st_ctime_ns
+            scan_file.device = stat.st_dev
+            scan_file.inode = stat.st_ino
             scan_file.status = "pending"
             scan_file.scanned_at = None
             scan_file.scanner_version = None
@@ -820,6 +887,7 @@ class ScanCoordinator:
         job.updated_at = datetime.utcnow()
         db.add_all([job, run])
         db.commit()
+        self._emit_scan_failure(job, message)
 
     def _defer_claim(
         self,
@@ -862,6 +930,7 @@ class ScanCoordinator:
         self._release_lease(run)
         db.add_all([job, run])
         db.commit()
+        self._emit_scan_failure(job, message)
 
     def _handle_policy_failure(self, db: Session, claim: ScanClaim, message: str) -> None:
         db.rollback()
@@ -892,6 +961,7 @@ class ScanCoordinator:
         self._release_lease(run)
         db.add_all([job, run])
         db.commit()
+        self._emit_scan_failure(job, message)
 
     def _should_yield(self, db: Session, job: Job, run: ScanRun, is_large: bool) -> bool:
         queued = list(
@@ -990,6 +1060,40 @@ class ScanCoordinator:
         if torrent is None and job.unique_tag:
             torrent = self.qbt.find_by_unique_tag(job.unique_tag)
         return torrent
+
+    def _wait_for_paused_torrent(
+        self,
+        db: Session,
+        job: Job,
+        claim: ScanClaim,
+        stop_event: threading.Event,
+    ):
+        deadline = time.monotonic() + max(self.settings.pause_confirmation_timeout_seconds, 1)
+        while time.monotonic() < deadline:
+            if stop_event.is_set() or not self._heartbeat(claim, stop_event):
+                raise ScanInterrupted("scan stopped while waiting for qBittorrent to pause")
+            torrent = self._find_torrent(job)
+            if torrent is None:
+                raise RuntimeError("qBittorrent torrent disappeared while pausing")
+            self.guard.validate_common(db, job, torrent, require_paused=False)
+            if self.guard.is_paused(torrent):
+                return torrent
+            time.sleep(0.5)
+        raise RuntimeError("qBittorrent did not confirm the torrent was paused before scanning")
+
+    def _emit_scan_failure(self, job: Job, message: str) -> None:
+        try:
+            emit_event(
+                "scan_failed",
+                "warning",
+                message[:2000],
+                source_path=job.content_path,
+                action_success=False,
+                job_id=job.id,
+                torrent_hash=job.qbt_hash,
+            )
+        except Exception:
+            self.logger.exception("Could not persist scan_failed event for job %s", job.id)
 
     def _absolute_scan_path(self, root_path: str | None, relative_path: str) -> Path:
         if not root_path:
@@ -1118,7 +1222,8 @@ class ScanCoordinator:
             "scan_paused": "Scan paused",
             "scan_clean": "Scan clean; promotion queued",
             "promoting": "Promoting clean torrent",
-            "scan_infected": "Threat found; deletion queued",
+            "scan_infected": "Threat found; safe action queued",
+            "quarantining_infected": "Moving infected torrent to quarantine",
             "deleting_infected": "Deleting infected torrent",
         }
         parts = [state_labels.get(job.state, "Scan pending")]

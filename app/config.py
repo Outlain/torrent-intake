@@ -32,14 +32,13 @@ class Settings(BaseSettings):
     completion_grace_seconds: int = 15
     completion_event_token: str | None = None
 
-    scanner_backend: Literal["clamd", "command"] = "command"
+    scanner_backend: Literal["clamd"] = "clamd"
     clamd_socket_path: str = "/run/clamav/clamd.sock"
-    clamdscan_binary: str = "clamscan"
-    clamdscan_args: str = "--infected --no-summary --alert-exceeds-max"
     scanner_policy_version: str = "clamav-policy-v1"
     scanner_max_file_mib: int = 2000
     scanner_health_cache_seconds: int = 15
     scanner_connect_timeout_seconds: int = 5
+    scanner_scan_timeout_seconds: int = 1200
     scanner_definitions_warn_hours: int = 36
     scanner_definitions_stale_hours: int = 72
     max_concurrent_scans: int = 2
@@ -52,9 +51,11 @@ class Settings(BaseSettings):
     scan_retry_base_seconds: int = 30
     scan_max_failures: int = 3
     scan_yield_after_files: int = 10
+    pause_confirmation_timeout_seconds: int = 30
 
-    telegram_bot_token: str | None = None
-    telegram_chat_id: str | None = None
+    infected_action: Literal["hold", "quarantine", "delete"] = "hold"
+    quarantine_root: str = "/quarantine"
+    event_dir: str = "/events"
 
     ui_title: str = "Torrent Intake"
 

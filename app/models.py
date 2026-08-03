@@ -39,6 +39,7 @@ class Job(Base):
     scan_completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    quarantine_path: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     threat_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -79,8 +80,6 @@ class ScanRun(Base):
     database_updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     policy_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    notification_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    notification_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
@@ -102,6 +101,9 @@ class ScanFile(Base):
     relative_path: Mapped[str] = mapped_column(Text, nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     mtime_ns: Mapped[int] = mapped_column(Integer, nullable=False)
+    ctime_ns: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    device: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inode: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     threat_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
