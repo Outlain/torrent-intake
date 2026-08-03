@@ -176,6 +176,29 @@ The UI/API has no login. The example binds it to
 `127.0.0.1:${TI_UI_HOST_PORT:-8095}`; place an authenticated reverse proxy in
 front before remote exposure.
 
+## Settings and help panel
+
+The UI has a **Settings & Help** gear button. Its drawer shows every effective
+`TI_*` application setting, the built-in default, a plain-language explanation,
+and how the setting is managed. The list is searchable and includes a short
+workflow guide plus a link back to the live scanner controls.
+
+The drawer is deliberately read-only. Compose or Portainer remains the source of
+truth for deployment configuration, and host bind mounts cannot be changed from
+inside the container. Change an environment value and recreate Torrent Intake
+when the drawer says a restart is required. The existing scan-slot and
+maintenance controls remain live and persist through SQLite.
+
+Compose-only values—the image tag, published host port, numeric UID/GID,
+host-side bind sources, and ClamD sidecar limits—cannot be discovered by the
+application and therefore remain visible only in the deployed stack.
+
+Passwords and completion tokens are displayed only as configured or not
+configured. Credentials embedded in URLs and URL query strings are redacted.
+Safety-critical values such as staging boundaries, the scanner policy, and
+`TI_INFECTED_ACTION` remain visible with their current behavior explained, but
+cannot be changed through the UI.
+
 ## Completion hook
 
 Polling remains a recovery fallback. For faster handoff, qBittorrent can run:

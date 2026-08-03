@@ -40,6 +40,335 @@
       margin: 28px auto 48px;
     }
 
+    body.settings-open {
+      overflow: hidden;
+    }
+
+    .page-tools {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 12px;
+    }
+
+    .settings-trigger {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 42px;
+    }
+
+    .settings-trigger-icon {
+      font-size: 1.05rem;
+      line-height: 1;
+    }
+
+    .settings-dialog {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: flex;
+      justify-content: flex-end;
+      background: rgba(2, 7, 13, 0.76);
+      backdrop-filter: blur(8px);
+    }
+
+    .settings-dialog[hidden] {
+      display: none;
+    }
+
+    .settings-drawer {
+      width: min(920px, 100vw);
+      height: 100%;
+      overflow-y: auto;
+      background: #0d1725;
+      border-left: 1px solid var(--line);
+      box-shadow: -28px 0 80px rgba(0, 0, 0, 0.48);
+    }
+
+    .settings-head {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 22px 24px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(13, 23, 37, 0.96);
+      backdrop-filter: blur(16px);
+    }
+
+    .settings-head h2 {
+      margin: 5px 0 6px;
+      font-size: 1.6rem;
+      letter-spacing: -0.03em;
+    }
+
+    .settings-head p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .settings-head .settings-close {
+      flex: 0 0 auto;
+      width: 42px;
+      height: 42px;
+      padding: 0;
+      font-size: 1.35rem;
+    }
+
+    .settings-content {
+      display: grid;
+      gap: 20px;
+      padding: 22px 24px 36px;
+    }
+
+    .settings-callout {
+      padding: 16px 18px;
+      border: 1px solid rgba(233, 178, 77, 0.35);
+      border-radius: 16px;
+      background: rgba(233, 178, 77, 0.09);
+      color: #f4d99e;
+      line-height: 1.5;
+    }
+
+    .settings-callout strong {
+      color: var(--ink);
+    }
+
+    .settings-overview {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .settings-overview-card {
+      padding: 15px 16px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .settings-overview-card strong,
+    .settings-overview-card span {
+      display: block;
+    }
+
+    .settings-overview-card strong {
+      margin-top: 5px;
+      overflow-wrap: anywhere;
+    }
+
+    .settings-overview-card span {
+      color: var(--muted);
+      font-size: 0.78rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .settings-help {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .settings-help summary {
+      cursor: pointer;
+      padding: 16px 18px;
+      font-weight: 700;
+    }
+
+    .settings-help-body {
+      padding: 0 18px 18px;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .settings-help-body p {
+      margin: 0 0 12px;
+    }
+
+    .settings-help-body ol {
+      margin: 0 0 16px;
+      padding-left: 22px;
+    }
+
+    .settings-help-body li + li {
+      margin-top: 6px;
+    }
+
+    .settings-search-wrap {
+      display: grid;
+      gap: 8px;
+    }
+
+    .settings-search-wrap label {
+      font-weight: 700;
+    }
+
+    .settings-search {
+      width: 100%;
+    }
+
+    .settings-no-results {
+      margin: 0;
+      padding: 18px;
+      border: 1px dashed var(--line);
+      border-radius: 16px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .settings-groups {
+      display: grid;
+      gap: 22px;
+    }
+
+    .settings-group {
+      display: grid;
+      gap: 12px;
+    }
+
+    .settings-group-head h3 {
+      margin: 0 0 4px;
+      font-size: 1.15rem;
+    }
+
+    .settings-group-head p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .settings-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .setting-card {
+      display: grid;
+      align-content: start;
+      gap: 11px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 17px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .setting-card.safety-critical {
+      border-color: rgba(233, 178, 77, 0.32);
+    }
+
+    .setting-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .setting-card h4 {
+      margin: 0 0 4px;
+      font-size: 1rem;
+    }
+
+    .setting-env {
+      color: var(--muted);
+      font-size: 0.74rem;
+      overflow-wrap: anywhere;
+    }
+
+    .setting-badges {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 5px;
+    }
+
+    .setting-badge {
+      padding: 4px 7px;
+      border-radius: 999px;
+      background: rgba(152, 168, 191, 0.12);
+      color: var(--muted);
+      font-size: 0.66rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .setting-badge.warning {
+      background: rgba(233, 178, 77, 0.13);
+      color: var(--warning);
+    }
+
+    .setting-badge.secret {
+      background: rgba(79, 209, 140, 0.11);
+      color: var(--success);
+    }
+
+    .setting-values {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 8px;
+    }
+
+    .setting-value {
+      min-width: 0;
+      padding: 10px 11px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .setting-value span,
+    .setting-value code {
+      display: block;
+    }
+
+    .setting-value span {
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .setting-value code {
+      color: var(--ink);
+      font-size: 0.82rem;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+
+    .setting-description,
+    .setting-effect,
+    .setting-change-hint {
+      margin: 0;
+      font-size: 0.84rem;
+      line-height: 1.48;
+    }
+
+    .setting-description,
+    .setting-change-hint {
+      color: var(--muted);
+    }
+
+    .setting-effect {
+      padding: 10px 11px;
+      border-left: 3px solid var(--accent);
+      border-radius: 0 10px 10px 0;
+      background: var(--accent-soft);
+      color: #f0c59f;
+    }
+
+    .setting-change-hint {
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }
+
     .panel {
       background: var(--surface);
       border: 1px solid var(--line);
@@ -1001,6 +1330,26 @@
         margin: 16px auto 28px;
       }
 
+      .page-tools {
+        margin-bottom: 10px;
+      }
+
+      .settings-trigger {
+        justify-content: center;
+      }
+
+      .settings-head,
+      .settings-content {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+
+      .settings-overview,
+      .settings-list,
+      .setting-values {
+        grid-template-columns: 1fr;
+      }
+
       .hero-copy,
       .form-panel,
       .jobs-panel {
@@ -1149,6 +1498,18 @@
 </head>
 <body>
   <div class="shell">
+    <div class="page-tools">
+      <button
+        id="settings-open-button"
+        class="button-secondary settings-trigger"
+        type="button"
+        aria-haspopup="dialog"
+        aria-controls="settings-dialog"
+        aria-expanded="false">
+        <span class="settings-trigger-icon" aria-hidden="true">⚙</span>
+        Settings &amp; Help
+      </button>
+    </div>
     <div class="top-layout">
       <details id="hero-details" class="hero hero-details panel" open>
         <summary class="hero-mobile-summary">
@@ -1419,8 +1780,135 @@
     </div>
   </div>
 
+  <section id="settings-dialog" class="settings-dialog" aria-hidden="true" hidden>
+    <aside
+      id="settings-drawer"
+      class="settings-drawer"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-title"
+      aria-describedby="settings-summary">
+      <header class="settings-head">
+        <div>
+          <span class="eyebrow">Effective container configuration</span>
+          <h2 id="settings-title">Settings &amp; Help</h2>
+          <p id="settings-summary">View the values Torrent Intake is currently using and what each variable controls.</p>
+        </div>
+        <button id="settings-close-button" class="button-secondary settings-close" type="button" aria-label="Close settings">×</button>
+      </header>
+
+      <div class="settings-content">
+        <div class="settings-callout">
+          <strong>Configuration is read-only here.</strong>
+          Docker Compose or Portainer remains the source of truth. Secret values are never displayed, and safety-critical settings cannot be changed from this panel.
+        </div>
+
+        <div class="settings-overview">
+          <div class="settings-overview-card">
+            <span>Infection action</span>
+            <strong>{{ settings.infected_action }}</strong>
+          </div>
+          <div class="settings-overview-card">
+            <span>Primary final root</span>
+            <strong>{{ settings.final_parent_prefix }}</strong>
+          </div>
+          <div class="settings-overview-card">
+            <span>Scanner backend</span>
+            <strong>{{ settings.scanner_backend }} via private Unix socket</strong>
+          </div>
+        </div>
+
+        <details class="settings-help" open>
+          <summary>How Torrent Intake works and where settings are changed</summary>
+          <div class="settings-help-body">
+            <ol>
+              <li>A submitted torrent is tagged and downloaded into the configured local or NAS staging boundary.</li>
+              <li>When complete, Torrent Intake pauses it and repeats the qBittorrent ownership, tag, path, completion, and file-identity checks.</li>
+              <li>Every regular file is streamed to the persistent private ClamD sidecar. Clean file checkpoints survive restarts.</li>
+              <li>Clean content is promoted to its approved media destination. Infected content follows the read-only action shown above.</li>
+              <li>Structured events are written durably for the central notifier; Torrent Intake does not send Telegram directly.</li>
+            </ol>
+            <p>Host bind mounts cannot be changed from inside this container. Update the Compose or Portainer stack and recreate the application when a deployment-managed setting changes.</p>
+            <p>Compose-only values such as the image tag, host port, numeric UID/GID, host-side bind paths, and ClamD sidecar limits are not visible to the application. Inspect the deployed stack for those values.</p>
+            <p>The live scan-slot and maintenance controls are intentionally kept in the Scan Queue toolbar.</p>
+            <button id="settings-runtime-controls-button" class="button-secondary" type="button">Go to runtime scanner controls</button>
+          </div>
+        </details>
+
+        <div class="settings-search-wrap">
+          <label for="settings-search">Search current settings</label>
+          <input
+            id="settings-search"
+            class="settings-search"
+            type="search"
+            placeholder="Search by name, environment variable, value, or purpose"
+            autocomplete="off">
+        </div>
+
+        <p id="settings-no-results" class="settings-no-results" hidden>No settings match that search.</p>
+
+        <div class="settings-groups">
+          {% for group in settings_catalog %}
+          <section class="settings-group" data-settings-group>
+            <header class="settings-group-head">
+              <h3>{{ group.name }}</h3>
+              <p>{{ group.description }}</p>
+            </header>
+            <div class="settings-list">
+              {% for item in group.settings %}
+              <article
+                class="setting-card{% if item.safety_critical %} safety-critical{% endif %}"
+                data-setting-item
+                data-setting-search="{{ item.label }} {{ item.env_name }} {{ item.description }} {{ item.current }}">
+                <div class="setting-card-head">
+                  <div>
+                    <h4>{{ item.label }}</h4>
+                    <code class="setting-env">{{ item.env_name }}</code>
+                  </div>
+                  <div class="setting-badges">
+                    {% if item.safety_critical %}
+                    <span class="setting-badge warning">Safety-critical</span>
+                    {% endif %}
+                    {% if item.sensitive %}
+                    <span class="setting-badge secret">Secret hidden</span>
+                    {% endif %}
+                    <span class="setting-badge">Read-only</span>
+                  </div>
+                </div>
+                <div class="setting-values">
+                  <div class="setting-value">
+                    <span>Current</span>
+                    <code>{{ item.current }}</code>
+                  </div>
+                  <div class="setting-value">
+                    <span>Built-in default</span>
+                    <code>{{ item.default }}</code>
+                  </div>
+                </div>
+                <p class="setting-description">{{ item.description }}</p>
+                {% if item.current_effect %}
+                <p class="setting-effect"><strong>Current behavior:</strong> {{ item.current_effect }}</p>
+                {% endif %}
+                <p class="setting-change-hint">{{ item.change_hint }}</p>
+              </article>
+              {% endfor %}
+            </div>
+          </section>
+          {% endfor %}
+        </div>
+      </div>
+    </aside>
+  </section>
+
   <script>
     const heroDetails = document.getElementById('hero-details');
+    const settingsOpenButton = document.getElementById('settings-open-button');
+    const settingsDialog = document.getElementById('settings-dialog');
+    const settingsDrawer = document.getElementById('settings-drawer');
+    const settingsCloseButton = document.getElementById('settings-close-button');
+    const settingsSearch = document.getElementById('settings-search');
+    const settingsNoResults = document.getElementById('settings-no-results');
+    const settingsRuntimeControlsButton = document.getElementById('settings-runtime-controls-button');
     const jobForm = document.getElementById('job-form');
     const finalParentInput = document.getElementById('final-parent-input');
     const finalCategoryInput = document.getElementById('final-category-input');
@@ -1476,7 +1964,46 @@
     let finalPathTimer = null;
     let jobsRefreshTimer = null;
     let jobsRequestInFlight = false;
+    let settingsReturnFocus = null;
     const mobileHeroMediaQuery = window.matchMedia('(max-width: 720px)');
+
+    function filterSettings() {
+      const query = settingsSearch.value.trim().toLowerCase();
+      let visibleCount = 0;
+      settingsDialog.querySelectorAll('[data-settings-group]').forEach((group) => {
+        let groupVisible = 0;
+        group.querySelectorAll('[data-setting-item]').forEach((item) => {
+          const searchable = (item.dataset.settingSearch || '').toLowerCase();
+          const visible = !query || searchable.includes(query);
+          item.hidden = !visible;
+          if (visible) groupVisible += 1;
+        });
+        group.hidden = groupVisible === 0;
+        visibleCount += groupVisible;
+      });
+      settingsNoResults.hidden = visibleCount !== 0;
+    }
+
+    function openSettingsDialog() {
+      if (!bulkDialog.hidden) closeBulkDialog();
+      settingsReturnFocus = document.activeElement;
+      settingsDialog.hidden = false;
+      settingsDialog.setAttribute('aria-hidden', 'false');
+      settingsOpenButton.setAttribute('aria-expanded', 'true');
+      document.body.classList.add('settings-open');
+      filterSettings();
+      window.requestAnimationFrame(() => settingsSearch.focus());
+    }
+
+    function closeSettingsDialog() {
+      if (settingsDialog.hidden) return;
+      settingsDialog.hidden = true;
+      settingsDialog.setAttribute('aria-hidden', 'true');
+      settingsOpenButton.setAttribute('aria-expanded', 'false');
+      document.body.classList.remove('settings-open');
+      if (settingsReturnFocus instanceof HTMLElement) settingsReturnFocus.focus();
+      settingsReturnFocus = null;
+    }
 
     function normalizedDefaultPrefix(prefix) {
       return prefix.endsWith('/') ? prefix : `${prefix}/`;
@@ -2354,7 +2881,25 @@
       if (event.target === bulkDialog) closeBulkDialog();
     });
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape' && !bulkDialog.hidden) closeBulkDialog();
+      if (event.key !== 'Escape') return;
+      if (!settingsDialog.hidden) {
+        closeSettingsDialog();
+        return;
+      }
+      if (!bulkDialog.hidden) closeBulkDialog();
+    });
+
+    settingsOpenButton.addEventListener('click', openSettingsDialog);
+    settingsCloseButton.addEventListener('click', closeSettingsDialog);
+    settingsSearch.addEventListener('input', filterSettings);
+    settingsDialog.addEventListener('click', (event) => {
+      if (event.target === settingsDialog) closeSettingsDialog();
+    });
+    settingsDrawer.addEventListener('click', (event) => event.stopPropagation());
+    settingsRuntimeControlsButton.addEventListener('click', () => {
+      closeSettingsDialog();
+      scannerStatusCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      scannerSlotsSelect.focus({ preventScroll: true });
     });
 
     finalParentInput.addEventListener('input', () => {

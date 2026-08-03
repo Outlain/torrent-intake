@@ -25,6 +25,7 @@ from .schemas import (
     ScannerSlotsUpdate,
 )
 from .service import JobService
+from .settings_view import build_settings_catalog
 from .worker import worker_loop
 
 logging.basicConfig(
@@ -358,5 +359,6 @@ def ui(request: Request, db: Session = Depends(get_db)):
             "title": settings.ui_title,
             "jobs": jobs,
             "settings": settings,
+            "settings_catalog": build_settings_catalog(settings),
         },
     )
