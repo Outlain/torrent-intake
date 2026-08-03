@@ -17,7 +17,13 @@ from email.utils import parsedate_to_datetime
 from .config import get_settings
 
 VERSION_PATTERN = re.compile(r"ClamAV\s+([^/\s]+)/([^/\s]+)/([^\r\n]+)", re.IGNORECASE)
-LIMIT_DETECTION_PREFIX = "heuristics.limits.exceeded"
+LIMIT_DETECTION_MARKERS = (
+    "heuristics.limits.exceeded",
+    "size limit exceeded",
+    "scan limit exceeded",
+    "limits exceeded",
+    "stream size limit exceeded",
+)
 STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_REPLY_BYTES = 1024 * 1024
 FileIdentity = tuple[int, int, int, int, int]
@@ -111,15 +117,15 @@ def parse_scan_response(response: str) -> tuple[bool, str | None]:
     response = response.strip().strip("\0")
     if not response:
         raise RuntimeError("scanner returned an empty response")
+    if any(marker in response.casefold() for marker in LIMIT_DETECTION_MARKERS):
+        raise ScannerPolicyError(
+            "ClamAV could not fully inspect this file because a configured limit was exceeded: "
+            f"{response[:500]}"
+        )
     if response.endswith(": OK") or response == "OK":
         return False, None
     if response.endswith(" FOUND"):
         threat_name = response.rsplit(": ", 1)[-1].removesuffix(" FOUND").strip() or "unknown"
-        if threat_name.lower().startswith(LIMIT_DETECTION_PREFIX):
-            raise ScannerPolicyError(
-                "ClamAV could not fully inspect this file because a configured limit was exceeded: "
-                f"{threat_name}"
-            )
         return True, threat_name
     if response.endswith(" ERROR"):
         raise RuntimeError(f"scanner could not inspect the file: {response}")

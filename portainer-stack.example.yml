@@ -58,7 +58,7 @@ services:
       - /mnt/media:/downloads:rw
       - /opt/docker/clamav-shared/events/torrent-intake:/events:rw
       - /opt/docker/clamav-shared/quarantine/torrent-intake:/quarantine:rw
-      - clamav-socket:/run/clamav:rw
+      - ${TI_CLAMD_SOCKET_HOST_DIR:-/opt/docker/clamav-shared/sockets/torrent-intake}:/run/clamav:rw
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
     ports:
@@ -99,7 +99,7 @@ services:
       CLAMD_SOCKET: /run/clamav/clamd.sock
     volumes:
       - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
-      - clamav-socket:/run/clamav:rw
+      - ${TI_CLAMD_SOCKET_HOST_DIR:-/opt/docker/clamav-shared/sockets/torrent-intake}:/run/clamav:rw
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777
     cap_drop:
@@ -118,6 +118,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  clamav-socket:

@@ -37,6 +37,10 @@ class ScannerParsingTests(unittest.TestCase):
                 "/downloads/large.iso: Heuristics.Limits.Exceeded.MaxFileSize FOUND"
             )
 
+    def test_stream_limit_error_is_policy_error(self) -> None:
+        with self.assertRaises(ScannerPolicyError):
+            parse_scan_response("stream: INSTREAM size limit exceeded. ERROR")
+
     def test_normal_detection_is_infection(self) -> None:
         infected, threat = parse_scan_response(
             "/downloads/eicar.com: Win.Test.EICAR_HDB-1 FOUND"

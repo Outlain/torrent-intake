@@ -961,7 +961,7 @@ class ScanCoordinator:
         self._release_lease(run)
         db.add_all([job, run])
         db.commit()
-        self._emit_scan_failure(job, message)
+        self._emit_scan_failure(job, message, failure_kind="scan_policy_limit")
 
     def _should_yield(self, db: Session, job: Job, run: ScanRun, is_large: bool) -> bool:
         queued = list(
@@ -1081,7 +1081,13 @@ class ScanCoordinator:
             time.sleep(0.5)
         raise RuntimeError("qBittorrent did not confirm the torrent was paused before scanning")
 
-    def _emit_scan_failure(self, job: Job, message: str) -> None:
+    def _emit_scan_failure(
+        self,
+        job: Job,
+        message: str,
+        *,
+        failure_kind: str | None = None,
+    ) -> None:
         try:
             emit_event(
                 "scan_failed",
@@ -1089,6 +1095,7 @@ class ScanCoordinator:
                 message[:2000],
                 source_path=job.content_path,
                 action_success=False,
+                failure_kind=failure_kind,
                 job_id=job.id,
                 torrent_hash=job.qbt_hash,
             )

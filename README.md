@@ -19,9 +19,12 @@ This repository publishes two images:
 - `torrent-intake-clamd`: persistent ClamD with the shared definitions mounted
   read-only. It has no media mount and `network_mode: none`.
 
-The containers share only a Compose-managed Unix-socket volume. The socket is
-mode `0600`, both processes use the same UID/GID, and there is no ClamD TCP
-listener or Docker socket. The sidecar never runs FreshClam; the separate
+The containers share only the dedicated host socket directory configured by
+`TI_CLAMD_SOCKET_HOST_DIR`. The socket is mode `0600`, the directory is mode
+`0750`, both processes use the same UID/GID, and there is no ClamD TCP listener
+or Docker socket. A bind mount is used so a deployment UID other than the image's
+default does not inherit incompatible ownership from a Docker-managed volume.
+The sidecar never runs FreshClam; the separate
 `clamav-defs-updater` is the sole signature writer. `SelfCheck 300` notices
 atomic definition updates. ClamD writes to container stderr, so the Compose
 `json-file` rotation policy covers daemon logs.
@@ -31,6 +34,12 @@ each file with `O_NOFOLLOW`, checks device/inode/size/mtime/ctime against its
 manifest, streams the descriptor, then verifies both descriptor and pathname
 identity again. ClamAV limit detections, malformed replies, unavailable/stale
 definitions, and socket failures never become clean verdicts.
+
+The default per-file limit is `2000 MiB`, matching the bounded sidecar. A larger
+file or a `Heuristics.Limits.Exceeded`/stream-limit reply becomes a durable
+`scan_failed` event with `failure_kind=scan_policy_limit`; the job enters an error
+state and the paused torrent is not promoted. Media extensions are not an
+allow-list because an extension is not proof of content type or safety.
 
 ## qBittorrent safety gates
 
@@ -101,7 +110,7 @@ Events never include passwords, tokens, passkeys, or magnet URIs.
 | `/opt/docker/clamav-shared/events/torrent-intake` | `/events` | rw durable events |
 | `/opt/docker/clamav-shared/quarantine/torrent-intake` | `/quarantine` | rw optional infection action |
 | `/opt/docker/clamav-shared/defs` | sidecar `/var/lib/clamav` | read-only definitions |
-| Compose named volume | both `/run/clamav` | private socket only |
+| `/opt/docker/clamav-shared/sockets/torrent-intake` | both `/run/clamav` | rw private socket only |
 
 The examples run both images as UID/GID `10001:10001`. Prepare their dedicated
 host directories without changing ownership of the whole media tree:
@@ -110,8 +119,14 @@ host directories without changing ownership of the whole media tree:
 sudo install -d -m 0750 -o 10001 -g 10001 \
   /opt/docker/torrent-intake/data \
   /opt/docker/clamav-shared/events/torrent-intake \
-  /opt/docker/clamav-shared/quarantine/torrent-intake
+  /opt/docker/clamav-shared/quarantine/torrent-intake \
+  /opt/docker/clamav-shared/sockets/torrent-intake
 ```
+
+If you set `INTAKE_UID`/`INTAKE_GID` to another identity, create every dedicated
+directory above with that same numeric owner before starting Compose. The socket
+directory is runtime-only; delete stale `clamd.sock` and `clamd.pid` files only
+while both Torrent Intake containers are stopped.
 
 Grant that identity the required access to the existing staging and media paths
 with the host's normal group or ACL policy. The definition directory only needs
@@ -140,6 +155,8 @@ show all bounded scanner settings. Important values include:
 | `TI_QBT_HOST` | `http://qbittorrent:8080` | reachable qB Web API |
 | `TI_QBT_USERNAME`, `TI_QBT_PASSWORD` | required deployment values | qB credentials |
 | `TI_COMPLETION_EVENT_TOKEN` | required in examples | authenticate completion hook |
+| `INTAKE_UID`, `INTAKE_GID` | `10001` | shared numeric identity for the app, sidecar, and writable host paths |
+| `TI_CLAMD_SOCKET_HOST_DIR` | `/opt/docker/clamav-shared/sockets/torrent-intake` | private host socket directory |
 | `TI_LOCAL_STAGING_ROOT` | `/staging-local` | exact local staging boundary |
 | `TI_NAS_STAGING_ROOT` | `/downloads/torrent-intake/staging` | exact NAS staging boundary |
 | `TI_FINAL_PARENT_PREFIX` | `/downloads` | primary allowed media root |
