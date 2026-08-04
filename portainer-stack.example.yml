@@ -1,6 +1,6 @@
 services:
   torrent-intake:
-    image: ghcr.io/${GITHUB_OWNER:-outlain}/torrent-intake-mvp:${IMAGE_TAG:-latest}
+    image: ghcr.io/${GITHUB_OWNER:-outlain}/torrent-intake:${IMAGE_TAG:-latest}
     container_name: torrent-intake
     user: "${INTAKE_UID:-10001}:${INTAKE_GID:-10001}"
     init: true

@@ -14,7 +14,7 @@ traversal, symlink escapes, staging roots, and operational locations such as
 
 This repository publishes two images:
 
-- `torrent-intake-mvp`: FastAPI/UI, SQLite job state, qBittorrent control, path
+- `torrent-intake`: FastAPI/UI, SQLite job state, qBittorrent control, path
   checks, and a descriptor-streaming ClamD client. It does not contain ClamAV.
 - `torrent-intake-clamd`: persistent ClamD with the shared definitions mounted
   read-only. It has no media mount and `network_mode: none`.
@@ -43,14 +43,23 @@ independent `1024 MiB` ClamD windows with a `1024 KiB` overlap. The overlap keep
 signatures crossing a window edge visible; one large-media scan slot is used by
 default. Device, inode, size, mtime, and ctime are still checked throughout.
 
+`MaxScanSize` measures parser/expanded data, not only the input file's raw size.
+Consequently, a video below `2000 MiB` can still reach that limit during its
+native scan. When that specific limit response occurs, Torrent Intake now
+requires the same `ffprobe` media validation and retries the file through the
+bounded overlapping-window route. This fallback never applies merely because a
+filename looks like media: archives, unknown formats, and unsafe attachments
+remain held without a clean verdict.
+
 This policy is intentionally recorded as `large_media_full_byte_windows`, not a
 native whole-file ClamAV verdict. ClamD sees all raw bytes and `ffprobe` validates
 the container, but whole-file hashes and parsers cannot span independent ClamD
 windows. The default bounded ceiling is `100 GiB`, so normal 5-50 GiB MKV/MP4
 files can complete without being skipped. Oversized archives, disk images,
 executables, audio-only files, unknown formats, unsafe media attachments, files
-above the configured ceiling, and any limit/error response remain held with no
-clean verdict. A filename extension never selects the large-media path.
+above the configured ceiling, and limit/error responses that the validated-media
+fallback cannot safely resolve remain held with no clean verdict. A filename
+extension never selects the large-media path.
 
 ## qBittorrent safety gates
 
@@ -266,10 +275,10 @@ large-media policy-version change intentionally invalidates old clean
 checkpoints so eligible files are evaluated under the new route once.
 
 ```sh
-docker build -t torrent-intake-mvp:test .
+docker build -t torrent-intake:test .
 docker build -f Dockerfile.clamd -t torrent-intake-clamd:test .
 docker run --rm --mount type=bind,src="$PWD",dst=/workspace,readonly \
-  --entrypoint python torrent-intake-mvp:test \
+  --entrypoint python torrent-intake:test \
   -m unittest discover -s /workspace/tests -v
 ```
 

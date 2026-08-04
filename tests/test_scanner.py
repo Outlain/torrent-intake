@@ -14,6 +14,7 @@ from pathlib import Path
 from app.scanner import (
     ScannerUnavailable,
     ScannerIdentity,
+    ScannerLimitError,
     ScannerPolicyError,
     ScannerService,
     file_identity,
@@ -35,13 +36,13 @@ class ScannerParsingTests(unittest.TestCase):
         self.assertEqual(updated_at, datetime(2026, 7, 29, 8, 0, 0))
 
     def test_limit_detection_is_policy_error_not_infection(self) -> None:
-        with self.assertRaises(ScannerPolicyError):
+        with self.assertRaises(ScannerLimitError):
             parse_scan_response(
                 "/downloads/large.iso: Heuristics.Limits.Exceeded.MaxFileSize FOUND"
             )
 
     def test_stream_limit_error_is_policy_error(self) -> None:
-        with self.assertRaises(ScannerPolicyError):
+        with self.assertRaises(ScannerLimitError):
             parse_scan_response("stream: INSTREAM size limit exceeded. ERROR")
 
     def test_normal_detection_is_infection(self) -> None:
@@ -177,6 +178,71 @@ class ScannerHealthTests(unittest.TestCase):
                 native_scan.assert_not_called()
             finally:
                 service.settings.scanner_max_file_mib = original_limit
+
+    def test_native_scan_limit_retries_verified_media_with_bounded_windows(self) -> None:
+        service = ScannerService()
+        identity = ScannerIdentity(
+            backend="clamd-instream",
+            engine_version="1.5.3",
+            database_version="27901",
+            database_updated_at=datetime.utcnow(),
+            policy_version=service.policy_version(),
+            raw_version="ClamAV 1.5.3/27901/test",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "movie.mkv"
+            path.write_bytes(b"small-test-placeholder")
+            with (
+                patch.object(
+                    service,
+                    "_scan_descriptor_window",
+                    side_effect=[
+                        b"stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND",
+                        b"stream: OK",
+                    ],
+                ) as stream_scan,
+                patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+            ):
+                result = service.scan_path(str(path), identity=identity)
+
+            self.assertEqual(stream_scan.call_count, 2)
+            self.assertEqual([call.kwargs["offset"] for call in stream_scan.call_args_list], [0, 0])
+            self.assertTrue(result.clean)
+            self.assertEqual(result.scan_method, "large_media_full_byte_windows")
+            self.assertIn("native-limit fallback", result.raw_output)
+
+    def test_native_scan_limit_keeps_non_media_fallback_held(self) -> None:
+        service = ScannerService()
+        identity = ScannerIdentity(
+            backend="clamd-instream",
+            engine_version="1.5.3",
+            database_version="27901",
+            database_updated_at=datetime.utcnow(),
+            policy_version=service.policy_version(),
+            raw_version="ClamAV 1.5.3/27901/test",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "archive.zip"
+            path.write_bytes(b"small-test-placeholder")
+            with (
+                patch.object(
+                    service,
+                    "_scan_descriptor",
+                    side_effect=ScannerLimitError(
+                        "ClamAV limit: Heuristics.Limits.Exceeded.MaxScanSize"
+                    ),
+                ),
+                patch.object(
+                    service,
+                    "_scan_large_media_descriptor",
+                    side_effect=ScannerPolicyError("not an approved video container"),
+                ),
+                self.assertRaisesRegex(
+                    ScannerPolicyError,
+                    "verified-media fallback was rejected.*not an approved video",
+                ),
+            ):
+                service.scan_path(str(path), identity=identity)
 
 
 class InStreamTests(unittest.TestCase):

@@ -127,6 +127,10 @@ class ScannerPolicyError(RuntimeError):
     pass
 
 
+class ScannerLimitError(ScannerPolicyError):
+    """ClamD reached a configured inspection limit without a clean verdict."""
+
+
 def parse_scanner_version(raw_output: str) -> tuple[str | None, str | None, datetime | None]:
     raw_output = (raw_output or "").strip().strip("\0")
     match = VERSION_PATTERN.search(raw_output)
@@ -153,7 +157,7 @@ def parse_scan_response(response: str) -> tuple[bool, str | None]:
     if not response:
         raise RuntimeError("scanner returned an empty response")
     if any(marker in response.casefold() for marker in LIMIT_DETECTION_MARKERS):
-        raise ScannerPolicyError(
+        raise ScannerLimitError(
             "ClamAV could not fully inspect this file because a configured limit was exceeded: "
             f"{response[:500]}"
         )
@@ -332,14 +336,37 @@ class ScannerService:
             started_at = datetime.utcnow()
             started = time.monotonic()
             if initial_stat.st_size <= self.settings.scanner_max_file_bytes:
-                infected, threat_name, output = self._scan_descriptor(
-                    descriptor,
-                    path,
-                    expected,
-                    heartbeat=heartbeat,
-                    should_stop=should_stop,
-                )
-                scan_method = "clamd_native"
+                try:
+                    infected, threat_name, output = self._scan_descriptor(
+                        descriptor,
+                        path,
+                        expected,
+                        heartbeat=heartbeat,
+                        should_stop=should_stop,
+                    )
+                    scan_method = "clamd_native"
+                except ScannerLimitError as native_limit:
+                    # MaxScanSize accounts for parser/expanded content, so a
+                    # file below the raw native-size boundary can still reach
+                    # it. Retry only through the media route: that route first
+                    # verifies the real container and rejects archives or
+                    # unknown formats before using bounded ClamD windows.
+                    try:
+                        infected, threat_name, output = self._scan_large_media_descriptor(
+                            descriptor,
+                            path,
+                            expected,
+                            heartbeat=heartbeat,
+                            should_stop=should_stop,
+                        )
+                    except ScannerPolicyError as fallback_error:
+                        raise ScannerPolicyError(
+                            f"{native_limit}; verified-media fallback was rejected: {fallback_error}"
+                        ) from fallback_error
+                    output = (
+                        f"native-limit fallback ({native_limit}); {output}"
+                    )[:MAX_REPLY_BYTES]
+                    scan_method = "large_media_full_byte_windows"
             else:
                 infected, threat_name, output = self._scan_large_media_descriptor(
                     descriptor,

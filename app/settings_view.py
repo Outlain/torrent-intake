@@ -178,8 +178,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     ),
     "scanner_max_file_mib": SettingSpec(
         "ClamAV scanner",
-        "Maximum streamed file size",
-        "Per-file MiB ceiling for complete scanning. Larger files fail closed and are never reported as clean.",
+        "Native ClamD stream boundary",
+        "Raw-size boundary for one native ClamD stream. Larger verified videos, and verified videos whose native parser reaches MaxScanSize, use bounded overlapping windows; other unsupported content remains held.",
         safety_critical=True,
     ),
     "scanner_health_cache_seconds": SettingSpec(
@@ -205,7 +205,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "large_media_enabled": SettingSpec(
         "ClamAV scanner",
         "Large-media scanner",
-        "Routes oversized, verified video containers through full-byte overlapping ClamD windows instead of treating them as clean or skipping them.",
+        "Routes oversized verified videos, and verified videos whose native scan reaches a parser/expanded-data limit, through full-byte overlapping ClamD windows.",
         safety_critical=True,
     ),
     "large_media_max_file_gib": SettingSpec(
