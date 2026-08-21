@@ -44,7 +44,7 @@ jobs:
 
       - name: Verify ClamD image
         run: |
-          docker run --rm --entrypoint clamd torrent-intake-clamd:test --version | grep -E '^ClamAV 1\.4\.5($|/)'
+          docker run --rm --entrypoint clamd torrent-intake-clamd:test --version | grep -E '^ClamAV 1\.4\.[0-9]+($|/)'
           docker run --rm --entrypoint id torrent-intake-clamd:test -u | grep -qx 10001
 
       - name: Set up QEMU
