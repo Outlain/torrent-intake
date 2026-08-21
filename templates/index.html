@@ -2112,7 +2112,7 @@
       const maintenanceText = status.maintenance_mode
         ? (status.maintenance_drained ? ' | maintenance ready: drained' : ' | maintenance: draining current files')
         : '';
-      scannerStatus.textContent = `${status.active || 0} active, ${status.queued || 0} queued, ${status.paused || 0} paused | ${status.active_large || 0}/${status.max_large_scans || 1} large | ${mode}${boostHint}${maintenanceText}`;
+      scannerStatus.textContent = `${status.active || 0} active, ${status.queued || 0} queued, ${status.paused || 0} paused | ${status.active_large || 0}/${status.max_large_scans || 1} large | ${status.per_job_scan_workers || 1} range workers/job, ${status.clamd_max_inflight_requests || 1} ClamD max | ${mode}${boostHint}${maintenanceText}`;
 
       const health = status.health || {};
       const engine = health.engine_version ? `engine ${health.engine_version}` : 'engine unknown';

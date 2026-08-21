@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -111,8 +112,19 @@ class ScanResult:
     scan_method: str = "clamd_native"
 
 
+@dataclass(frozen=True)
+class _WindowScanOutcome:
+    infected: bool
+    threat_name: str | None
+    replies: tuple[str, ...]
+
+
 class ScanInterrupted(RuntimeError):
     pass
+
+
+class _ParallelWindowCancelled(ScanInterrupted):
+    """A sibling window reached a terminal result, so this work is no longer needed."""
 
 
 class ScannerUnavailable(RuntimeError):
@@ -201,6 +213,31 @@ def large_media_window_ranges(
     return ranges
 
 
+def split_large_media_window(
+    offset: int,
+    length: int,
+    minimum_bytes: int,
+    overlap_bytes: int,
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """Split a limited window into two overlapping windows without dropping bytes."""
+    if offset < 0 or length <= 0 or minimum_bytes <= 0:
+        raise ValueError("window offset, length, and minimum must be valid positive values")
+    if overlap_bytes < 0 or overlap_bytes >= minimum_bytes:
+        raise ValueError("adaptive overlap must be smaller than the minimum window")
+
+    left_length = (length + overlap_bytes) // 2
+    right_offset = offset + left_length - overlap_bytes
+    right_length = offset + length - right_offset
+    if (
+        left_length < minimum_bytes
+        or right_length < minimum_bytes
+        or left_length >= length
+        or right_length >= length
+    ):
+        return None
+    return (offset, left_length), (right_offset, right_length)
+
+
 def parse_large_media_probe(raw_output: str, path: str) -> str:
     try:
         payload = json.loads(raw_output)
@@ -263,6 +300,9 @@ class ScannerService:
         self._health_lock = threading.Lock()
         self._cached_health: ScannerHealth | None = None
         self._cached_health_at = 0.0
+        self._clamd_scan_slots = threading.BoundedSemaphore(
+            min(max(int(self.settings.clamd_max_inflight_requests), 1), 4)
+        )
 
     def policy_version(self) -> str:
         policy = {
@@ -271,6 +311,7 @@ class ScannerService:
             "large_media_enabled": self.settings.large_media_enabled,
             "large_media_max_file_bytes": self.settings.large_media_max_file_bytes,
             "large_media_chunk_bytes": self.settings.large_media_chunk_bytes,
+            "large_media_min_chunk_bytes": self.settings.large_media_min_chunk_bytes,
             "large_media_overlap_bytes": self.settings.large_media_overlap_bytes,
             "policy_version": self.settings.scanner_policy_version,
         }
@@ -366,7 +407,7 @@ class ScannerService:
                     output = (
                         f"native-limit fallback ({native_limit}); {output}"
                     )[:MAX_REPLY_BYTES]
-                    scan_method = "large_media_full_byte_windows"
+                    scan_method = "large_media_parallel_adaptive_windows"
             else:
                 infected, threat_name, output = self._scan_large_media_descriptor(
                     descriptor,
@@ -375,7 +416,7 @@ class ScannerService:
                     heartbeat=heartbeat,
                     should_stop=should_stop,
                 )
-                scan_method = "large_media_full_byte_windows"
+                scan_method = "large_media_parallel_adaptive_windows"
             return ScanResult(
                 clean=not infected,
                 infected=infected,
@@ -463,6 +504,7 @@ class ScannerService:
         if self.settings.large_media_max_file_bytes <= 0:
             raise ScannerPolicyError("TI_LARGE_MEDIA_MAX_FILE_GIB must be positive")
         window_bytes = self.settings.large_media_chunk_bytes
+        minimum_bytes = self.settings.large_media_min_chunk_bytes
         overlap_bytes = self.settings.large_media_overlap_bytes
         if not 1 <= window_bytes <= native_bytes:
             raise ScannerPolicyError(
@@ -472,6 +514,23 @@ class ScannerService:
         if overlap_bytes < 0 or overlap_bytes >= window_bytes:
             raise ScannerPolicyError(
                 "TI_LARGE_MEDIA_OVERLAP_KIB must be nonnegative and smaller than the window"
+            )
+        if not overlap_bytes < minimum_bytes <= window_bytes:
+            raise ScannerPolicyError(
+                "TI_LARGE_MEDIA_MIN_CHUNK_MIB must be no larger than the initial window and "
+                "must be larger than TI_LARGE_MEDIA_OVERLAP_KIB"
+            )
+        inflight = self.settings.clamd_max_inflight_requests
+        workers = self.settings.per_job_scan_workers
+        if not 1 <= inflight <= 4:
+            raise ScannerPolicyError(
+                "TI_CLAMD_MAX_INFLIGHT_REQUESTS must be between 1 and 4 to match "
+                "the bundled ClamD MaxThreads setting"
+            )
+        if not 1 <= workers <= inflight:
+            raise ScannerPolicyError(
+                "TI_PER_JOB_SCAN_WORKERS must be positive and no larger than "
+                "TI_CLAMD_MAX_INFLIGHT_REQUESTS"
             )
         if self.settings.large_media_enabled and (
             not os.path.isabs(self.settings.ffprobe_binary)
@@ -557,13 +616,85 @@ class ScannerService:
         media_format = self._probe_large_media_descriptor(descriptor, path, deadline=deadline)
         self._verify_file_identity(descriptor, path, expected)
 
-        replies: list[str] = []
-        for index, (offset, length) in enumerate(ranges, start=1):
-            if time.monotonic() >= deadline:
-                self.clear_health_cache()
-                raise ScannerUnavailable(
-                    f"large-media scan exceeded the configured {timeout}-second timeout"
-                )
+        cancellation = threading.Event()
+        shared_heartbeat = self._shared_parallel_heartbeat(heartbeat)
+        worker_count = min(max(self.settings.per_job_scan_workers, 1), len(ranges))
+        outcomes: dict[int, _WindowScanOutcome] = {}
+        infection: _WindowScanOutcome | None = None
+        first_error: Exception | None = None
+
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="clamd-media-window",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    self._scan_large_media_range,
+                    descriptor,
+                    path,
+                    expected,
+                    offset=offset,
+                    length=length,
+                    deadline=deadline,
+                    timeout=timeout,
+                    heartbeat=shared_heartbeat,
+                    should_stop=should_stop,
+                    cancellation=cancellation,
+                ): index
+                for index, (offset, length) in enumerate(ranges, start=1)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    outcome = future.result()
+                except _ParallelWindowCancelled:
+                    continue
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                    cancellation.set()
+                    continue
+                outcomes[index] = outcome
+                if outcome.infected and infection is None:
+                    infection = outcome
+                    cancellation.set()
+
+        self._verify_file_identity(descriptor, path, expected)
+        if infection is not None:
+            return True, infection.threat_name, "; ".join(infection.replies)[:MAX_REPLY_BYTES]
+        if first_error is not None:
+            raise first_error
+        if len(outcomes) != len(ranges):
+            raise ScanInterrupted("large-media scan ended before every byte range completed")
+
+        replies = [reply for index in sorted(outcomes) for reply in outcomes[index].replies]
+        return False, None, (
+            f"large-media format={media_format} initial_windows={len(ranges)} "
+            f"clamd_requests={len(replies)} workers={worker_count} coverage=all-bytes; "
+            + "; ".join(replies)
+        )[:MAX_REPLY_BYTES]
+
+    def _scan_large_media_range(
+        self,
+        descriptor: int,
+        path: str,
+        expected: FileIdentity,
+        *,
+        offset: int,
+        length: int,
+        deadline: float,
+        timeout: int,
+        heartbeat: Callable[[], bool] | None,
+        should_stop: Callable[[], bool] | None,
+        cancellation: threading.Event,
+    ) -> _WindowScanOutcome:
+        if cancellation.is_set():
+            raise _ParallelWindowCancelled("large-media sibling window completed terminally")
+
+        def combined_should_stop() -> bool:
+            return cancellation.is_set() or bool(should_stop and should_stop())
+
+        try:
             raw_reply = self._scan_descriptor_window(
                 descriptor,
                 offset=offset,
@@ -571,20 +702,88 @@ class ScannerService:
                 deadline=deadline,
                 timeout_description=f"large-media {timeout}-second timeout",
                 heartbeat=heartbeat,
-                should_stop=should_stop,
+                should_stop=combined_should_stop,
             )
-            self._verify_file_identity(descriptor, path, expected)
-            output = raw_reply.decode("utf-8", errors="replace")
+        except ScanInterrupted as exc:
+            if cancellation.is_set() and not (should_stop and should_stop()):
+                raise _ParallelWindowCancelled(str(exc)) from exc
+            raise
+
+        self._verify_file_identity(descriptor, path, expected)
+        output = raw_reply.decode("utf-8", errors="replace")
+        reply = f"offset={offset} length={length} {output[:500]}"
+        try:
             infected, threat_name = parse_scan_response(output)
-            replies.append(
-                f"window={index}/{len(ranges)} offset={offset} length={length} {output[:500]}"
+        except ScannerLimitError as exc:
+            split = split_large_media_window(
+                offset,
+                length,
+                self.settings.large_media_min_chunk_bytes,
+                self.settings.large_media_overlap_bytes,
             )
-            if infected:
-                return True, threat_name, replies[-1]
-        return False, None, (
-            f"large-media format={media_format} windows={len(ranges)} coverage=all-bytes; "
-            + "; ".join(replies)
-        )[:MAX_REPLY_BYTES]
+            if split is None:
+                raise ScannerPolicyError(
+                    "ClamAV still reached an inspection limit at the configured adaptive "
+                    f"minimum window of {self.settings.large_media_min_chunk_mib} MiB: "
+                    f"offset={offset} length={length}: {exc}"
+                ) from exc
+
+            child_replies = [f"{reply}; subdividing"]
+            for child_offset, child_length in split:
+                child = self._scan_large_media_range(
+                    descriptor,
+                    path,
+                    expected,
+                    offset=child_offset,
+                    length=child_length,
+                    deadline=deadline,
+                    timeout=timeout,
+                    heartbeat=heartbeat,
+                    should_stop=should_stop,
+                    cancellation=cancellation,
+                )
+                child_replies.extend(child.replies)
+                if child.infected:
+                    cancellation.set()
+                    return _WindowScanOutcome(
+                        infected=True,
+                        threat_name=child.threat_name,
+                        replies=tuple(child_replies),
+                    )
+            return _WindowScanOutcome(
+                infected=False,
+                threat_name=None,
+                replies=tuple(child_replies),
+            )
+
+        if infected:
+            cancellation.set()
+        return _WindowScanOutcome(
+            infected=infected,
+            threat_name=threat_name,
+            replies=(reply,),
+        )
+
+    def _shared_parallel_heartbeat(
+        self,
+        heartbeat: Callable[[], bool] | None,
+    ) -> Callable[[], bool] | None:
+        if heartbeat is None:
+            return None
+        lock = threading.Lock()
+        state = {"last": 0.0, "healthy": True}
+        minimum_interval = max(min(self.settings.scan_heartbeat_seconds / 2, 5), 1)
+
+        def shared() -> bool:
+            with lock:
+                now = time.monotonic()
+                if now - state["last"] < minimum_interval:
+                    return bool(state["healthy"])
+                state["healthy"] = bool(heartbeat())
+                state["last"] = now
+                return bool(state["healthy"])
+
+        return shared
 
     def _probe_large_media_descriptor(
         self,
@@ -657,7 +856,14 @@ class ScannerService:
                     f"ClamD scan exceeded the {timeout_description}"
                 )
 
+        acquired_slot = False
         try:
+            acquired_slot = self._acquire_clamd_scan_slot(
+                deadline=deadline,
+                check_deadline=check_deadline,
+                heartbeat=heartbeat,
+                should_stop=should_stop,
+            )
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(max(self.settings.scanner_connect_timeout_seconds, 1))
                 client.connect(socket_path)
@@ -697,7 +903,34 @@ class ScannerService:
         except OSError as exc:
             self.clear_health_cache()
             raise ScannerUnavailable(f"lost connection to clamd socket {socket_path}: {exc}") from exc
+        finally:
+            if acquired_slot:
+                self._clamd_scan_slots.release()
         return raw_reply
+
+    def _acquire_clamd_scan_slot(
+        self,
+        *,
+        deadline: float,
+        check_deadline: Callable[[], None],
+        heartbeat: Callable[[], bool] | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> bool:
+        if self._clamd_scan_slots.acquire(blocking=False):
+            return True
+
+        interval = min(max(int(self.settings.scan_heartbeat_seconds), 1), 30)
+        while True:
+            check_deadline()
+            if should_stop and should_stop():
+                raise ScanInterrupted("scan interrupted while waiting for ClamD capacity")
+            if heartbeat and not heartbeat():
+                raise ScanInterrupted("scan lease was lost while waiting for ClamD capacity")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                check_deadline()
+            if self._clamd_scan_slots.acquire(timeout=min(interval, remaining)):
+                return True
 
     @staticmethod
     def _receive_reply(

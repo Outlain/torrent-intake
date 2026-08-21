@@ -505,6 +505,8 @@ class ScanCoordinator:
             "hard_max_slots": self._hard_max_slots(),
             "max_large_scans": self._max_large_scans(),
             "large_scan_gib": self.settings.large_scan_gib,
+            "per_job_scan_workers": self.settings.per_job_scan_workers,
+            "clamd_max_inflight_requests": self.settings.clamd_max_inflight_requests,
             "active": len(active),
             "active_large": sum(1 for job, run in active if self._is_large(job, run)),
             "queued": queued,

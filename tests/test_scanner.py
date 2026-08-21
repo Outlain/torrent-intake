@@ -6,7 +6,9 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from unittest.mock import patch
 from pathlib import Path
@@ -22,6 +24,7 @@ from app.scanner import (
     parse_large_media_probe,
     parse_scan_response,
     parse_scanner_version,
+    split_large_media_window,
 )
 
 
@@ -105,6 +108,20 @@ class ScannerParsingTests(unittest.TestCase):
                 coverage[index] = True
         self.assertTrue(all(coverage))
 
+    def test_adaptive_split_preserves_coverage_and_overlap(self) -> None:
+        split = split_large_media_window(100, 1000, 400, 20)
+
+        self.assertIsNotNone(split)
+        left, right = split or ((0, 0), (0, 0))
+        self.assertEqual(left[0], 100)
+        self.assertEqual(left[0] + left[1], right[0] + 20)
+        self.assertEqual(right[0] + right[1], 1100)
+        self.assertGreaterEqual(left[1], 400)
+        self.assertGreaterEqual(right[1], 400)
+
+    def test_adaptive_split_stops_before_children_would_be_too_small(self) -> None:
+        self.assertIsNone(split_large_media_window(0, 700, 400, 20))
+
 
 class ScannerHealthTests(unittest.TestCase):
     def test_stale_definitions_block_new_scans(self) -> None:
@@ -173,7 +190,7 @@ class ScannerHealthTests(unittest.TestCase):
                 ):
                     result = service.scan_path(str(path), identity=identity)
                 self.assertTrue(result.clean)
-                self.assertEqual(result.scan_method, "large_media_full_byte_windows")
+                self.assertEqual(result.scan_method, "large_media_parallel_adaptive_windows")
                 large_scan.assert_called_once()
                 native_scan.assert_not_called()
             finally:
@@ -208,7 +225,7 @@ class ScannerHealthTests(unittest.TestCase):
             self.assertEqual(stream_scan.call_count, 2)
             self.assertEqual([call.kwargs["offset"] for call in stream_scan.call_args_list], [0, 0])
             self.assertTrue(result.clean)
-            self.assertEqual(result.scan_method, "large_media_full_byte_windows")
+            self.assertEqual(result.scan_method, "large_media_parallel_adaptive_windows")
             self.assertIn("native-limit fallback", result.raw_output)
 
     def test_native_scan_limit_keeps_non_media_fallback_held(self) -> None:
@@ -285,6 +302,250 @@ class InStreamTests(unittest.TestCase):
                 )
             finally:
                 os.close(descriptor)
+
+    def test_large_media_uses_four_parallel_window_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "movie.mkv"
+            path.write_bytes(b"0123456789abcdefghijklmnop")
+            descriptor = os.open(path, os.O_RDONLY)
+            service = ScannerService()
+            original_workers = service.settings.per_job_scan_workers
+            service.settings.per_job_scan_workers = 4
+            expected = file_identity(os.fstat(descriptor))
+            active = 0
+            maximum_active = 0
+            lock = threading.Lock()
+            four_started = threading.Event()
+
+            def scan_window(*_args, **_kwargs) -> bytes:
+                nonlocal active, maximum_active
+                with lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                    if active == 4:
+                        four_started.set()
+                try:
+                    self.assertTrue(four_started.wait(2))
+                    time.sleep(0.02)
+                    return b"stream: OK"
+                finally:
+                    with lock:
+                        active -= 1
+
+            try:
+                with (
+                    patch(
+                        "app.scanner.large_media_window_ranges",
+                        return_value=[(0, 10), (4, 10), (8, 10), (16, 10)],
+                    ),
+                    patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                    patch.object(service, "_scan_descriptor_window", side_effect=scan_window),
+                ):
+                    infected, threat, output = service._scan_large_media_descriptor(
+                        descriptor,
+                        str(path),
+                        expected,
+                        heartbeat=None,
+                        should_stop=None,
+                    )
+
+                self.assertFalse(infected)
+                self.assertIsNone(threat)
+                self.assertEqual(maximum_active, 4)
+                self.assertIn("workers=4", output)
+            finally:
+                service.settings.per_job_scan_workers = original_workers
+                os.close(descriptor)
+
+    def test_large_media_limit_adaptively_subdivides_the_window(self) -> None:
+        mebibyte = 1024 * 1024
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "movie.mkv"
+            with path.open("wb") as stream:
+                stream.truncate(4 * mebibyte)
+            descriptor = os.open(path, os.O_RDONLY)
+            service = ScannerService()
+            original_workers = service.settings.per_job_scan_workers
+            original_minimum = service.settings.large_media_min_chunk_mib
+            original_overlap = service.settings.large_media_overlap_kib
+            service.settings.per_job_scan_workers = 1
+            service.settings.large_media_min_chunk_mib = 1
+            service.settings.large_media_overlap_kib = 0
+            expected = file_identity(os.fstat(descriptor))
+            lengths: list[int] = []
+
+            def scan_window(*_args, **kwargs) -> bytes:
+                lengths.append(kwargs["length"])
+                if kwargs["length"] > 2 * mebibyte:
+                    return b"stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND"
+                return b"stream: OK"
+
+            try:
+                with (
+                    patch(
+                        "app.scanner.large_media_window_ranges",
+                        return_value=[(0, 4 * mebibyte)],
+                    ),
+                    patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                    patch.object(service, "_scan_descriptor_window", side_effect=scan_window),
+                ):
+                    infected, threat, output = service._scan_large_media_descriptor(
+                        descriptor,
+                        str(path),
+                        expected,
+                        heartbeat=None,
+                        should_stop=None,
+                    )
+
+                self.assertFalse(infected)
+                self.assertIsNone(threat)
+                self.assertEqual(lengths, [4 * mebibyte, 2 * mebibyte, 2 * mebibyte])
+                self.assertIn("clamd_requests=3", output)
+                self.assertIn("subdividing", output)
+            finally:
+                service.settings.per_job_scan_workers = original_workers
+                service.settings.large_media_min_chunk_mib = original_minimum
+                service.settings.large_media_overlap_kib = original_overlap
+                os.close(descriptor)
+
+    def test_large_media_limit_at_minimum_window_fails_closed(self) -> None:
+        mebibyte = 1024 * 1024
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "movie.mkv"
+            with path.open("wb") as stream:
+                stream.truncate(mebibyte)
+            descriptor = os.open(path, os.O_RDONLY)
+            service = ScannerService()
+            original_workers = service.settings.per_job_scan_workers
+            original_minimum = service.settings.large_media_min_chunk_mib
+            original_overlap = service.settings.large_media_overlap_kib
+            service.settings.per_job_scan_workers = 1
+            service.settings.large_media_min_chunk_mib = 1
+            service.settings.large_media_overlap_kib = 0
+            expected = file_identity(os.fstat(descriptor))
+
+            try:
+                with (
+                    patch(
+                        "app.scanner.large_media_window_ranges",
+                        return_value=[(0, mebibyte)],
+                    ),
+                    patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                    patch.object(
+                        service,
+                        "_scan_descriptor_window",
+                        return_value=b"stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND",
+                    ),
+                    self.assertRaisesRegex(ScannerPolicyError, "adaptive minimum window"),
+                ):
+                    service._scan_large_media_descriptor(
+                        descriptor,
+                        str(path),
+                        expected,
+                        heartbeat=None,
+                        should_stop=None,
+                    )
+            finally:
+                service.settings.per_job_scan_workers = original_workers
+                service.settings.large_media_min_chunk_mib = original_minimum
+                service.settings.large_media_overlap_kib = original_overlap
+                os.close(descriptor)
+
+    def test_parallel_window_error_prevents_clean_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "movie.mkv"
+            path.write_bytes(b"0123456789abcdefghijklmnop")
+            descriptor = os.open(path, os.O_RDONLY)
+            service = ScannerService()
+            original_workers = service.settings.per_job_scan_workers
+            service.settings.per_job_scan_workers = 2
+            expected = file_identity(os.fstat(descriptor))
+
+            def scan_window(*_args, **kwargs) -> bytes:
+                if kwargs["offset"] == 0:
+                    raise RuntimeError("simulated ClamD failure")
+                return b"stream: OK"
+
+            try:
+                with (
+                    patch(
+                        "app.scanner.large_media_window_ranges",
+                        return_value=[(0, 10), (8, 10)],
+                    ),
+                    patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                    patch.object(service, "_scan_descriptor_window", side_effect=scan_window),
+                    self.assertRaisesRegex(RuntimeError, "simulated ClamD failure"),
+                ):
+                    service._scan_large_media_descriptor(
+                        descriptor,
+                        str(path),
+                        expected,
+                        heartbeat=None,
+                        should_stop=None,
+                    )
+            finally:
+                service.settings.per_job_scan_workers = original_workers
+                os.close(descriptor)
+
+    def test_global_clamd_limit_allows_only_four_active_requests(self) -> None:
+        service = ScannerService()
+        service._clamd_scan_slots = threading.BoundedSemaphore(4)
+        active = 0
+        maximum_active = 0
+        lock = threading.Lock()
+        four_started = threading.Event()
+
+        class FakeSocket:
+            def __enter__(inner_self):
+                nonlocal active, maximum_active
+                with lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                    if active == 4:
+                        four_started.set()
+                if not four_started.wait(2):
+                    raise RuntimeError("four requests did not start concurrently")
+                time.sleep(0.02)
+                return inner_self
+
+            def __exit__(inner_self, *_args):
+                nonlocal active
+                with lock:
+                    active -= 1
+
+            def settimeout(inner_self, _timeout):
+                return None
+
+            def connect(inner_self, _path):
+                return None
+
+            def sendall(inner_self, _payload):
+                return None
+
+            def recv(inner_self, _length):
+                return b"stream: OK\0"
+
+        deadline = time.monotonic() + 10
+
+        def request(_index: int) -> bytes:
+            return service._scan_descriptor_window(
+                -1,
+                offset=0,
+                length=0,
+                deadline=deadline,
+                timeout_description="test timeout",
+                heartbeat=None,
+                should_stop=None,
+            )
+
+        with (
+            patch("app.scanner.socket.socket", side_effect=lambda *_args, **_kwargs: FakeSocket()),
+            ThreadPoolExecutor(max_workers=8) as executor,
+        ):
+            replies = list(executor.map(request, range(8)))
+
+        self.assertEqual(replies, [b"stream: OK"] * 8)
+        self.assertEqual(maximum_active, 4)
 
     def test_total_scan_deadline_is_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

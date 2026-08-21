@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     scanner_backend: Literal["clamd"] = "clamd"
     clamd_socket_path: str = "/run/clamav/clamd.sock"
-    scanner_policy_version: str = "clamav-policy-v3-large-media"
+    scanner_policy_version: str = "clamav-policy-v4-parallel-adaptive-media"
     scanner_max_file_mib: int = 2000
     scanner_health_cache_seconds: int = 15
     scanner_connect_timeout_seconds: int = 5
@@ -43,11 +43,14 @@ class Settings(BaseSettings):
     scanner_definitions_stale_hours: int = 72
     large_media_enabled: bool = True
     large_media_max_file_gib: int = 100
-    large_media_chunk_mib: int = 1024
+    large_media_chunk_mib: int = 512
+    large_media_min_chunk_mib: int = 64
     large_media_overlap_kib: int = 1024
     large_media_probe_timeout_seconds: int = 120
-    large_media_scan_timeout_seconds: int = 21600
+    large_media_scan_timeout_seconds: int = 172800
     ffprobe_binary: str = "/usr/bin/ffprobe"
+    per_job_scan_workers: int = 1
+    clamd_max_inflight_requests: int = 4
     max_concurrent_scans: int = 2
     max_scan_slots: int = 4
     max_concurrent_large_scans: int = 1
@@ -100,6 +103,10 @@ class Settings(BaseSettings):
     @property
     def large_media_overlap_bytes(self) -> int:
         return self.large_media_overlap_kib * 1024
+
+    @property
+    def large_media_min_chunk_bytes(self) -> int:
+        return self.large_media_min_chunk_mib * 1024 * 1024
 
     @property
     def allowed_final_parent_prefixes(self) -> list[str]:

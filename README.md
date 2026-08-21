@@ -39,9 +39,12 @@ The native per-file ClamD limit remains `2000 MiB`. That is now a routing bounda
 not the application's final ceiling. A larger file is accepted only when
 `ffprobe` identifies an approved container with a real video stream and no
 unsupported stream or attachment type. Torrent Intake then reads every byte in
-independent `1024 MiB` ClamD windows with a `1024 KiB` overlap. The overlap keeps
-signatures crossing a window edge visible; one large-media scan slot is used by
-default. Device, inode, size, mtime, and ctime are still checked throughout.
+independent `512 MiB` ClamD windows with a `1024 KiB` overlap. Up to four windows
+from that file are streamed concurrently through separate private Unix-socket
+connections. The file is opened once and read with explicit offsets; Torrent
+Intake does not copy it or create temporary chunk files. The overlap keeps
+signatures crossing a window edge visible. Device, inode, size, mtime, and ctime
+are still checked throughout.
 
 `MaxScanSize` measures parser/expanded data, not only the input file's raw size.
 Consequently, a video below `2000 MiB` can still reach that limit during its
@@ -51,15 +54,23 @@ bounded overlapping-window route. This fallback never applies merely because a
 filename looks like media: archives, unknown formats, and unsafe attachments
 remain held without a clean verdict.
 
-This policy is intentionally recorded as `large_media_full_byte_windows`, not a
-native whole-file ClamAV verdict. ClamD sees all raw bytes and `ffprobe` validates
-the container, but whole-file hashes and parsers cannot span independent ClamD
-windows. The default bounded ceiling is `100 GiB`, so normal 5-50 GiB MKV/MP4
-files can complete without being skipped. Oversized archives, disk images,
-executables, audio-only files, unknown formats, unsafe media attachments, files
-above the configured ceiling, and limit/error responses that the validated-media
-fallback cannot safely resolve remain held with no clean verdict. A filename
-extension never selects the large-media path.
+If ClamD still reports a parser or expanded-data limit for one window, that
+window is split into smaller overlapping windows and retried, down to a
+configured `64 MiB` minimum. A limit at the minimum remains a policy failure; it
+is never reported as clean or malware. A single application-wide semaphore caps
+all active ClamD streams at four, matching the sidecar's `MaxThreads 4`; `MaxQueue
+8` remains burst capacity rather than eight active scanners.
+
+This policy is intentionally recorded as
+`large_media_parallel_adaptive_windows`, not a native whole-file ClamAV verdict.
+ClamD sees all raw bytes and `ffprobe` validates the container, but whole-file
+hashes and parsers cannot span independent ClamD windows. The default bounded
+ceiling is `100 GiB`, so normal 5-50 GiB MKV/MP4 files can complete without being
+skipped. Oversized archives, disk images, executables, audio-only files, unknown
+formats, unsafe media attachments, files above the configured ceiling, and
+limit/error responses that the validated-media fallback cannot safely resolve
+remain held with no clean verdict. A filename extension never selects the
+large-media path.
 
 ## qBittorrent safety gates
 
@@ -93,6 +104,11 @@ pending files finish, so additions, replacements, deletions, symlinks, and
 special files block the final clean gate. Engine or policy changes reset relevant
 checkpoints; a signature-only database update is recorded without discarding
 completed per-file work.
+
+Parallel range workers never write SQLite. The owning torrent worker collects
+their results and performs every checkpoint update serially. A restart during
+one large file retries that file from its first window, while previously clean
+files in the same torrent remain checkpointed.
 
 Scan slots, large-job limits, leases, heartbeats, exponential retry, operator
 pause/resume, prioritization, and maintenance drain are bounded and persistent.
@@ -182,14 +198,17 @@ show all bounded scanner settings. Important values include:
 | `TI_FINAL_PARENT_PREFIX` | `/downloads` | primary allowed media root |
 | `TI_FINAL_PARENT_PREFIXES` | empty | optional additional mounted media roots |
 | `TI_SCANNER_MAX_FILE_MIB` | `2000` | native ClamD boundary; larger verified videos use the large-media route |
-| `TI_SCANNER_POLICY_VERSION` | `clamav-policy-v3-large-media` | checkpoint policy identity; changing it deliberately reschedules prior file checkpoints |
+| `TI_SCANNER_POLICY_VERSION` | `clamav-policy-v4-parallel-adaptive-media` | checkpoint policy identity; changing it deliberately reschedules prior file checkpoints |
 | `TI_SCANNER_SCAN_TIMEOUT_SECONDS` | `1200` | total per-file client deadline |
 | `TI_LARGE_MEDIA_ENABLED` | `true` | enable verified oversized-video routing |
 | `TI_LARGE_MEDIA_MAX_FILE_GIB` | `100` | hard ceiling for one oversized video |
-| `TI_LARGE_MEDIA_CHUNK_MIB` | `1024` | independent ClamD window, below the native limit |
+| `TI_LARGE_MEDIA_CHUNK_MIB` | `512` | initial independent ClamD window, below the native limit |
+| `TI_LARGE_MEDIA_MIN_CHUNK_MIB` | `64` | smallest adaptive retry window after a ClamD limit response |
 | `TI_LARGE_MEDIA_OVERLAP_KIB` | `1024` | repeated bytes between adjacent windows |
 | `TI_LARGE_MEDIA_PROBE_TIMEOUT_SECONDS` | `120` | ffprobe container-validation deadline |
-| `TI_LARGE_MEDIA_SCAN_TIMEOUT_SECONDS` | `21600` | total large-video scan deadline |
+| `TI_LARGE_MEDIA_SCAN_TIMEOUT_SECONDS` | `172800` | total deadline for one large video (two days) |
+| `TI_PER_JOB_SCAN_WORKERS` | `4` in the examples; built-in fallback `1` | concurrent byte ranges within one large media file |
+| `TI_CLAMD_MAX_INFLIGHT_REQUESTS` | `4` | application-wide active ClamD stream cap; keep at or below ClamD `MaxThreads` |
 | `TI_MAX_CONCURRENT_SCANS` | `2` | normal scan slots |
 | `TI_MAX_SCAN_SLOTS` | `4` | operator hard ceiling |
 | `TI_LARGE_SCAN_GIB` | `2` | jobs at/above this size use the bounded large-scan slot |

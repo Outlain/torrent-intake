@@ -220,6 +220,12 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         "MiB sent in each independent ClamD window. It must remain below the native ClamD stream limit.",
         safety_critical=True,
     ),
+    "large_media_min_chunk_mib": SettingSpec(
+        "ClamAV scanner",
+        "Minimum adaptive media window",
+        "Smallest MiB window allowed when ClamD reaches a parser or expanded-data limit and Torrent Intake safely subdivides that range.",
+        safety_critical=True,
+    ),
     "large_media_overlap_kib": SettingSpec(
         "ClamAV scanner",
         "Large-media window overlap",
@@ -240,6 +246,17 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         "ClamAV scanner",
         "ffprobe executable",
         "Image-provided ffprobe path used to validate oversized media. The Docker image installs it at build time.",
+        safety_critical=True,
+    ),
+    "per_job_scan_workers": SettingSpec(
+        "Scan scheduling",
+        "Large-file workers per torrent",
+        "Maximum large-media byte ranges from one torrent that may be streamed to ClamD simultaneously.",
+    ),
+    "clamd_max_inflight_requests": SettingSpec(
+        "Scan scheduling",
+        "Global ClamD request limit",
+        "Hard application-wide limit for simultaneous ClamD INSTREAM requests across every active torrent. Keep it at or below ClamD MaxThreads.",
         safety_critical=True,
     ),
     "max_concurrent_scans": SettingSpec(
