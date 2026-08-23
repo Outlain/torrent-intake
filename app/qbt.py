@@ -1,10 +1,19 @@
 from __future__ import annotations
+
 import base64
 import binascii
 import re
+import threading
+from collections.abc import Callable
+from typing import TypeVar
+
 import qbittorrentapi
 from requests import Response
+
 from .config import get_settings
+
+
+_T = TypeVar("_T")
 
 
 class TorrentAlreadyExistsError(RuntimeError):
@@ -25,25 +34,56 @@ class QbtService:
     _LOGIN_SUCCESS_STATUSES = {200, 204}
     _AUTH_COOKIE_NAMES = {"SID", "QBT_SID"}
 
+    # qBittorrent's Web API uses a session cookie. The application creates more
+    # than one JobService (UI + background worker), so keep one authenticated
+    # client for the whole Python process instead of logging in per operation.
+    #
+    # requests.Session is not guaranteed to be thread-safe. All qB calls are
+    # therefore serialized through this re-entrant lock while still reusing the
+    # same underlying HTTP session/cookie. qbittorrent-api automatically replaces
+    # an expired authentication cookie when an API call needs it.
+    _shared_client: qbittorrentapi.Client | None = None
+    _client_lock = threading.RLock()
+
     def __init__(self) -> None:
         self.settings = get_settings()
 
     def client(self) -> qbittorrentapi.Client:
-        client = qbittorrentapi.Client(
-            host=self.settings.qbt_host,
-            username=self.settings.qbt_username,
-            password=self.settings.qbt_password,
-            VERIFY_WEBUI_CERTIFICATE=self.settings.qbt_verify_certificate,
-            REQUESTS_ARGS={"timeout": self.settings.qbt_request_timeout_seconds},
-        )
-        try:
-            self._log_in(client)
-        except Exception as exc:
-            raise RuntimeError(
-                "qBittorrent login failed "
-                f"(host={self.settings.qbt_host}, user={self.settings.qbt_username}): {self._format_exc(exc)}"
-            ) from exc
-        return client
+        with type(self)._client_lock:
+            client = type(self)._shared_client
+            if client is not None:
+                return client
+
+            client = qbittorrentapi.Client(
+                host=self.settings.qbt_host,
+                username=self.settings.qbt_username,
+                password=self.settings.qbt_password,
+                VERIFY_WEBUI_CERTIFICATE=self.settings.qbt_verify_certificate,
+                REQUESTS_ARGS={"timeout": self.settings.qbt_request_timeout_seconds},
+            )
+            try:
+                self._log_in(client)
+            except Exception as exc:
+                raise RuntimeError(
+                    "qBittorrent login failed "
+                    f"(host={self.settings.qbt_host}, user={self.settings.qbt_username}): {self._format_exc(exc)}"
+                ) from exc
+
+            type(self)._shared_client = client
+            return client
+
+    def _with_client(self, operation: Callable[[qbittorrentapi.Client], _T]) -> _T:
+        # Hold the lock for the full API operation. This protects the shared
+        # requests.Session and its cookie jar from concurrent mutation.
+        with type(self)._client_lock:
+            return operation(self.client())
+
+    @classmethod
+    def _drop_shared_client(cls) -> None:
+        # Primarily useful for tests and controlled recovery. Normal cookie
+        # expiry is handled by qbittorrent-api itself on the shared client.
+        with cls._client_lock:
+            cls._shared_client = None
 
     def _log_in(self, client: qbittorrentapi.Client) -> str:
         try:
@@ -194,155 +234,178 @@ class QbtService:
         return f"{compact[:limit]}..."
 
     def add_torrent(self, magnet_uri: str, save_path: str, tags: list[str], category: str) -> None:
-        client = self.client()
-        infohash = self._extract_btih_hash(magnet_uri)
-        existing = self._get_torrent_with_client(client, infohash) if infohash else None
-        if existing is not None:
-            raise TorrentAlreadyExistsError(
-                torrent_hash=getattr(existing, "hash", None),
-                torrent_name=getattr(existing, "name", None),
-                save_path=getattr(existing, "save_path", None),
-            )
-        try:
-            result = client.torrents_add(
-                urls=magnet_uri,
-                save_path=save_path,
-                tags=tags,
-                category=category,
-                is_paused=False,
-            )
-            if isinstance(result, str) and result.strip().lower() != "ok.":
-                existing = self._get_torrent_with_client(client, infohash) if infohash else None
-                if existing is not None:
-                    raise TorrentAlreadyExistsError(
-                        torrent_hash=getattr(existing, "hash", None),
-                        torrent_name=getattr(existing, "name", None),
-                        save_path=getattr(existing, "save_path", None),
-                    )
-                raise RuntimeError(
-                    f"unexpected qBittorrent add result: {result!r} "
-                    "(generic qB add failure; often duplicate torrent, malformed magnet, or rejected save path/category)"
+        def operation(client: qbittorrentapi.Client) -> None:
+            infohash = self._extract_btih_hash(magnet_uri)
+            existing = self._get_torrent_with_client(client, infohash) if infohash else None
+            if existing is not None:
+                raise TorrentAlreadyExistsError(
+                    torrent_hash=getattr(existing, "hash", None),
+                    torrent_name=getattr(existing, "name", None),
+                    save_path=getattr(existing, "save_path", None),
                 )
-        except TorrentAlreadyExistsError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                "qBittorrent rejected torrent add request "
-                f"(save_path={save_path}, category={category}): {self._format_exc(exc)}"
-            ) from exc
+            try:
+                result = client.torrents_add(
+                    urls=magnet_uri,
+                    save_path=save_path,
+                    tags=tags,
+                    category=category,
+                    is_paused=False,
+                )
+                if isinstance(result, str) and result.strip().lower() != "ok.":
+                    existing = self._get_torrent_with_client(client, infohash) if infohash else None
+                    if existing is not None:
+                        raise TorrentAlreadyExistsError(
+                            torrent_hash=getattr(existing, "hash", None),
+                            torrent_name=getattr(existing, "name", None),
+                            save_path=getattr(existing, "save_path", None),
+                        )
+                    raise RuntimeError(
+                        f"unexpected qBittorrent add result: {result!r} "
+                        "(generic qB add failure; often duplicate torrent, malformed magnet, or rejected save path/category)"
+                    )
+            except TorrentAlreadyExistsError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    "qBittorrent rejected torrent add request "
+                    f"(save_path={save_path}, category={category}): {self._format_exc(exc)}"
+                ) from exc
+
+        self._with_client(operation)
 
     def find_existing_from_magnet(self, magnet_uri: str):
-        client = self.client()
         infohash = self._extract_btih_hash(magnet_uri)
         if not infohash:
             return None
-        return self._get_torrent_with_client(client, infohash)
+        return self._with_client(lambda client: self._get_torrent_with_client(client, infohash))
 
     def find_by_unique_tag(self, unique_tag: str):
-        client = self.client()
-        torrents = client.torrents_info()
-        for torrent in torrents:
-            torrent_tags = getattr(torrent, "tags", "") or ""
-            tags = {t.strip() for t in torrent_tags.split(",") if t.strip()}
-            if unique_tag in tags:
-                return torrent
-        return None
+        def operation(client: qbittorrentapi.Client):
+            torrents = client.torrents_info()
+            for torrent in torrents:
+                torrent_tags = getattr(torrent, "tags", "") or ""
+                tags = {t.strip() for t in torrent_tags.split(",") if t.strip()}
+                if unique_tag in tags:
+                    return torrent
+            return None
+
+        return self._with_client(operation)
 
     def get_torrent(self, torrent_hash: str):
-        return self._get_torrent_with_client(self.client(), torrent_hash)
+        return self._with_client(lambda client: self._get_torrent_with_client(client, torrent_hash))
 
     def get_torrents(self, torrent_hashes: list[str]):
         hashes = [torrent_hash for torrent_hash in dict.fromkeys(torrent_hashes) if torrent_hash]
         if not hashes:
             return []
-        return list(self.client().torrents_info(torrent_hashes="|".join(hashes)))
+        return self._with_client(
+            lambda client: list(client.torrents_info(torrent_hashes="|".join(hashes)))
+        )
 
     def list_torrents(self):
-        return list(self.client().torrents_info())
+        return self._with_client(lambda client: list(client.torrents_info()))
 
     def transfer_info(self) -> dict[str, object]:
-        response = self.client()._request(
-            http_method="get",
-            api_namespace="transfer",
-            api_method="info",
-            response_class=Response,
-        )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError(f"invalid qBittorrent transfer info response: {self._format_response(response)}") from exc
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"unexpected qBittorrent transfer info payload: {payload!r}")
-        return payload
+        def operation(client: qbittorrentapi.Client) -> dict[str, object]:
+            response = client._request(
+                http_method="get",
+                api_namespace="transfer",
+                api_method="info",
+                response_class=Response,
+            )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"invalid qBittorrent transfer info response: {self._format_response(response)}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"unexpected qBittorrent transfer info payload: {payload!r}")
+            return payload
+
+        return self._with_client(operation)
 
     def pause(self, torrent_hash: str) -> None:
-        self.client().torrents_pause(torrent_hashes=torrent_hash)
+        self._with_client(lambda client: client.torrents_pause(torrent_hashes=torrent_hash))
 
     def resume(self, torrent_hash: str) -> None:
-        self.client().torrents_resume(torrent_hashes=torrent_hash)
+        self._with_client(lambda client: client.torrents_resume(torrent_hashes=torrent_hash))
 
     def delete_with_files(self, torrent_hash: str) -> None:
-        self.client().torrents_delete(torrent_hashes=torrent_hash, delete_files=True)
+        self._with_client(
+            lambda client: client.torrents_delete(torrent_hashes=torrent_hash, delete_files=True)
+        )
 
     def set_location(self, torrent_hash: str, location: str) -> None:
-        self.client().torrents_set_location(torrent_hashes=torrent_hash, location=location)
+        self._with_client(
+            lambda client: client.torrents_set_location(torrent_hashes=torrent_hash, location=location)
+        )
 
     def set_category(self, torrent_hash: str, category: str) -> None:
-        self.client().torrents_set_category(torrent_hashes=torrent_hash, category=category)
+        self._with_client(
+            lambda client: client.torrents_set_category(torrent_hashes=torrent_hash, category=category)
+        )
 
     def set_save_path(self, torrent_hash: str, save_path: str) -> None:
-        self.client().torrents_set_save_path(torrent_hashes=torrent_hash, save_path=save_path)
+        self._with_client(
+            lambda client: client.torrents_set_save_path(torrent_hashes=torrent_hash, save_path=save_path)
+        )
 
     def list_categories(self) -> list[str]:
-        categories = self.client().torrents_categories()
+        categories = self._with_client(lambda client: client.torrents_categories())
         if hasattr(categories, "keys"):
             return sorted(str(name) for name in categories.keys())
         return []
 
     def list_save_path_suggestions(self) -> list[str]:
-        client = self.client()
-        paths: set[str] = set()
-        for torrent in client.torrents_info():
-            path = getattr(torrent, "save_path", None)
-            if isinstance(path, str) and path.strip():
-                paths.add(path.strip())
-        categories = client.torrents_categories()
-        if hasattr(categories, "values"):
-            for info in categories.values():
-                path = getattr(info, "save_path", None) or getattr(info, "savePath", None)
+        def operation(client: qbittorrentapi.Client) -> list[str]:
+            paths: set[str] = set()
+            for torrent in client.torrents_info():
+                path = getattr(torrent, "save_path", None)
                 if isinstance(path, str) and path.strip():
                     paths.add(path.strip())
-        return sorted(paths)
+            categories = client.torrents_categories()
+            if hasattr(categories, "values"):
+                for info in categories.values():
+                    path = getattr(info, "save_path", None) or getattr(info, "savePath", None)
+                    if isinstance(path, str) and path.strip():
+                        paths.add(path.strip())
+            return sorted(paths)
+
+        return self._with_client(operation)
 
     def resolve_or_create_category(self, category: str, *, create_if_missing: bool) -> str:
         requested = category.strip()
         if not requested:
             raise RuntimeError("final category is empty")
 
-        categories = self.client().torrents_categories()
-        existing = {str(name): str(name) for name in categories.keys()}
-        exact = existing.get(requested)
-        if exact:
-            return exact
+        def operation(client: qbittorrentapi.Client) -> str:
+            categories = client.torrents_categories()
+            existing = {str(name): str(name) for name in categories.keys()}
+            exact = existing.get(requested)
+            if exact:
+                return exact
 
-        lower_map = {name.lower(): name for name in existing}
-        case_match = lower_map.get(requested.lower())
-        if case_match:
-            return case_match
+            lower_map = {name.lower(): name for name in existing}
+            case_match = lower_map.get(requested.lower())
+            if case_match:
+                return case_match
 
-        if not create_if_missing:
-            raise RuntimeError(
-                f"final category '{requested}' not found in qBittorrent; "
-                "enable TI_AUTO_CREATE_FINAL_CATEGORY or create it in qBittorrent first"
-            )
+            if not create_if_missing:
+                raise RuntimeError(
+                    f"final category '{requested}' not found in qBittorrent; "
+                    "enable TI_AUTO_CREATE_FINAL_CATEGORY or create it in qBittorrent first"
+                )
 
-        try:
-            self.client().torrents_create_category(name=requested)
-        except Exception as exc:
-            raise RuntimeError(
-                f"failed to create qBittorrent category '{requested}': {self._format_exc(exc)}"
-            ) from exc
-        return requested
+            try:
+                client.torrents_create_category(name=requested)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"failed to create qBittorrent category '{requested}': {self._format_exc(exc)}"
+                ) from exc
+            return requested
+
+        return self._with_client(operation)
 
     def _get_torrent_with_client(self, client: qbittorrentapi.Client, torrent_hash: str | None):
         if not torrent_hash:
