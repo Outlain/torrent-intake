@@ -111,7 +111,9 @@ services:
       - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
       - ${TI_CLAMD_SOCKET_HOST_DIR:-/opt/docker/clamav-shared/sockets/torrent-intake}:/run/clamav:rw
     tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777
+      # ClamD stages each INSTREAM request here. Four 512 MiB parallel
+      # windows need 2 GiB before ClamAV's own temporary working space.
+      - /tmp:rw,nosuid,nodev,noexec,size=4g,mode=1777
     cap_drop:
       - ALL
     security_opt:

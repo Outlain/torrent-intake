@@ -61,6 +61,15 @@ is never reported as clean or malware. A single application-wide semaphore caps
 all active ClamD streams at four, matching the sidecar's `MaxThreads 4`; `MaxQueue
 8` remains burst capacity rather than eight active scanners.
 
+ClamD stages every active `INSTREAM` request in its temporary directory before
+scanning it. The examples therefore give the sidecar a `4 GiB` `/tmp` tmpfs for
+four concurrent `512 MiB` windows, leaving working headroom above the `2 GiB`
+raw-stream total. This is a maximum, not preallocated memory, and its actual use
+counts toward the sidecar's `8 GiB` memory limit. If either the window size or
+in-flight request cap is increased, increase both limits deliberately; an
+undersized temporary filesystem can make ClamD close a socket before returning a
+verdict.
+
 This policy is intentionally recorded as
 `large_media_parallel_adaptive_windows`, not a native whole-file ClamAV verdict.
 ClamD sees all raw bytes and `ffprobe` validates the container, but whole-file
