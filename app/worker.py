@@ -6,12 +6,16 @@ import socket
 import threading
 from uuid import uuid4
 
+from sqlalchemy import select
+
 from .config import get_settings
 from .db import SessionLocal
+from .models import Job
 from .scan_coordinator import ScanClaim
 from .service import JobService
 
 logger = logging.getLogger(__name__)
+QBT_HASH_RETRY_INTERVAL_SECONDS = 5
 
 
 def _run_management_cycle(service: JobService, startup_diagnostics_logged: bool) -> bool:
@@ -25,6 +29,35 @@ def _run_management_cycle(service: JobService, startup_diagnostics_logged: bool)
                 startup_diagnostics_logged = True
         service.process_nonterminal_jobs(db)
     return startup_diagnostics_logged
+
+
+def _run_qbt_hash_retry_cycle(service: JobService) -> int:
+    """Retry only jobs waiting for qBittorrent to expose their canonical hash.
+
+    qBittorrent can accept a magnet before the new torrent/tag is visible through
+    torrents/info. Keep this fast path separate from the general management poll
+    so a short propagation race does not leave a healthy torrent waiting for up
+    to several minutes.
+    """
+    with SessionLocal() as db:
+        jobs = list(
+            db.scalars(
+                select(Job)
+                .where(Job.is_terminal == False)
+                .where(Job.state == "waiting_for_qbt_hash")
+                .order_by(Job.created_at.asc())
+            )
+        )
+        for job in jobs:
+            try:
+                service._resolve_hash_for_job(db, job)
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Fast qB hash resolution failed for job %s; keeping it queued for retry",
+                    job.id,
+                )
+        return len(jobs)
 
 
 def _recover_scan_state(service: JobService) -> None:
@@ -62,6 +95,7 @@ async def worker_loop(stop_event: asyncio.Event) -> None:
     startup_diagnostics_logged = False
     loop = asyncio.get_running_loop()
     next_management_cycle = 0.0
+    next_qbt_hash_retry_cycle = 0.0
 
     try:
         try:
@@ -82,6 +116,13 @@ async def worker_loop(stop_event: asyncio.Event) -> None:
                 except Exception:
                     logger.exception("Background management cycle failed")
                 next_management_cycle = loop.time() + max(settings.polling_interval_seconds, 1)
+
+            if now >= next_qbt_hash_retry_cycle:
+                try:
+                    await asyncio.to_thread(_run_qbt_hash_retry_cycle, service)
+                except Exception:
+                    logger.exception("Background qB hash retry cycle failed")
+                next_qbt_hash_retry_cycle = loop.time() + QBT_HASH_RETRY_INTERVAL_SECONDS
 
             try:
                 claims = await asyncio.to_thread(_run_scan_scheduler_cycle, service, scheduler_id)
