@@ -5,6 +5,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app.config import Settings
 from app.settings_view import SETTING_SPECS, build_settings_catalog
+from app.tags import MAX_CUSTOM_TAG_LENGTH, MAX_CUSTOM_TAGS, PRIVATE_JOB_TAG_PREFIX
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +65,9 @@ class SettingsViewTests(unittest.TestCase):
             jobs=[],
             settings=settings,
             settings_catalog=build_settings_catalog(settings),
+            max_custom_tags=MAX_CUSTOM_TAGS,
+            max_custom_tag_length=MAX_CUSTOM_TAG_LENGTH,
+            private_job_tag_prefix=PRIVATE_JOB_TAG_PREFIX,
         )
 
         self.assertIn('id="settings-dialog"', html)
@@ -78,6 +82,27 @@ class SettingsViewTests(unittest.TestCase):
         self.assertIn("This does not perform the final clean-library promotion", html)
         self.assertIn("/jobs/bulk-move-to-nas", html)
         self.assertNotIn("Move Selected To NAS", html)
+        self.assertIn("qBittorrent Tags", html)
+        self.assertIn('id="custom-tag-input"', html)
+        self.assertIn('role="combobox"', html)
+        self.assertIn('aria-controls="custom-tag-menu"', html)
+        self.assertIn('id="custom-tag-menu"', html)
+        self.assertIn('aria-label="Available qBittorrent tags"', html)
+        self.assertIn('aria-multiselectable="true"', html)
+        self.assertIn('id="custom-tag-status"', html)
+        self.assertIn('aria-live="polite"', html)
+        self.assertIn("/qbt/tags", html)
+        self.assertIn("custom_tags", html)
+        self.assertIn("private tracking tags are added separately and never shown here", html)
+        self.assertIn("Tags selected in the main form apply to every torrent", html)
+        self.assertIn(f"Maximum {MAX_CUSTOM_TAGS} tags, {MAX_CUSTOM_TAG_LENGTH} characters each", html)
+        self.assertIn("Finish the tag search first", html)
+        self.assertNotIn("commitPendingCustomTag", html)
+        self.assertLess(
+            html.index("matches.slice(0, existingLimit)"),
+            html.index("if (canUseNewTag) options.push"),
+        )
+        self.assertIn("button.tabIndex = -1", html)
         self.assertNotIn("never-render-this-password", html)
         self.assertNotIn("never-render-this-token", html)
 

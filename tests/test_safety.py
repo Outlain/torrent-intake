@@ -74,6 +74,7 @@ class TorrentGuardTests(unittest.TestCase):
                 staging_root_actual=str(staging),
                 managed_tag="torrent_intake",
                 unique_tag="ti_job_guard",
+                custom_tags_json='["review-later"]',
                 qbt_hash="abc",
                 state="scanning",
             )
@@ -89,6 +90,8 @@ class TorrentGuardTests(unittest.TestCase):
                 content_path=str(content),
             )
 
+            # Descriptive custom tags are not ownership credentials. Removing
+            # one manually in qBittorrent must not block scanning or promotion.
             self.assertEqual(
                 TorrentSafetyGuard().validate_staging(db, job, torrent, require_paused=True),
                 content,

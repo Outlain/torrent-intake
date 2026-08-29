@@ -4,6 +4,7 @@ import re
 from pydantic import BaseModel, Field, field_validator
 from .config import get_settings
 from .paths import canonical_final_parent
+from .tags import MAX_CUSTOM_TAGS, normalize_custom_tags
 
 
 BTIH_PATTERN = re.compile(r"(^|[?&])xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})($|&)", re.IGNORECASE)
@@ -19,6 +20,7 @@ class JobCreate(BaseModel):
     final_parent: str = Field(min_length=2)
     final_category: str | None = None
     staging_preference: Literal["local", "nas"] = "local"
+    custom_tags: list[str] = Field(default_factory=list, max_length=MAX_CUSTOM_TAGS)
 
     @field_validator("final_parent")
     @classmethod
@@ -38,6 +40,14 @@ class JobCreate(BaseModel):
         if not BTIH_PATTERN.search(value):
             raise ValueError("magnet_uri must include a valid xt=urn:btih hash")
         return value
+
+    @field_validator("custom_tags")
+    @classmethod
+    def validate_custom_tags(cls, value: list[str]) -> list[str]:
+        return normalize_custom_tags(
+            value,
+            reserved_tags=(get_settings().managed_tag,),
+        )
 
 
 class JobBatchCreate(BaseModel):
@@ -59,6 +69,7 @@ class JobOut(BaseModel):
     override_reason: str | None
     managed_tag: str
     unique_tag: str
+    custom_tags: list[str]
     qbt_hash: str | None
     torrent_name: str | None
     state: str

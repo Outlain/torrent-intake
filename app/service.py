@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import shutil
 from uuid import uuid4
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .config import get_settings
@@ -14,6 +14,7 @@ from .models import Job, ScanRun
 from .paths import canonical_final_parent, path_is_within
 from .qbt import QbtService, TorrentAlreadyExistsError
 from .scan_coordinator import SCAN_ACTION_STATES, SCAN_QUEUE_STATES, ScanCoordinator
+from .tags import encode_custom_tags, filter_selectable_custom_tags, normalize_custom_tags
 
 
 class JobService:
@@ -47,9 +48,26 @@ class JobService:
         self.scan_coordinator = ScanCoordinator()
         self.logger = logging.getLogger(__name__)
 
-    def submit_job(self, db: Session, *, magnet_uri: str, final_parent: str, final_category: str | None,
-                   staging_preference: str) -> Job:
+    def submit_job(
+        self,
+        db: Session,
+        *,
+        magnet_uri: str,
+        final_parent: str,
+        final_category: str | None,
+        staging_preference: str,
+        custom_tags: list[str] | None = None,
+    ) -> Job:
         final_parent = canonical_final_parent(final_parent, self.settings)
+        custom_tags = normalize_custom_tags(
+            custom_tags,
+            reserved_tags=(self.settings.managed_tag,),
+        )
+        if custom_tags:
+            custom_tags = normalize_custom_tags(
+                custom_tags,
+                reserved_tags=self._reserved_custom_tags(db, candidate_tags=custom_tags),
+            )
         existing_torrent = self.qbt.find_existing_from_magnet(magnet_uri)
         if existing_torrent is not None:
             raise ValueError(
@@ -69,13 +87,14 @@ class JobService:
             final_category=final_category,
             staging_preference=staging_preference,
             staging_root=staging_root,
+            custom_tags=custom_tags,
         )
 
         try:
             self.qbt.add_torrent(
                 magnet_uri=magnet_uri,
                 save_path=staging_root,
-                tags=[self.settings.managed_tag, job.unique_tag],
+                tags=self._qbt_tags_for_job(job),
                 category=self.settings.intake_category,
             )
             self._resolve_hash_for_job(db, job)
@@ -109,6 +128,7 @@ class JobService:
         final_category: str | None,
         staging_preference: str,
         staging_root: str,
+        custom_tags: list[str],
     ) -> Job:
         last_exc: Exception | None = None
         for _ in range(5):
@@ -123,6 +143,7 @@ class JobService:
                 staging_root_actual=staging_root,
                 managed_tag=self.settings.managed_tag,
                 unique_tag=self._generate_unique_tag(db),
+                custom_tags_json=encode_custom_tags(custom_tags),
                 state="adding_to_qbt",
                 updated_at=datetime.utcnow(),
             )
@@ -159,6 +180,53 @@ class JobService:
                     qbt_tags.add(normalized)
         return db_tags | qbt_tags
 
+    def _reserved_custom_tags(
+        self,
+        db: Session,
+        *,
+        candidate_tags: list[str] | None = None,
+    ) -> set[str]:
+        reserved = {self.settings.managed_tag}
+        if not candidate_tags:
+            return reserved
+
+        for managed_tag in db.scalars(select(Job.managed_tag).distinct()):
+            if managed_tag:
+                reserved.add(managed_tag)
+
+        # Generated unique tags are rejected by namespace before this query.
+        # Check stored values case-insensitively too for compatibility with any
+        # historical job that used a different private-tag format, without
+        # loading every job tag into memory.
+        candidates = list(dict.fromkeys(tag.casefold() for tag in (candidate_tags or [])))
+        for offset in range(0, len(candidates), 500):
+            chunk = candidates[offset:offset + 500]
+            reserved.update(
+                db.scalars(select(Job.unique_tag).where(func.lower(Job.unique_tag).in_(chunk)))
+            )
+        return reserved
+
+    def list_selectable_qbt_tags(self, db: Session) -> list[str]:
+        # Remove invalid/current private names before doing historical lookups.
+        # A long-running installation can have thousands of ti_job_* tags, and
+        # none of those should create needless database query parameters.
+        qbt_tags = filter_selectable_custom_tags(
+            self.qbt.list_tags(),
+            reserved_tags=(self.settings.managed_tag,),
+        )
+        return filter_selectable_custom_tags(
+            qbt_tags,
+            reserved_tags=self._reserved_custom_tags(db, candidate_tags=qbt_tags),
+        )
+
+    @staticmethod
+    def _qbt_tags_for_job(job: Job) -> list[str]:
+        custom_tags = normalize_custom_tags(
+            job.custom_tags,
+            reserved_tags=(job.managed_tag, job.unique_tag),
+        )
+        return [job.managed_tag, job.unique_tag, *custom_tags]
+
     def retry_job(self, db: Session, *, job_id: str) -> Job:
         job = db.get(Job, job_id)
         if not job:
@@ -178,7 +246,7 @@ class JobService:
                 self.qbt.add_torrent(
                     magnet_uri=job.magnet_uri,
                     save_path=staging_root,
-                    tags=[self.settings.managed_tag, job.unique_tag],
+                    tags=self._qbt_tags_for_job(job),
                     category=self.settings.intake_category,
                 )
                 self._resolve_hash_for_job(db, job)

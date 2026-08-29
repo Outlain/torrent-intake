@@ -232,6 +232,33 @@ The UI/API has no login. The example binds it to
 `127.0.0.1:${TI_UI_HOST_PORT:-8095}`; place an authenticated reverse proxy in
 front before remote exposure.
 
+## Optional qBittorrent tags
+
+Each single or bulk intake submission can include up to 20 ordinary
+qBittorrent tags. The UI fetches qBittorrent's existing tags on load and manual
+refresh, searches them locally, and renders at most 40 suggestions at a time.
+Type a new name and use **Add Tag** to select it; qBittorrent creates a missing
+tag only when the torrent is submitted. Leaving unfinished search text blocks
+submission instead of silently creating a partial tag. Tags selected for a bulk
+submission apply to every torrent in that batch.
+
+qBittorrent trims tag names and uses commas as the tag-list delimiter. Torrent
+Intake therefore rejects empty names and commas. It also applies its own
+64-character limit, rejects control and invalid surrogate characters, and
+prevents use of the managed tag or private `ti_job_*` namespace. Private current
+and historical Intake tags are filtered server-side and never appear in the
+suggestion list. qBittorrent automatically creates a missing valid tag when the
+torrent is added, so no separate tag-creation request is needed.
+
+Selected tags are stored with the job and reused if a failed job must recreate
+its missing qBittorrent torrent. They are descriptive rather than ownership
+credentials: manually removing one does not block scanning or promotion. The
+managed tag and generated unique job tag remain the only required safety tags.
+
+Current upstream behavior is documented by qBittorrent's
+[WebUI API](https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-%28qBittorrent-5.0%29#add-torrent-tags)
+and [`Tag::isValid`](https://github.com/qbittorrent/qBittorrent/blob/master/src/base/tag.cpp).
+
 ## Settings and help panel
 
 The UI has a **Settings & Help** gear button. Its drawer shows every effective
@@ -278,6 +305,7 @@ placeholders. The background poller still discovers missed callbacks.
   priority/pause/resume endpoints used by the UI
 - `GET /scanner/status`, `POST /scanner/slots`, `POST /scanner/maintenance`
 - qB category/transfer and approved final-path suggestion endpoints
+- server-filtered qB tag suggestions at `GET /qbt/tags`
 - `POST /events/qbt-complete` and `/events/qbt-complete-form`
 - `GET /health` and `GET /ui`
 

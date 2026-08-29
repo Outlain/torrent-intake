@@ -663,7 +663,8 @@
 
     .combo-option:hover,
     .combo-option:focus-visible,
-    .combo-option[aria-selected="true"] {
+    .combo-option[aria-selected="true"],
+    .combo-option[data-active="true"] {
       background: rgba(222, 125, 54, 0.1);
       border-color: rgba(222, 125, 54, 0.24);
       outline: none;
@@ -672,6 +673,97 @@
     .combo-empty {
       color: var(--muted);
       font-size: 0.88rem;
+    }
+
+    .tag-picker {
+      position: relative;
+      display: grid;
+      gap: 8px;
+    }
+
+    .tag-chip-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .tag-chip-list:empty {
+      display: none;
+    }
+
+    .tag-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      max-width: 100%;
+      padding: 6px 8px 6px 11px;
+      border: 1px solid rgba(222, 125, 54, 0.28);
+      border-radius: 999px;
+      background: rgba(222, 125, 54, 0.1);
+      color: var(--ink);
+    }
+
+    .tag-chip-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.86rem;
+      font-weight: 600;
+    }
+
+    .tag-chip-remove {
+      width: 24px;
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .tag-chip-remove:hover,
+    .tag-chip-remove:focus-visible {
+      background: rgba(255, 255, 255, 0.16);
+      color: var(--ink);
+      outline: 2px solid rgba(222, 125, 54, 0.45);
+      outline-offset: 1px;
+    }
+
+    .tag-input-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+    }
+
+    .tag-add-button {
+      min-width: 88px;
+      padding: 0 16px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--ink);
+      cursor: pointer;
+    }
+
+    .tag-add-button:hover,
+    .tag-add-button:focus-visible {
+      background: rgba(222, 125, 54, 0.12);
+      border-color: rgba(222, 125, 54, 0.38);
+      outline: none;
+    }
+
+    .tag-picker-status {
+      min-height: 1.2em;
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.35;
+    }
+
+    .tag-picker-status.error {
+      color: var(--danger);
     }
 
     input,
@@ -1649,6 +1741,30 @@
               </select>
               <span class="hint">Local is default. Torrents above the local max use NAS intake staging automatically, while smaller local jobs follow the aggregate overflow policy. Final promotion still uses the chosen destination.</span>
             </label>
+
+            <div class="field-wide">
+              <label for="custom-tag-input">qBittorrent Tags <span class="hint">(optional)</span></label>
+              <div id="custom-tag-picker" class="tag-picker" data-open="false">
+                <div id="selected-custom-tags" class="tag-chip-list" role="list" aria-label="Selected qBittorrent tags"></div>
+                <div class="tag-input-row">
+                  <input
+                    id="custom-tag-input"
+                    type="text"
+                    placeholder="Type to search or add a new tag"
+                    autocomplete="off"
+                    autocapitalize="none"
+                    role="combobox"
+                    aria-autocomplete="list"
+                    aria-expanded="false"
+                    aria-controls="custom-tag-menu"
+                    aria-describedby="custom-tag-help">
+                  <button id="custom-tag-add-button" class="tag-add-button" type="button">Add Tag</button>
+                </div>
+                <div id="custom-tag-menu" class="combo-menu" role="listbox" aria-label="Available qBittorrent tags" aria-multiselectable="true" hidden></div>
+              </div>
+              <span id="custom-tag-help" class="hint">Choose existing qBittorrent tags or type a new tag and use Add Tag. A typed tag is created in qBittorrent only when the torrent is submitted. These are descriptive tags that remain after promotion; Torrent Intake's private tracking tags are added separately and never shown here. Maximum {{ max_custom_tags }} tags, {{ max_custom_tag_length }} characters each, and no commas.</span>
+              <span id="custom-tag-status" class="tag-picker-status" role="status" aria-live="polite"></span>
+            </div>
           </div>
 
           <div class="actions-row">
@@ -1676,6 +1792,7 @@
             <input id="bulk-use-same-settings" type="checkbox" checked>
             <span>Use the form destination, category, and staging choice for every torrent</span>
           </label>
+          <span id="bulk-tags-summary" class="hint">Tags selected in the main form apply to every torrent in this bulk submission.</span>
         </div>
         <div id="bulk-list" class="bulk-list"></div>
         <div class="bulk-dialog-actions">
@@ -1934,6 +2051,12 @@
     const finalCategoryCombo = document.getElementById('final-category-combo');
     const finalCategoryToggle = document.getElementById('final-category-toggle');
     const categoryMenu = document.getElementById('category-menu');
+    const customTagPicker = document.getElementById('custom-tag-picker');
+    const customTagInput = document.getElementById('custom-tag-input');
+    const customTagAddButton = document.getElementById('custom-tag-add-button');
+    const customTagMenu = document.getElementById('custom-tag-menu');
+    const selectedCustomTagsContainer = document.getElementById('selected-custom-tags');
+    const customTagStatus = document.getElementById('custom-tag-status');
     const magnetInput = document.getElementById('magnet-input');
     const formStatus = document.getElementById('form-status');
     const submitButton = document.getElementById('submit-button');
@@ -1967,12 +2090,22 @@
     const bulkDialogStatus = document.getElementById('bulk-dialog-status');
     const bulkUseSameSettings = document.getElementById('bulk-use-same-settings');
     const bulkList = document.getElementById('bulk-list');
+    const bulkTagsSummary = document.getElementById('bulk-tags-summary');
     const defaultFinalParentPrefix = finalParentInput.dataset.defaultPrefix || '/downloads';
+    const managedQbtTag = {{ settings.managed_tag | tojson }};
+    const maxCustomTags = {{ max_custom_tags }};
+    const maxCustomTagLength = {{ max_custom_tag_length }};
+    const privateJobTagPrefix = {{ private_job_tag_prefix | tojson }};
+    const maxTagSuggestions = 40;
     const magnetUriPattern = /magnet:\?(?:(?!\s|magnet:\?).)+/gi;
     const btihPattern = /(^|[?&])xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})($|&)/i;
 
     let knownFinalPaths = [];
     let knownCategories = [];
+    let knownCustomTags = [];
+    let selectedCustomTags = [];
+    let tagMenuOptions = [];
+    let activeTagOptionIndex = -1;
     let latestJobs = [];
     let selectedJobIds = new Set();
     let jobsSortOrder = 'newest';
@@ -2269,12 +2402,16 @@
     }
 
     function getFormSettings() {
+      if (customTagInput.value.trim()) {
+        throw new Error('Finish the tag search first: choose a suggestion, use Add Tag, press Enter, or clear the search field.');
+      }
       const form = new FormData(jobForm);
       const finalCategory = String(form.get('final_category') || '').trim();
       return {
         final_parent: String(form.get('final_parent') || '').trim(),
         final_category: finalCategory || null,
         staging_preference: String(form.get('staging_preference') || 'local'),
+        custom_tags: [...selectedCustomTags],
       };
     }
 
@@ -2350,10 +2487,12 @@
       return row;
     }
 
-    function openBulkDialog(magnets) {
+    function openBulkDialog(magnets, settings) {
       pendingBulkMagnets = magnets;
-      const settings = getFormSettings();
       bulkDialogCopy.textContent = `${magnets.length} magnet links were detected. Each row will become its own tracked intake job.`;
+      bulkTagsSummary.textContent = settings.custom_tags.length
+        ? `Every row will receive these qBittorrent tags: ${settings.custom_tags.join(', ')}.`
+        : 'No optional qBittorrent tags are selected. Tags can be added from the main form before opening bulk review.';
       bulkUseSameSettings.checked = true;
       bulkList.innerHTML = '';
       magnets.forEach((magnet, index) => {
@@ -2382,6 +2521,7 @@
           final_parent: finalParent,
           final_category: finalCategory || null,
           staging_preference: stagingPreference,
+          custom_tags: [...sharedSettings.custom_tags],
         };
       });
       return { jobs };
@@ -2395,10 +2535,10 @@
     }
 
     async function submitBulkDialog() {
-      const payload = buildBulkPayload();
       bulkDialogSubmit.disabled = true;
       setBulkDialogStatus('Adding torrents as individually tracked jobs...');
       try {
+        const payload = buildBulkPayload();
         const result = await postJson('/jobs/bulk', payload);
         const failedIndexes = Object.keys(result.errors || {}).map((index) => Number(index) - 1);
         if (result.failed > 0) {
@@ -2414,6 +2554,9 @@
         } else {
           magnetInput.value = '';
           setFormStatus(`Bulk submit complete: ${result.created || 0} torrents added as individually tracked jobs.`);
+        }
+        if ((result.created || 0) > 0) {
+          knownCustomTags = sortedUnique([...knownCustomTags, ...selectedCustomTags]);
         }
         closeBulkDialog();
         magnetInput.focus();
@@ -2431,6 +2574,220 @@
 
     function sortedUnique(values) {
       return Array.from(new Set(values.filter(Boolean))).sort((left, right) => left.localeCompare(right));
+    }
+
+    function validateCustomTag(rawValue) {
+      const tag = String(rawValue || '').trim();
+      if (!tag) return { tag: '', error: 'Enter a tag name first.' };
+      if (tag.includes(',')) return { tag, error: 'qBittorrent tag names cannot contain commas.' };
+      if (Array.from(tag).length > maxCustomTagLength) {
+        return { tag, error: `Tag names must be ${maxCustomTagLength} characters or fewer.` };
+      }
+      if (/[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(tag)) {
+        return { tag, error: 'Tag names cannot contain control or surrogate characters.' };
+      }
+      const folded = tag.toLocaleLowerCase();
+      if (folded.startsWith(String(privateJobTagPrefix || '').toLocaleLowerCase()) || folded === String(managedQbtTag || '').trim().toLocaleLowerCase()) {
+        return { tag, error: 'That tag name is reserved for Torrent Intake tracking.' };
+      }
+      return { tag, error: '' };
+    }
+
+    function setCustomTagStatus(message, isError = false) {
+      customTagStatus.textContent = message || '';
+      customTagStatus.classList.toggle('error', Boolean(isError));
+    }
+
+    function closeCustomTagMenu() {
+      customTagPicker.dataset.open = 'false';
+      customTagInput.setAttribute('aria-expanded', 'false');
+      customTagInput.removeAttribute('aria-activedescendant');
+      customTagMenu.hidden = true;
+      customTagMenu.innerHTML = '';
+      tagMenuOptions = [];
+      activeTagOptionIndex = -1;
+    }
+
+    function renderSelectedCustomTags() {
+      selectedCustomTagsContainer.innerHTML = '';
+      selectedCustomTags.forEach((tag) => {
+        const chip = document.createElement('span');
+        chip.className = 'tag-chip';
+        chip.setAttribute('role', 'listitem');
+
+        const name = document.createElement('span');
+        name.className = 'tag-chip-name';
+        name.textContent = tag;
+        name.title = tag;
+
+        const remove = document.createElement('button');
+        remove.className = 'tag-chip-remove';
+        remove.type = 'button';
+        remove.textContent = '×';
+        remove.setAttribute('aria-label', `Remove qBittorrent tag ${tag}`);
+        remove.addEventListener('click', () => {
+          selectedCustomTags = selectedCustomTags.filter((value) => value !== tag);
+          renderSelectedCustomTags();
+          customTagInput.focus();
+          renderCustomTagMenu();
+          setCustomTagStatus(`Removed “${tag}”. ${selectedCustomTags.length} of ${maxCustomTags} tags selected.`);
+        });
+
+        chip.append(name, remove);
+        selectedCustomTagsContainer.appendChild(chip);
+      });
+    }
+
+    function addSelectedCustomTag(rawValue, { announce = true } = {}) {
+      const { tag, error } = validateCustomTag(rawValue);
+      if (error) {
+        setCustomTagStatus(error, true);
+        return error;
+      }
+      if (selectedCustomTags.includes(tag)) {
+        customTagInput.value = '';
+        renderCustomTagMenu({ showAll: true });
+        if (announce) setCustomTagStatus(`“${tag}” is already selected.`);
+        return '';
+      }
+      if (selectedCustomTags.length >= maxCustomTags) {
+        const limitError = `A job can have at most ${maxCustomTags} custom qBittorrent tags.`;
+        setCustomTagStatus(limitError, true);
+        return limitError;
+      }
+
+      selectedCustomTags.push(tag);
+      customTagInput.value = '';
+      renderSelectedCustomTags();
+      renderCustomTagMenu({ showAll: true });
+      if (announce) {
+        setCustomTagStatus(`Added “${tag}”. ${selectedCustomTags.length} of ${maxCustomTags} tags selected.`);
+      }
+      return '';
+    }
+
+    function availableTagMatches(rawQuery) {
+      const query = String(rawQuery || '').trim().toLocaleLowerCase();
+      const available = knownCustomTags.filter((tag) => !selectedCustomTags.includes(tag));
+      if (!query) return available;
+
+      const startsWith = [];
+      const includes = [];
+      available.forEach((tag) => {
+        const lowered = tag.toLocaleLowerCase();
+        if (lowered.startsWith(query)) {
+          startsWith.push(tag);
+        } else if (lowered.includes(query)) {
+          includes.push(tag);
+        }
+      });
+      return [...startsWith, ...includes];
+    }
+
+    function setActiveTagOption(index) {
+      if (tagMenuOptions.length === 0) {
+        activeTagOptionIndex = -1;
+        customTagInput.removeAttribute('aria-activedescendant');
+        return;
+      }
+      activeTagOptionIndex = (index + tagMenuOptions.length) % tagMenuOptions.length;
+      customTagMenu.querySelectorAll('.combo-option').forEach((option, optionIndex) => {
+        option.dataset.active = String(optionIndex === activeTagOptionIndex);
+      });
+      const active = document.getElementById(`custom-tag-option-${activeTagOptionIndex}`);
+      if (active) {
+        customTagInput.setAttribute('aria-activedescendant', active.id);
+        active.scrollIntoView({ block: 'nearest' });
+      }
+    }
+
+    function renderCustomTagMenu({ showAll = false } = {}) {
+      const rawQuery = showAll ? '' : customTagInput.value;
+      const query = String(rawQuery || '').trim();
+
+      if (selectedCustomTags.length >= maxCustomTags) {
+        tagMenuOptions = [];
+        customTagPicker.dataset.open = 'true';
+        customTagInput.setAttribute('aria-expanded', 'true');
+        customTagInput.removeAttribute('aria-activedescendant');
+        customTagMenu.hidden = false;
+        customTagMenu.innerHTML = '';
+        const limit = document.createElement('div');
+        limit.className = 'combo-empty';
+        limit.textContent = `The ${maxCustomTags}-tag limit is reached. Remove a selected tag before adding another.`;
+        customTagMenu.appendChild(limit);
+        activeTagOptionIndex = -1;
+        setCustomTagStatus(`${selectedCustomTags.length} of ${maxCustomTags} tags selected.`);
+        return;
+      }
+
+      const matches = availableTagMatches(rawQuery);
+      const options = [];
+      const validation = query ? validateCustomTag(query) : { tag: '', error: '' };
+      const exactKnown = query && knownCustomTags.includes(validation.tag);
+      const exactSelected = query && selectedCustomTags.includes(validation.tag);
+      const canUseNewTag = query && !validation.error && !exactKnown && !exactSelected;
+
+      // Existing matches come first so Enter selects the likely intended tag.
+      // The typed value remains available at the end or through Add Tag.
+      const existingLimit = Math.max(maxTagSuggestions - (canUseNewTag ? 1 : 0), 0);
+      matches.slice(0, existingLimit).forEach((tag) => options.push({ value: tag, create: false }));
+      if (canUseNewTag) options.push({ value: validation.tag, create: true });
+      tagMenuOptions = options;
+
+      customTagPicker.dataset.open = 'true';
+      customTagInput.setAttribute('aria-expanded', 'true');
+      customTagMenu.hidden = false;
+      customTagMenu.innerHTML = '';
+
+      if (options.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'combo-empty';
+        if (validation.error && query) {
+          empty.textContent = validation.error;
+          setCustomTagStatus(validation.error, true);
+        } else if (exactSelected) {
+          empty.textContent = 'That tag is already selected.';
+          setCustomTagStatus('That tag is already selected.');
+        } else if (knownCustomTags.length === 0) {
+          empty.textContent = 'No reusable qBittorrent tags were returned. Type a new tag and use Add Tag or press Enter.';
+          setCustomTagStatus(`${selectedCustomTags.length} of ${maxCustomTags} tags selected; no reusable tags are currently available.`);
+        } else {
+          empty.textContent = 'No selectable tags match this search.';
+          setCustomTagStatus('No selectable tags match this search.');
+        }
+        customTagMenu.appendChild(empty);
+        setActiveTagOption(-1);
+        return;
+      }
+
+      options.forEach((option, index) => {
+        const button = document.createElement('button');
+        button.id = `custom-tag-option-${index}`;
+        button.type = 'button';
+        button.tabIndex = -1;
+        button.className = 'combo-option';
+        button.setAttribute('role', 'option');
+        button.setAttribute('aria-selected', 'false');
+        button.dataset.active = 'false';
+        button.textContent = option.create ? `Use new tag “${option.value}”` : option.value;
+        button.addEventListener('mousedown', (event) => event.preventDefault());
+        button.addEventListener('click', () => {
+          addSelectedCustomTag(option.value);
+          customTagInput.focus();
+        });
+        customTagMenu.appendChild(button);
+      });
+      setActiveTagOption(0);
+
+      const existingShown = Math.min(matches.length, existingLimit);
+      if (matches.length > existingLimit) {
+        setCustomTagStatus(`Showing ${existingShown} of ${matches.length} existing tags. Type to narrow the list.`);
+      } else if (query) {
+        setCustomTagStatus(`${matches.length} existing match${matches.length === 1 ? '' : 'es'}${canUseNewTag ? '; use Add Tag to select the typed name instead' : ''}.`);
+      } else {
+        setCustomTagStatus(`${matches.length} reusable tag${matches.length === 1 ? '' : 's'} available; ${selectedCustomTags.length} selected.`);
+      }
     }
 
     function filterCategories(rawQuery) {
@@ -2735,6 +3092,22 @@
       } catch (error) {}
     }
 
+    async function loadCustomTags() {
+      try {
+        const tagsRes = await fetch('/qbt/tags');
+        if (!tagsRes.ok) throw new Error(await readErrorDetail(tagsRes));
+        const data = await tagsRes.json();
+        knownCustomTags = sortedUnique(Array.isArray(data.tags) ? data.tags : []);
+        if (customTagPicker.dataset.open === 'true') {
+          renderCustomTagMenu();
+        } else {
+          setCustomTagStatus(`${knownCustomTags.length} reusable tag${knownCustomTags.length === 1 ? '' : 's'} available; ${selectedCustomTags.length} selected.`);
+        }
+      } catch (error) {
+        setCustomTagStatus('Existing qBittorrent tags are unavailable; you can still type a new valid tag.', true);
+      }
+    }
+
     async function loadKnownFinalPaths() {
       try {
         const pathsRes = await fetch('/qbt/final-path-suggestions');
@@ -2864,13 +3237,23 @@
         submitButton.disabled = false;
         return;
       }
+
+      let formSettings;
+      try {
+        formSettings = getFormSettings();
+      } catch (error) {
+        setFormStatus(String(error), true);
+        customTagInput.focus();
+        submitButton.disabled = false;
+        return;
+      }
       if (parsed.magnets.length > 1) {
-        openBulkDialog(parsed.magnets);
+        openBulkDialog(parsed.magnets, formSettings);
         submitButton.disabled = false;
         return;
       }
 
-      const payload = { ...getFormSettings(), magnet_uri: parsed.magnets[0].uri };
+      const payload = { ...formSettings, magnet_uri: parsed.magnets[0].uri };
 
       try {
         const res = await fetch('/jobs', {
@@ -2885,6 +3268,7 @@
 
         magnetInput.value = '';
         magnetInput.focus();
+        knownCustomTags = sortedUnique([...knownCustomTags, ...selectedCustomTags]);
         setFormStatus('Job submitted. The job table will continue updating automatically.');
         await loadJobs();
       } finally {
@@ -2948,14 +3332,71 @@
       openCategoryMenu({ showAll: true });
       finalCategoryInput.focus();
     });
+    customTagInput.addEventListener('focus', () => renderCustomTagMenu({ showAll: !customTagInput.value.trim() }));
+    customTagInput.addEventListener('input', () => renderCustomTagMenu());
+    customTagInput.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        if (customTagPicker.dataset.open !== 'true') {
+          renderCustomTagMenu();
+        } else {
+          setActiveTagOption(activeTagOptionIndex + 1);
+        }
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        if (customTagPicker.dataset.open !== 'true') {
+          renderCustomTagMenu();
+          setActiveTagOption(tagMenuOptions.length - 1);
+        } else {
+          setActiveTagOption(activeTagOptionIndex - 1);
+        }
+        return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        const active = tagMenuOptions[activeTagOptionIndex];
+        addSelectedCustomTag(active ? active.value : customTagInput.value);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeCustomTagMenu();
+        return;
+      }
+      if (event.key === 'Backspace' && !customTagInput.value && selectedCustomTags.length) {
+        const removed = selectedCustomTags.pop();
+        renderSelectedCustomTags();
+        renderCustomTagMenu({ showAll: true });
+        setCustomTagStatus(`Removed “${removed}”. ${selectedCustomTags.length} of ${maxCustomTags} tags selected.`);
+      }
+    });
+    customTagInput.addEventListener('blur', () => {
+      window.setTimeout(() => {
+        if (!customTagPicker.contains(document.activeElement)) closeCustomTagMenu();
+      }, 0);
+    });
+    customTagAddButton.addEventListener('click', () => {
+      if (customTagInput.value.trim()) {
+        addSelectedCustomTag(customTagInput.value);
+      } else {
+        renderCustomTagMenu({ showAll: true });
+      }
+      customTagInput.focus();
+    });
     document.addEventListener('click', (event) => {
       if (!finalCategoryCombo.contains(event.target)) {
         closeCategoryMenu();
+      }
+      if (!customTagPicker.contains(event.target)) {
+        closeCustomTagMenu();
       }
     });
     refreshJobsButton.addEventListener('click', () => {
       loadJobs();
       loadScannerStatus();
+      loadCustomTags();
     });
     scannerSlotsSelect.addEventListener('change', updateScannerSlots);
     scannerMaintenanceButton.addEventListener('click', updateScannerMaintenance);
@@ -3076,7 +3517,7 @@
 
     loadQbtTransferInfo();
     loadScannerStatus();
-    Promise.all([loadCategories(), loadKnownFinalPaths()]).then(() => {
+    Promise.all([loadCategories(), loadCustomTags(), loadKnownFinalPaths()]).then(() => {
       loadFinalPathSuggestions();
       loadJobs();
       jobsRefreshTimer = setInterval(() => {

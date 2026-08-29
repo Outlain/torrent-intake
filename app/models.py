@@ -2,6 +2,7 @@ from datetime import datetime
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
+from .tags import decode_custom_tags, encode_custom_tags
 
 
 class Job(Base):
@@ -24,6 +25,12 @@ class Job(Base):
 
     managed_tag: Mapped[str] = mapped_column(String(255), nullable=False)
     unique_tag: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    custom_tags_json: Mapped[str] = mapped_column(
+        Text,
+        default="[]",
+        server_default="[]",
+        nullable=False,
+    )
     qbt_hash: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
     torrent_name: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -43,6 +50,14 @@ class Job(Base):
 
     threat_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    @property
+    def custom_tags(self) -> list[str]:
+        return decode_custom_tags(self.custom_tags_json)
+
+    @custom_tags.setter
+    def custom_tags(self, values: list[str]) -> None:
+        self.custom_tags_json = encode_custom_tags(values)
 
 
 class ScanRun(Base):

@@ -4,7 +4,7 @@ import base64
 import binascii
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TypeVar
 
 import qbittorrentapi
@@ -356,6 +356,12 @@ class QbtService:
         if hasattr(categories, "keys"):
             return sorted(str(name) for name in categories.keys())
         return []
+
+    def list_tags(self) -> list[str]:
+        tags = self._with_client(lambda client: client.torrents_tags())
+        if isinstance(tags, (str, bytes, dict)) or not isinstance(tags, Iterable):
+            return []
+        return [str(tag) for tag in tags]
 
     def list_save_path_suggestions(self) -> list[str]:
         def operation(client: qbittorrentapi.Client) -> list[str]:

@@ -30,6 +30,7 @@ class AdditiveMigrationTests(unittest.TestCase):
             )
             with engine.begin() as connection:
                 connection.execute(text("CREATE TABLE jobs (id VARCHAR(36) PRIMARY KEY)"))
+                connection.execute(text("INSERT INTO jobs (id) VALUES ('legacy-job')"))
                 connection.execute(text("CREATE TABLE scan_runs (job_id VARCHAR(36) PRIMARY KEY)"))
                 connection.execute(
                     text(
@@ -55,6 +56,11 @@ class AdditiveMigrationTests(unittest.TestCase):
             for index_name, (table_name, _) in SCHEMA_INDEXES.items():
                 indexes = {index["name"] for index in inspector.get_indexes(table_name)}
                 self.assertIn(index_name, indexes)
+            with engine.connect() as connection:
+                custom_tags_json = connection.execute(
+                    text("SELECT custom_tags_json FROM jobs WHERE id = 'legacy-job'")
+                ).scalar_one()
+            self.assertEqual(custom_tags_json, "[]")
             engine.dispose()
 
 

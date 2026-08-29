@@ -26,6 +26,7 @@ from .schemas import (
 )
 from .service import JobService
 from .settings_view import build_settings_catalog
+from .tags import MAX_CUSTOM_TAG_LENGTH, MAX_CUSTOM_TAGS, PRIVATE_JOB_TAG_PREFIX
 from .worker import worker_loop
 
 logging.basicConfig(
@@ -107,6 +108,7 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
             final_parent=payload.final_parent,
             final_category=payload.final_category,
             staging_preference=payload.staging_preference,
+            custom_tags=payload.custom_tags,
         )
         return job
     except ValueError as exc:
@@ -135,6 +137,7 @@ def create_jobs_bulk(payload: JobBatchCreate, db: Session = Depends(get_db)):
                 final_parent=item.final_parent,
                 final_category=item.final_category,
                 staging_preference=item.staging_preference,
+                custom_tags=item.custom_tags,
             )
             created_jobs.append(job)
         except (ValueError, RuntimeError) as exc:
@@ -198,6 +201,14 @@ def qbt_categories():
         return {"categories": service.qbt.list_categories()}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch qBittorrent categories: {exc}") from exc
+
+
+@app.get("/qbt/tags")
+def qbt_tags(db: Session = Depends(get_db)):
+    try:
+        return {"tags": service.list_selectable_qbt_tags(db)}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch qBittorrent tags: {exc}") from exc
 
 
 @app.get("/qbt/final-path-suggestions")
@@ -360,5 +371,8 @@ def ui(request: Request, db: Session = Depends(get_db)):
             "jobs": jobs,
             "settings": settings,
             "settings_catalog": build_settings_catalog(settings),
+            "max_custom_tags": MAX_CUSTOM_TAGS,
+            "max_custom_tag_length": MAX_CUSTOM_TAG_LENGTH,
+            "private_job_tag_prefix": PRIVATE_JOB_TAG_PREFIX,
         },
     )

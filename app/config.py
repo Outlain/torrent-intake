@@ -1,7 +1,10 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .tags import normalize_managed_tag
 
 
 class Settings(BaseSettings):
@@ -75,6 +78,13 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @field_validator("managed_tag")
+    @classmethod
+    def validate_managed_tag(cls, value: str) -> str:
+        # qBittorrent silently ignores invalid tags on torrent-add requests.
+        # This tag is an ownership credential, so fail startup instead.
+        return normalize_managed_tag(value)
 
     @property
     def local_max_bytes(self) -> int:

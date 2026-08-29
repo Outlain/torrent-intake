@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import UserList
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest import TestCase
@@ -61,3 +62,18 @@ class QbtSessionReuseTests(TestCase):
         self.assertEqual(log_in.call_count, 1)
         client.torrents_pause.assert_called_once_with(torrent_hashes="abc")
         client.torrents_resume.assert_called_once_with(torrent_hashes="abc")
+
+    @patch("app.qbt.QbtService._log_in", autospec=True)
+    @patch("app.qbt.qbittorrentapi.Client")
+    def test_list_tags_uses_existing_authenticated_session(self, client_cls, log_in) -> None:
+        client = MagicMock()
+        # qbittorrent-api returns a UserList-based TagList, not a built-in list.
+        client.torrents_tags.return_value = UserList(["Review", "Needs subtitles"])
+        client_cls.return_value = client
+
+        service = QbtService()
+
+        self.assertEqual(service.list_tags(), ["Review", "Needs subtitles"])
+        client.torrents_tags.assert_called_once_with()
+        self.assertEqual(client_cls.call_count, 1)
+        self.assertEqual(log_in.call_count, 1)

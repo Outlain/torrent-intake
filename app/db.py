@@ -51,6 +51,7 @@ class Base(DeclarativeBase):
 SCHEMA_ADDITIONS: dict[str, dict[str, str]] = {
     "jobs": {
         "quarantine_path": "TEXT",
+        "custom_tags_json": "TEXT NOT NULL DEFAULT '[]'",
     },
     "scan_runs": {
         "current_file_started_at": "DATETIME",
