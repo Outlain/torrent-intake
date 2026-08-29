@@ -274,8 +274,8 @@ placeholders. The background poller still discovers missed callbacks.
 
 - `POST /jobs` and `POST /jobs/bulk`: create intake jobs
 - `GET /jobs`, `GET /jobs/{id}`: inspect jobs
-- retry, bulk retry/delete/clear, move-to-NAS, and scan priority/pause/resume
-  endpoints used by the UI
+- retry, bulk retry/delete/clear, switch-waiting-jobs-to-NAS-staging, and scan
+  priority/pause/resume endpoints used by the UI
 - `GET /scanner/status`, `POST /scanner/slots`, `POST /scanner/maintenance`
 - qB category/transfer and approved final-path suggestion endpoints
 - `POST /events/qbt-complete` and `/events/qbt-complete-form`

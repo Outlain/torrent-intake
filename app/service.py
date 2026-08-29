@@ -269,9 +269,9 @@ class JobService:
         if not job:
             raise LookupError("Job not found")
         if job.state != "waiting_for_local_space":
-            raise ValueError("Only jobs waiting for local space can be moved to NAS")
+            raise ValueError("Only jobs waiting for local space can use NAS staging")
         if job.staging_preference != "local" or job.staging_actual != "local":
-            raise ValueError("Only queued local-staging jobs can be moved to NAS")
+            raise ValueError("Only queued local-staging jobs can switch to NAS staging")
         if not job.qbt_hash:
             raise ValueError("Queued job is not linked to a qBittorrent hash yet")
 
@@ -296,8 +296,8 @@ class JobService:
             db.refresh(job)
             return job
         except Exception as exc:
-            self.logger.exception("Failed to move queued job %s to NAS", job.id)
-            self._mark(job, "error", error=f"manual move to NAS failed: {exc}")
+            self.logger.exception("Failed to switch queued job %s to NAS staging", job.id)
+            self._mark(job, "error", error=f"manual switch to NAS staging failed: {exc}")
             db.add(job)
             db.commit()
             raise RuntimeError(str(exc)) from exc

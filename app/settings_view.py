@@ -114,7 +114,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "nas_staging_root": SettingSpec(
         "Storage and placement",
         "NAS staging root",
-        "Exact container path used when a torrent is placed or moved to NAS staging. qBittorrent must use the same path.",
+        "Exact container path used for temporary NAS intake/download staging. This is separate from the final clean-library destination, and qBittorrent must use the same path.",
         safety_critical=True,
     ),
     "final_parent_prefix": SettingSpec(
@@ -135,7 +135,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         "Action taken when aggregate local staging capacity is unavailable for another torrent.",
         value_explanations={
             "queue": "Wait for local capacity while preserving the requested local staging preference.",
-            "nas": "Place or move eligible work to NAS staging when local capacity is unavailable.",
+            "nas": "Switch eligible work to temporary NAS intake staging when local capacity is unavailable; the chosen final destination does not change.",
         },
     ),
     "local_max_gib": SettingSpec(

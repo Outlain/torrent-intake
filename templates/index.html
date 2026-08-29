@@ -564,6 +564,18 @@
       line-height: 1.4;
     }
 
+    .visually-hidden {
+      position: absolute !important;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
     .combo-field {
       position: relative;
     }
@@ -1635,7 +1647,7 @@
                 <option value="local">Local</option>
                 <option value="nas">NAS</option>
               </select>
-              <span class="hint">Local is default. Torrents above the local max move to NAS automatically, while smaller local jobs follow the aggregate overflow policy.</span>
+              <span class="hint">Local is default. Torrents above the local max use NAS intake staging automatically, while smaller local jobs follow the aggregate overflow policy. Final promotion still uses the chosen destination.</span>
             </label>
           </div>
 
@@ -1712,7 +1724,14 @@
             </div>
             <div class="jobs-toolbar-group">
               <button id="retry-selected-button" class="button-secondary toolbar-button" type="button">Retry Failed Selected</button>
-              <button id="move-selected-to-nas-button" class="button-secondary toolbar-button" type="button">Move Selected To NAS</button>
+              <button
+                id="move-selected-to-nas-button"
+                class="button-secondary toolbar-button"
+                type="button"
+                title="For selected jobs waiting for local space, pause qBittorrent, switch the active download staging path to the configured NAS staging root, and resume downloading. This does not perform the final clean-library promotion or change the chosen final destination."
+                aria-describedby="nas-staging-action-help"
+              >Use NAS Staging For Selected</button>
+              <span id="nas-staging-action-help" class="visually-hidden">This action changes only the temporary intake and download staging location. Scanning and promotion to the chosen final library destination still happen later.</span>
               <button id="delete-selected-button" class="button-secondary toolbar-button danger-soft" type="button">Forget Selected</button>
               <button id="retry-failed-button" class="button-secondary toolbar-button" type="button">Retry All Failed</button>
               <button id="clear-completed-button" class="button-secondary toolbar-button" type="button">Clear All Completed</button>
@@ -2665,7 +2684,7 @@
           ? ` Retry only applies to intake error rows; ${retryIneligibleSelected} selected active/non-error row${retryIneligibleSelected === 1 ? '' : 's'} will be skipped.`
           : '';
         setJobsToolbarStatus(
-          `${selectedVisibleCount} selected. Prioritize: ${scanNextEligible}. Pause: ${pauseScanEligible}. Resume: ${resumeScanEligible}. Retry: ${retryEligible}. Move-to-NAS: ${moveNasEligible}. Forget: ${deleteEligible}.${skippedRetryText}`
+          `${selectedVisibleCount} selected. Prioritize: ${scanNextEligible}. Pause: ${pauseScanEligible}. Resume: ${resumeScanEligible}. Retry: ${retryEligible}. NAS staging eligible: ${moveNasEligible}. Forget: ${deleteEligible}.${skippedRetryText}`
         );
       }
     }
@@ -2984,7 +3003,7 @@
       runBulkAction({
         url: '/jobs/bulk-move-to-nas',
         payload: { job_ids: jobIds },
-        label: 'Move selected to NAS',
+        label: 'Use NAS staging',
       });
     });
     scanNextButton.addEventListener('click', () => {

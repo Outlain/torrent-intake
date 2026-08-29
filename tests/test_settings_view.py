@@ -71,6 +71,13 @@ class SettingsViewTests(unittest.TestCase):
         self.assertIn("TI_INFECTED_ACTION", html)
         self.assertIn("<code>delete</code>", html)
         self.assertIn("<code>hold</code>", html)
+        self.assertIn("Use NAS Staging For Selected", html)
+        self.assertIn('aria-describedby="nas-staging-action-help"', html)
+        self.assertIn('id="nas-staging-action-help"', html)
+        self.assertIn("This action changes only the temporary intake and download staging location", html)
+        self.assertIn("This does not perform the final clean-library promotion", html)
+        self.assertIn("/jobs/bulk-move-to-nas", html)
+        self.assertNotIn("Move Selected To NAS", html)
         self.assertNotIn("never-render-this-password", html)
         self.assertNotIn("never-render-this-token", html)
 
