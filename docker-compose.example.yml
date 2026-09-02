@@ -107,6 +107,7 @@ services:
       DEFINITIONS_WAIT_TIMEOUT: "1800"
       DEFINITIONS_MAX_AGE_SECONDS: ${DEFINITIONS_MAX_AGE_SECONDS:-172800}
       CLAMD_SOCKET: /run/clamav/clamd.sock
+      CLAMD_MAX_SCAN_SIZE_MIB: ${CLAMD_MAX_SCAN_SIZE_MIB:-2000}
     volumes:
       - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
       - ${TI_CLAMD_SOCKET_HOST_DIR:-/opt/docker/clamav-shared/sockets/torrent-intake}:/run/clamav:rw

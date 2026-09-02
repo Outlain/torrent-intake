@@ -46,6 +46,17 @@ jobs:
         run: |
           docker run --rm --entrypoint clamd torrent-intake-clamd:test --version | grep -E '^ClamAV 1\.4\.[0-9]+($|/)'
           docker run --rm --entrypoint id torrent-intake-clamd:test -u | grep -qx 10001
+          docker run --rm --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+            --env CLAMD_MAX_SCAN_SIZE_MIB=4000 \
+            --env PYTHONPATH=/usr/local/bin \
+            --entrypoint python3 torrent-intake-clamd:test -c \
+            'from pathlib import Path; import subprocess, clamd_entrypoint; path, value = clamd_entrypoint.write_runtime_config(runtime_path=Path("/tmp/config/clamd.conf")); text = path.read_text(); assert value == 4000; assert "MaxScanSize 4000M" in text; assert "MaxFileSize 2000M" in text; assert "StreamMaxLength 2000M" in text; parsed = subprocess.run(["clamconf", "--config-dir=/tmp/config", "--non-default"], check=True, capture_output=True, text=True).stdout; assert "MaxScanSize = \"4194304000\"" in parsed'
+          ! docker run --rm --entrypoint python3 \
+            --env CLAMD_MAX_SCAN_SIZE_MIB=4001 \
+            --env PYTHONPATH=/usr/local/bin \
+            torrent-intake-clamd:test -c \
+            'import clamd_entrypoint; clamd_entrypoint.configured_max_scan_size_mib()'
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0

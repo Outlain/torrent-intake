@@ -35,24 +35,36 @@ manifest, streams the descriptor, then verifies both descriptor and pathname
 identity again. ClamAV limit detections, malformed replies, unavailable/stale
 definitions, and socket failures never become clean verdicts.
 
-The native per-file ClamD limit remains `2000 MiB`. That is now a routing boundary,
-not the application's final ceiling. A larger file is accepted only when
-`ffprobe` identifies an approved container with a real video stream and no
-unsupported stream or attachment type. Torrent Intake then reads every byte in
-independent `512 MiB` ClamD windows with a `1024 KiB` overlap. Up to four windows
-from that file are streamed concurrently through separate private Unix-socket
-connections. The file is opened once and read with explicit offsets; Torrent
-Intake does not copy it or create temporary chunk files. The overlap keeps
-signatures crossing a window edge visible. Device, inode, size, mtime, and ctime
-are still checked throughout.
+The native raw-file and `INSTREAM` boundary remains `2000 MiB`. That is now a
+routing boundary, not the application's final ceiling. A larger file is accepted
+only when `ffprobe` identifies an approved container with a real video stream and
+no unsupported stream or attachment type. Torrent Intake then reads every byte
+in independent `512 MiB` ClamD windows with a `1024 KiB` overlap. Up to four
+windows from that file are streamed concurrently through separate private
+Unix-socket connections. The file is opened once and read with explicit offsets;
+Torrent Intake does not copy it or create temporary chunk files. The overlap
+keeps signatures crossing a window edge visible. Device, inode, size, mtime, and
+ctime are still checked throughout.
 
 `MaxScanSize` measures parser/expanded data, not only the input file's raw size.
-Consequently, a video below `2000 MiB` can still reach that limit during its
-native scan. When that specific limit response occurs, Torrent Intake now
-requires the same `ffprobe` media validation and retries the file through the
-bounded overlapping-window route. This fallback never applies merely because a
-filename looks like media: archives, unknown formats, and unsafe attachments
+It defaults to `2000 MiB` and the sidecar permits a bounded deployment override
+up to `4000 MiB` with `CLAMD_MAX_SCAN_SIZE_MIB`. Consequently, a file below
+`2000 MiB` can still reach the default limit during its native scan; selecting
+`4000` gives ClamAV more internal-analysis headroom without raising its technical
+raw-file or stream boundary. When that limit response still occurs, Torrent
+Intake requires the same `ffprobe` media validation and retries the file through
+the bounded overlapping-window route. This fallback never applies merely because
+a filename looks like media: archives, unknown formats, and unsafe attachments
 remain held without a clean verdict.
+
+The sidecar validates `CLAMD_MAX_SCAN_SIZE_MIB` as a whole number from `1` through
+`4000`, writes a private runtime configuration under the `/tmp` tmpfs, and changes
+only `MaxScanSize`; the image's read-only base configuration is never edited.
+Invalid or larger values stop startup with a clear error. Raising the value
+increases the maximum parser and archive-expansion work ClamAV may perform, so
+`2000` remains the default. The example's CPU, memory, temporary-space, timeout,
+and concurrency limits keep a `4000` opt-in bounded. Resource exhaustion or any
+other incomplete scan still fails closed.
 
 If ClamD still reports a parser or expanded-data limit for one window, that
 window is split into smaller overlapping windows and retried, down to a
@@ -202,6 +214,7 @@ show all bounded scanner settings. Important values include:
 | `TI_COMPLETION_EVENT_TOKEN` | required in examples | authenticate completion hook |
 | `INTAKE_UID`, `INTAKE_GID` | `10001` | shared numeric identity for the app, sidecar, and writable host paths |
 | `TI_CLAMD_SOCKET_HOST_DIR` | `/opt/docker/clamav-shared/sockets/torrent-intake` | private host socket directory |
+| `CLAMD_MAX_SCAN_SIZE_MIB` | `2000` | sidecar cumulative parser/expanded-data limit; bounded to `1`-`4000`, with `4000` as an explicit higher-work opt-in |
 | `TI_LOCAL_STAGING_ROOT` | `/staging-local` | exact local staging boundary |
 | `TI_NAS_STAGING_ROOT` | `/downloads/torrent-intake/staging` | exact NAS staging boundary |
 | `TI_FINAL_PARENT_PREFIX` | `/downloads` | primary allowed media root |
@@ -231,6 +244,19 @@ diagnostics but never queries public torrent services.
 The UI/API has no login. The example binds it to
 `127.0.0.1:${TI_UI_HOST_PORT:-8095}`; place an authenticated reverse proxy in
 front before remote exposure.
+
+To give native scans more parser/expanded-data headroom for raw files that remain
+below the `2000 MiB` file and stream boundary, set this on the
+`torrent-intake-clamd` service and recreate that sidecar:
+
+```yaml
+environment:
+  CLAMD_MAX_SCAN_SIZE_MIB: "4000"
+```
+
+Do not raise `TI_SCANNER_MAX_FILE_MIB`, `MaxFileSize`, or `StreamMaxLength` above
+`2000`; those represent a different ClamAV limitation. Existing failed scan-file
+checkpoints remain retryable after the sidecar is recreated.
 
 ## Optional qBittorrent tags
 
