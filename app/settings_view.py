@@ -179,7 +179,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "scanner_max_file_mib": SettingSpec(
         "ClamAV scanner",
         "Native ClamD stream boundary",
-        "Raw-size boundary for one native ClamD stream. Larger verified videos, and verified videos whose native parser reaches MaxScanSize, use bounded overlapping windows; other unsupported content remains held.",
+        "Raw-size boundary for one native ClamD stream. Larger verified videos and raw TrueHD audio, plus eligible media whose native parser reaches MaxScanSize, use bounded overlapping windows; other unsupported content remains held.",
         safety_critical=True,
     ),
     "scanner_health_cache_seconds": SettingSpec(
@@ -205,7 +205,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "large_media_enabled": SettingSpec(
         "ClamAV scanner",
         "Large-media scanner",
-        "Routes oversized verified videos, and verified videos whose native scan reaches a parser/expanded-data limit, through full-byte overlapping ClamD windows.",
+        "Routes oversized verified videos and narrowly validated raw TrueHD audio, plus eligible media whose native scan reaches a parser/expanded-data limit, through full-byte overlapping ClamD windows.",
         safety_critical=True,
     ),
     "large_media_max_file_gib": SettingSpec(
@@ -240,7 +240,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "large_media_scan_timeout_seconds": SettingSpec(
         "ClamAV scanner",
         "Large-media scan timeout",
-        "Total deadline for validating and reading every window of one oversized video file.",
+        "Total deadline for validating and reading every window of one oversized media file.",
     ),
     "ffprobe_binary": SettingSpec(
         "ClamAV scanner",

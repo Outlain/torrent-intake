@@ -31,9 +31,10 @@ MAX_REPLY_BYTES = 1024 * 1024
 MAX_FFPROBE_OUTPUT_BYTES = 1024 * 1024
 FileIdentity = tuple[int, int, int, int, int]
 
-LARGE_MEDIA_FORMATS = frozenset(
+LARGE_VIDEO_FORMATS = frozenset(
     {
         "avi",
+        "flv",
         "matroska",
         "mov",
         "mp4",
@@ -43,6 +44,8 @@ LARGE_MEDIA_FORMATS = frozenset(
         "webm",
     }
 )
+LARGE_TRUEHD_FORMAT = "truehd"
+LARGE_TRUEHD_SUFFIXES = frozenset({".thd", ".truehd"})
 LARGE_MEDIA_STREAM_TYPES = frozenset({"audio", "attachment", "subtitle", "video"})
 SAFE_ATTACHMENT_SUFFIXES = frozenset(
     {
@@ -243,33 +246,59 @@ def parse_large_media_probe(raw_output: str, path: str) -> str:
         payload = json.loads(raw_output)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ScannerPolicyError(
-            f"oversized file is not a valid supported video container: {path}"
+            f"oversized file is not valid supported media content: {path}"
         ) from exc
     if not isinstance(payload, dict):
         raise ScannerPolicyError(f"ffprobe returned an invalid media description: {path}")
 
     format_payload = payload.get("format")
-    format_name = format_payload.get("format_name") if isinstance(format_payload, dict) else None
+    format_name = (
+        format_payload.get("format_name") if isinstance(format_payload, dict) else None
+    )
     detected_formats = {
         part.strip().casefold()
         for part in str(format_name or "").split(",")
         if part.strip()
     }
-    approved_formats = detected_formats & LARGE_MEDIA_FORMATS
-    if not approved_formats:
+    approved_video_formats = detected_formats & LARGE_VIDEO_FORMATS
+    is_raw_truehd = detected_formats == {LARGE_TRUEHD_FORMAT}
+    if not approved_video_formats and not is_raw_truehd:
         detected = ",".join(sorted(detected_formats)) or "unknown"
         raise ScannerPolicyError(
-            f"oversized content type is not an approved video container ({detected}): {path}"
+            "oversized content type is not an approved video container or raw "
+            f"TrueHD audio stream ({detected}): {path}"
         )
 
     streams = payload.get("streams")
     if not isinstance(streams, list) or len(streams) > 1024:
-        raise ScannerPolicyError(f"oversized media has an invalid or excessive stream table: {path}")
+        raise ScannerPolicyError(
+            f"oversized media has an invalid or excessive stream table: {path}"
+        )
+    if is_raw_truehd:
+        suffix = os.path.splitext(path)[1].casefold()
+        if suffix not in LARGE_TRUEHD_SUFFIXES:
+            raise ScannerPolicyError(
+                f"raw TrueHD content requires a .thd or .truehd filename: {path}"
+            )
+        if len(streams) != 1 or not isinstance(streams[0], dict):
+            raise ScannerPolicyError(
+                f"raw TrueHD content must contain exactly one TrueHD audio stream: {path}"
+            )
+        stream_type = str(streams[0].get("codec_type") or "").casefold()
+        codec_name = str(streams[0].get("codec_name") or "").casefold()
+        if stream_type != "audio" or codec_name != LARGE_TRUEHD_FORMAT:
+            raise ScannerPolicyError(
+                f"raw TrueHD content must contain exactly one TrueHD audio stream: {path}"
+            )
+        return LARGE_TRUEHD_FORMAT
+
     video_streams = 0
     attachment_streams = 0
     for stream in streams:
         if not isinstance(stream, dict):
-            raise ScannerPolicyError(f"oversized media has a malformed stream entry: {path}")
+            raise ScannerPolicyError(
+                f"oversized media has a malformed stream entry: {path}"
+            )
         stream_type = str(stream.get("codec_type") or "").casefold()
         if stream_type not in LARGE_MEDIA_STREAM_TYPES:
             raise ScannerPolicyError(
@@ -280,7 +309,9 @@ def parse_large_media_probe(raw_output: str, path: str) -> str:
         if stream_type == "attachment":
             attachment_streams += 1
             if attachment_streams > 64:
-                raise ScannerPolicyError(f"oversized media contains too many attachments: {path}")
+                raise ScannerPolicyError(
+                    f"oversized media contains too many attachments: {path}"
+                )
             tags = stream.get("tags")
             filename = tags.get("filename") if isinstance(tags, dict) else None
             suffix = os.path.splitext(str(filename or ""))[1].casefold()
@@ -291,7 +322,7 @@ def parse_large_media_probe(raw_output: str, path: str) -> str:
                 )
     if video_streams == 0:
         raise ScannerPolicyError(f"oversized container does not contain a video stream: {path}")
-    return ",".join(sorted(approved_formats))
+    return ",".join(sorted(approved_video_formats))
 
 
 class ScannerService:

@@ -37,14 +37,20 @@ definitions, and socket failures never become clean verdicts.
 
 The native raw-file and `INSTREAM` boundary remains `2000 MiB`. That is now a
 routing boundary, not the application's final ceiling. A larger file is accepted
-only when `ffprobe` identifies an approved container with a real video stream and
-no unsupported stream or attachment type. Torrent Intake then reads every byte
-in independent `512 MiB` ClamD windows with a `1024 KiB` overlap. Up to four
-windows from that file are streamed concurrently through separate private
-Unix-socket connections. The file is opened once and read with explicit offsets;
-Torrent Intake does not copy it or create temporary chunk files. The overlap
-keeps signatures crossing a window edge visible. Device, inode, size, mtime, and
-ctime are still checked throughout.
+only when `ffprobe` identifies either an approved container with a real video
+stream and no unsupported stream or attachment type, or narrowly validated raw
+TrueHD audio. Torrent Intake then reads every byte in independent `512 MiB` ClamD
+windows with a `1024 KiB` overlap. Up to four windows from that file are streamed
+concurrently through separate private Unix-socket connections. The file is
+opened once and read with explicit offsets; Torrent Intake does not copy it or
+create temporary chunk files. The overlap keeps signatures crossing a window
+edge visible. Device, inode, size, mtime, and ctime are still checked throughout.
+
+Approved large-video containers are AVI, FLV, Matroska/WebM, MOV/MP4, MPEG,
+MPEG-TS, and Ogg. Raw TrueHD is the only approved audio-only format and must
+have a `.thd` or `.truehd` suffix, byte-level `ffprobe` identification as
+`truehd`, and exactly one TrueHD audio stream. Other audio-only formats remain
+held. Media recognition never relies on the filename extension alone.
 
 `MaxScanSize` measures parser/expanded data, not only the input file's raw size.
 It defaults to `2000 MiB` and the sidecar permits a bounded deployment override
@@ -87,11 +93,11 @@ This policy is intentionally recorded as
 ClamD sees all raw bytes and `ffprobe` validates the container, but whole-file
 hashes and parsers cannot span independent ClamD windows. The default bounded
 ceiling is `100 GiB`, so normal 5-50 GiB MKV/MP4 files can complete without being
-skipped. Oversized archives, disk images, executables, audio-only files, unknown
-formats, unsafe media attachments, files above the configured ceiling, and
-limit/error responses that the validated-media fallback cannot safely resolve
-remain held with no clean verdict. A filename extension never selects the
-large-media path.
+skipped. Oversized archives, disk images, executables, unapproved audio-only
+files, unknown formats, unsafe media attachments, files above the configured
+ceiling, and limit/error responses that the validated-media fallback cannot
+safely resolve remain held with no clean verdict. A filename extension never
+selects the large-media path.
 
 ## qBittorrent safety gates
 
@@ -219,16 +225,16 @@ show all bounded scanner settings. Important values include:
 | `TI_NAS_STAGING_ROOT` | `/downloads/torrent-intake/staging` | exact NAS staging boundary |
 | `TI_FINAL_PARENT_PREFIX` | `/downloads` | primary allowed media root |
 | `TI_FINAL_PARENT_PREFIXES` | empty | optional additional mounted media roots |
-| `TI_SCANNER_MAX_FILE_MIB` | `2000` | native ClamD boundary; larger verified videos use the large-media route |
+| `TI_SCANNER_MAX_FILE_MIB` | `2000` | native ClamD boundary; larger verified video and raw TrueHD content use the large-media route |
 | `TI_SCANNER_POLICY_VERSION` | `clamav-policy-v4-parallel-adaptive-media` | checkpoint policy identity; changing it deliberately reschedules prior file checkpoints |
 | `TI_SCANNER_SCAN_TIMEOUT_SECONDS` | `1200` | total per-file client deadline |
-| `TI_LARGE_MEDIA_ENABLED` | `true` | enable verified oversized-video routing |
-| `TI_LARGE_MEDIA_MAX_FILE_GIB` | `100` | hard ceiling for one oversized video |
+| `TI_LARGE_MEDIA_ENABLED` | `true` | enable verified oversized-video and raw-TrueHD routing |
+| `TI_LARGE_MEDIA_MAX_FILE_GIB` | `100` | hard ceiling for one oversized media file |
 | `TI_LARGE_MEDIA_CHUNK_MIB` | `512` | initial independent ClamD window, below the native limit |
 | `TI_LARGE_MEDIA_MIN_CHUNK_MIB` | `64` | smallest adaptive retry window after a ClamD limit response |
 | `TI_LARGE_MEDIA_OVERLAP_KIB` | `1024` | repeated bytes between adjacent windows |
 | `TI_LARGE_MEDIA_PROBE_TIMEOUT_SECONDS` | `120` | ffprobe container-validation deadline |
-| `TI_LARGE_MEDIA_SCAN_TIMEOUT_SECONDS` | `172800` | total deadline for one large video (two days) |
+| `TI_LARGE_MEDIA_SCAN_TIMEOUT_SECONDS` | `172800` | total deadline for one large media file (two days) |
 | `TI_PER_JOB_SCAN_WORKERS` | `4` in the examples; built-in fallback `1` | concurrent byte ranges within one large media file |
 | `TI_CLAMD_MAX_INFLIGHT_REQUESTS` | `4` | application-wide active ClamD stream cap; keep at or below ClamD `MaxThreads` |
 | `TI_MAX_CONCURRENT_SCANS` | `2` | normal scan slots |

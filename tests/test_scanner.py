@@ -77,7 +77,49 @@ class ScannerParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ScannerPolicyError, "attachment"):
             parse_large_media_probe(json.dumps(payload), "/downloads/movie.mkv")
 
-    def test_large_media_probe_rejects_archive_and_audio_only_content(self) -> None:
+    def test_large_media_probe_accepts_flv_only_with_safe_stream_types(self) -> None:
+        payload = {
+            "format": {"format_name": "flv"},
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264"},
+                {"codec_type": "audio", "codec_name": "aac"},
+            ],
+        }
+        self.assertEqual(
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.flv"),
+            "flv",
+        )
+
+        payload["streams"].append({"codec_type": "data", "codec_name": "unknown"})
+        with self.assertRaisesRegex(ScannerPolicyError, "unsupported stream type"):
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.flv")
+
+    def test_large_media_probe_accepts_only_strict_raw_truehd_audio(self) -> None:
+        payload = {
+            "format": {"format_name": "truehd"},
+            "streams": [{"codec_type": "audio", "codec_name": "truehd"}],
+        }
+        self.assertEqual(
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.en.thd"),
+            "truehd",
+        )
+        self.assertEqual(
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.truehd"),
+            "truehd",
+        )
+
+        with self.assertRaisesRegex(ScannerPolicyError, "requires a .thd"):
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.mkv")
+
+        payload["streams"].append({"codec_type": "audio", "codec_name": "ac3"})
+        with self.assertRaisesRegex(ScannerPolicyError, "exactly one TrueHD"):
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.en.thd")
+
+        payload["streams"] = [{"codec_type": "data", "codec_name": "truehd"}]
+        with self.assertRaisesRegex(ScannerPolicyError, "exactly one TrueHD"):
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.en.thd")
+
+    def test_large_media_probe_rejects_archive_and_unapproved_audio_content(self) -> None:
         with self.assertRaisesRegex(ScannerPolicyError, "not an approved video"):
             parse_large_media_probe(
                 json.dumps(
