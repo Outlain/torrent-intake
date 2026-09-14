@@ -24,9 +24,6 @@ jobs:
         run: python3 -m py_compile app/*.py clamav/*.py
 
       - name: Validate Compose examples
-        env:
-          TI_QBT_PASSWORD: test-password
-          TI_COMPLETION_EVENT_TOKEN: test-token
         run: |
           docker compose -f docker-compose.example.yml config --quiet
           docker compose -f portainer-stack.example.yml config --quiet
@@ -42,6 +39,9 @@ jobs:
           docker run --rm --entrypoint id torrent-intake:test -u | grep -qx 10001
           docker run --rm --entrypoint ffprobe torrent-intake:test -version
           docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m --entrypoint python torrent-intake:test -c 'import app.scanner, app.paths, app.torrent_guard'
+
+      - name: Test portable configuration and encrypted restore through real HTTP
+        run: docker run --rm --read-only --network none --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m --mount type=bind,src="${GITHUB_WORKSPACE}/tests",dst=/tests,readonly --env PYTHONPATH=/app --entrypoint python torrent-intake:test /tests/integration_portability.py
 
       - name: Build ClamD image
         run: docker build --file Dockerfile.clamd --tag torrent-intake-clamd:test .

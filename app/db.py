@@ -34,6 +34,7 @@ if settings.database_url.startswith("sqlite"):
     def _configure_sqlite(dbapi_connection, _connection_record) -> None:
         _secure_sqlite_files(settings.database_url)
         cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA trusted_schema=OFF")
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA foreign_keys=ON")

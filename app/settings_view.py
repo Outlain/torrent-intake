@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from .config import Settings
+from .config import Settings, environment_settings
 
 
 @dataclass(frozen=True)
@@ -30,17 +30,24 @@ CATEGORY_DETAILS = {
 
 
 DEFAULT_CHANGE_HINT = (
-    "Deployment managed. Change the corresponding environment variable in Compose or Portainer, "
-    "then recreate Torrent Intake."
+    "Saved in /app/data/settings.json. An explicit environment value from Compose or Portainer wins "
+    "and is saved locally at startup. File/UI changes require a container restart."
 )
 
 
 SETTING_SPECS: dict[str, SettingSpec] = {
     "app_name": SettingSpec(
-        "Application", "Application name", "Internal application identifier used by the service."
+        "Application", "Legacy application name",
+        "Accepted for compatibility with old settings files only; it has no effect. Use UI title to change the page heading.",
+        change_hint="Legacy compatibility value, not an active setting. There is no need to define TI_APP_NAME.",
     ),
     "debug": SettingSpec(
         "Application", "Debug logging", "Enables verbose application logging. Leave disabled for normal operation."
+    ),
+    "data_dir": SettingSpec(
+        "Application", "Local application data directory",
+        "Bootstrap container directory containing SQLite, settings, and restore state. Keep its host mount on local SSD storage. Only TI_DATA_DIR in the container environment can relocate it.",
+        safety_critical=True,
     ),
     "database_url": SettingSpec(
         "Application",
@@ -161,7 +168,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "scanner_backend": SettingSpec(
         "ClamAV scanner",
         "Scanner backend",
-        "Scanning implementation. The supported backend is the persistent private ClamD sidecar.",
+        "Compatibility selector: only clamd is supported. It may be omitted; there is no clamscan or alternate backend.",
         safety_critical=True,
     ),
     "clamd_socket_path": SettingSpec(
@@ -277,8 +284,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "max_concurrent_scans": SettingSpec(
         "Scan scheduling",
         "Default concurrent scans",
-        "Normal number of scan workers. The Scan Queue control can temporarily change the active slot request.",
-        change_hint="Use the Scan Queue slot control for a live adjustment. Change this environment value to alter the restart default.",
+        "Default torrent scan slots for a new queue and after a temporary boost ends. Existing slot requests are saved in SQLite.",
+        change_hint="Use the Scan Queue slot control for live adjustments. Change the local file or an environment override for the default, then restart; a saved queue request is not automatically reset by restarting.",
     ),
     "max_scan_slots": SettingSpec(
         "Scan scheduling",
@@ -390,7 +397,13 @@ def _display_value(spec: SettingSpec, value: Any, *, default: bool = False) -> s
     return str(value)
 
 
+def ui_editable(name: str) -> bool:
+    spec = SETTING_SPECS.get(name)
+    return bool(spec and not spec.safety_critical and name not in {"app_name", "database_url", "data_dir"})
+
+
 def build_settings_catalog(settings: Settings) -> list[dict[str, object]]:
+    overrides = environment_settings()
     grouped: dict[str, list[dict[str, object]]] = {
         category: [] for category in CATEGORY_DETAILS
     }
@@ -398,7 +411,8 @@ def build_settings_catalog(settings: Settings) -> list[dict[str, object]]:
         field = Settings.model_fields[name]
         current_value = getattr(settings, name)
         current_display = _display_value(spec, current_value)
-        default_display = _display_value(spec, field.default, default=True)
+        default_display = _display_value(spec, field.get_default(call_default_factory=True), default=True)
+        editable = ui_editable(name) and name not in overrides
         current_effect = None
         if spec.value_explanations:
             current_effect = spec.value_explanations.get(current_display)
@@ -413,7 +427,14 @@ def build_settings_catalog(settings: Settings) -> list[dict[str, object]]:
                 "current_effect": current_effect,
                 "sensitive": spec.sensitive,
                 "safety_critical": spec.safety_critical,
-                "change_hint": spec.change_hint or DEFAULT_CHANGE_HINT,
+                "change_hint": spec.change_hint or (
+                    "Read-only in the UI. Edit settings.json or Compose or Portainer, then restart/recreate Torrent Intake."
+                    if not ui_editable(name) else DEFAULT_CHANGE_HINT
+                ),
+                "source": "Environment override" if name in overrides else "Local settings / built-in default",
+                "editable": editable,
+                "input_type": "password" if spec.sensitive or spec.url_value else "boolean" if isinstance(current_value, bool) else "number" if isinstance(current_value, int) else "text",
+                "input_value": None if spec.sensitive or spec.url_value else current_value,
             }
         )
 

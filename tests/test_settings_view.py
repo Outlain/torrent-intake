@@ -23,6 +23,16 @@ class SettingsViewTests(unittest.TestCase):
     def test_catalog_covers_every_settings_field(self) -> None:
         self.assertEqual(set(Settings.model_fields), set(SETTING_SPECS))
 
+    def test_reference_covers_every_application_setting(self) -> None:
+        reference = (ROOT / "CONFIGURATION.md").read_text()
+        for name in Settings.model_fields:
+            self.assertIn(f"TI_{name.upper()}", reference, name)
+
+    def test_legacy_application_name_is_explained_and_not_editable(self) -> None:
+        item = catalog_items(build_settings_catalog(Settings()))["app_name"]
+        self.assertFalse(item["editable"])
+        self.assertIn("no effect", item["description"])
+
     def test_secrets_and_url_credentials_are_redacted(self) -> None:
         settings = Settings(
             qbt_password="qbt-super-secret",

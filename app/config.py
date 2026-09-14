@@ -1,16 +1,35 @@
+import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
-from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, DotEnvSettingsSource, EnvSettingsSource, SettingsConfigDict
 
 from .tags import normalize_managed_tag
+from .state_files import data_directory, read_private, write_json
+
+
+def saved_settings() -> dict:
+    try:
+        payload = json.loads(read_private(data_directory() / "settings.json"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(payload.get("settings"), dict):
+        raise ValueError("settings.json must contain schema_version=1 and a settings object")
+    unknown = set(payload["settings"]) - set(Settings.model_fields)
+    if unknown:
+        raise ValueError("settings.json contains unknown setting names: " + ", ".join(sorted(unknown)))
+    values = dict(payload["settings"])
+    # This is the bootstrap mount location, never selected by an imported file.
+    values.pop("data_dir", None)
+    return values
 
 
 class Settings(BaseSettings):
     app_name: str = "torrent-intake"
     debug: bool = False
-    database_url: str = "sqlite:////app/data/torrent_intake.db"
+    data_dir: str = Field(default_factory=lambda: str(data_directory()))
+    database_url: str = Field(default_factory=lambda: f"sqlite:///{data_directory() / 'torrent_intake.db'}")
 
     qbt_host: str = "http://qbittorrent:8080"
     qbt_username: str = "admin"
@@ -82,6 +101,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings):
+        return init_settings, env_settings, dotenv_settings, saved_settings, file_secret_settings
+
     @field_validator("managed_tag")
     @classmethod
     def validate_managed_tag(cls, value: str) -> str:
@@ -151,3 +174,22 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+def environment_settings() -> dict:
+    """Explicit environment/dotenv values, using the same parsing as Settings."""
+    return {**DotEnvSettingsSource(Settings)(), **EnvSettingsSource(Settings)()}
+
+
+def persist_settings(settings: Settings) -> None:
+    if settings.data_dir != str(data_directory()):
+        raise ValueError("TI_DATA_DIR must be set in the container environment, not in a dotenv/settings file")
+    path = data_directory() / "settings.json"
+    payload = {"schema_version": 1, "settings": settings.model_dump(mode="json")}
+    try:
+        if json.loads(read_private(path)) == payload:
+            path.chmod(0o600)
+            return
+    except FileNotFoundError:
+        pass
+    write_json(path, payload)

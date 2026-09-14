@@ -86,10 +86,10 @@ def _reap_scan_tasks(tasks: dict[str, asyncio.Task[None]]) -> None:
             logger.exception("Unhandled scan task failure for job %s", job_id)
 
 
-async def worker_loop(stop_event: asyncio.Event) -> None:
+async def worker_loop(stop_event: asyncio.Event, scanner_stop_event: threading.Event | None = None) -> None:
     settings = get_settings()
     service = JobService()
-    scanner_stop_event = threading.Event()
+    scanner_stop_event = scanner_stop_event or threading.Event()
     scheduler_id = f"{socket.gethostname()}:{uuid4().hex[:12]}"
     scan_tasks: dict[str, asyncio.Task[None]] = {}
     startup_diagnostics_logged = False

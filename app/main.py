@@ -1,16 +1,30 @@
 from __future__ import annotations
 import asyncio
+import base64
 import hmac
+import json
 import logging
 import os
+import tempfile
+import sqlite3
+import zipfile
+from urllib.parse import urlsplit
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, Response, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from .config import get_settings
+from starlette.background import BackgroundTask
+from cryptography.exceptions import InvalidTag
+from pydantic import ValidationError
+from .admin import Controller
+from .backup import MAX_BACKUP_BYTES, MAX_DATABASE_BYTES, create_backup, database_path, database_size_bytes
+from .config import Settings, environment_settings, get_settings, persist_settings, saved_settings
+from .restore import stage_restore
+from .scanner import ScannerPolicyError
+from .state_files import read_private, write_private
 from .db import Base, engine, get_db, upgrade_schema
 from .models import Job
 from .schemas import (
@@ -25,9 +39,8 @@ from .schemas import (
     ScannerSlotsUpdate,
 )
 from .service import JobService
-from .settings_view import build_settings_catalog
+from .settings_view import build_settings_catalog, ui_editable
 from .tags import MAX_CUSTOM_TAG_LENGTH, MAX_CUSTOM_TAGS, PRIVATE_JOB_TAG_PREFIX
-from .worker import worker_loop
 
 logging.basicConfig(
     level=logging.DEBUG if get_settings().debug else logging.INFO,
@@ -39,29 +52,232 @@ settings = get_settings()
 service = JobService()
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-worker_stop_event: asyncio.Event | None = None
-worker_task: asyncio.Task | None = None
+controller: Controller | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global worker_stop_event, worker_task
+    global controller
+    persist_settings(settings)
+    if (Path(settings.data_dir) / ".restore-pending").exists():
+        raise RuntimeError("A restore is pending; start the container through its standard image entrypoint")
+    # Opening create_all below creates the database on a fresh installation.
+    try:
+        fresh = not database_path(settings).exists()
+    except ValueError:
+        fresh = False  # Non-SQLite deployments use their own database backup tooling.
     Base.metadata.create_all(bind=engine)
     upgrade_schema()
-    worker_stop_event = asyncio.Event()
-    worker_task = asyncio.create_task(worker_loop(worker_stop_event))
-    yield
-    if worker_stop_event:
-        worker_stop_event.set()
-    if worker_task:
-        await worker_task
+    controller = Controller(settings, fresh=fresh)
+    if not controller.paused:
+        controller.start()
+    try:
+        yield
+    finally:
+        await controller.shutdown()
 
 
 app = FastAPI(title=settings.ui_title, lifespan=lifespan)
 
 
+@app.middleware("http")
+async def administration_guard(request: Request, call_next):
+    is_admin = request.url.path.startswith("/admin/")
+    if controller is not None and controller.paused and request.url.path.startswith("/qbt/"):
+        return JSONResponse({"detail": "Live qBittorrent lookups are paused with the controller"}, status_code=503)
+    if is_admin:
+        if controller is None:
+            return JSONResponse({"detail": "Controller is starting"}, status_code=503)
+        if not controller.authorized(request.headers.get("X-TI-Admin-Token", "")):
+            return JSONResponse({"detail": "A valid local administrator token is required"}, status_code=403)
+        origin = request.headers.get("origin")
+        if origin and urlsplit(origin).netloc != request.headers.get("host"):
+            return JSONResponse({"detail": "Cross-origin administration is not allowed"}, status_code=403)
+    mutating = not is_admin and request.method not in {"GET", "HEAD", "OPTIONS"} and controller is not None
+    if mutating:
+        if controller.paused:
+            return JSONResponse({"detail": "Controller is paused for backup, restore, or configuration"}, status_code=503)
+        controller.active_mutations += 1
+    try:
+        response = await call_next(request)
+        if is_admin:
+            response.headers["Cache-Control"] = "no-store"
+        return response
+    finally:
+        if mutating:
+            controller.active_mutations -= 1
+
+
+async def _admin_json(request: Request) -> dict:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > 65536:
+            raise HTTPException(status_code=413, detail="Administration request is too large")
+        body.extend(chunk)
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeError):
+        raise HTTPException(status_code=422, detail="Expected a JSON object")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Expected a JSON object")
+    return payload
+
+
+async def _finish_thread(function, *args, **kwargs):
+    """Do not release the restore lock/delete work files while a thread still runs."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+@app.get("/controller/status")
+def controller_status():
+    return controller.status() if controller else {"paused": True, "drained": False}
+
+
+@app.get("/admin/status")
+def admin_status():
+    try:
+        notes = read_private(Path(settings.data_dir) / "deployment-notes.txt").decode()
+    except FileNotFoundError:
+        notes = ""
+    try:
+        database_bytes = database_size_bytes(settings)
+    except (OSError, ValueError, sqlite3.DatabaseError):
+        database_bytes = None
+    return {
+        **controller.status(), "deployment_notes": notes,
+        "settings": build_settings_catalog(settings),
+        "backup": {"database_bytes": database_bytes, "database_limit_bytes": MAX_DATABASE_BYTES},
+    }
+
+
+@app.post("/admin/pause")
+async def pause_controller():
+    async with controller.operation_lock:
+        return controller.pause()
+
+
+@app.post("/admin/resume")
+async def resume_controller(request: Request):
+    payload = await _admin_json(request)
+    if payload.get("confirm_external_state") is not True:
+        raise HTTPException(status_code=422, detail="Confirm mounts, qBittorrent state, and that the old controller is stopped")
+    async with controller.operation_lock:
+        try:
+            controller.require_drained()
+            await asyncio.to_thread(service.scan_coordinator.scanner.require_healthy, force=True)
+            await asyncio.to_thread(service.qbt.list_torrents)
+            paths = [settings.local_staging_root, settings.nas_staging_root, *settings.allowed_final_parent_prefixes]
+            if settings.infected_action == "quarantine":
+                paths.append(settings.quarantine_root)
+            for name in paths:
+                if not Path(name).is_dir() or not os.access(name, os.R_OK | os.W_OK | os.X_OK):
+                    raise ValueError(f"Configured content directory is not accessible: {name}")
+            return controller.resume()
+        except Exception:
+            logger.warning("Controller resume checks failed; controller remains paused")
+            raise HTTPException(status_code=409, detail="Resume checks failed. Verify settings, ClamD health, qBittorrent access, and all content mounts; the controller remains paused.")
+
+
+@app.post("/admin/settings")
+async def save_local_settings(request: Request):
+    payload = await _admin_json(request)
+    updates = payload.get("settings")
+    if not isinstance(updates, dict) or not updates:
+        raise HTTPException(status_code=422, detail="Provide settings to update")
+    async with controller.operation_lock:
+        try:
+            controller.require_drained()
+            overrides = environment_settings()
+            for name in updates:
+                if not ui_editable(name):
+                    raise ValueError("One or more settings are read-only; use the local file or deployment configuration")
+                if name in overrides:
+                    raise ValueError("An environment override is active; remove it and recreate the container before editing that setting here")
+            values = {**settings.model_dump(), **saved_settings(), **overrides, **updates}
+            candidate = Settings(**values)
+            for name in updates:
+                value = getattr(candidate, name)
+                if isinstance(value, int) and not isinstance(value, bool) and value < (0 if name in {"completion_grace_seconds", "local_free_space_buffer_gib"} else 1):
+                    raise ValueError("Numeric settings must be positive (grace periods and space reserves may be zero)")
+            scanner = service.scan_coordinator.scanner.__class__()
+            scanner.settings = candidate
+            scanner._validate_policy_configuration()
+            persist_settings(candidate)
+            write_private(Path(settings.data_dir) / "restart-required", b"settings changed\n")
+        except ValidationError as exc:
+            fields = sorted({str(error["loc"][0]) for error in exc.errors(include_input=False)})
+            raise HTTPException(status_code=422, detail="Invalid setting values: " + ", ".join(fields))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ScannerPolicyError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    return {"restart_required": True, "message": "Settings saved locally. Restart the container to apply them."}
+
+
+@app.post("/admin/deployment-notes")
+async def save_deployment_notes(request: Request):
+    payload = await _admin_json(request)
+    notes = payload.get("notes")
+    if not isinstance(notes, str):
+        raise HTTPException(status_code=422, detail="Expected text notes")
+    async with controller.operation_lock:
+        write_private(Path(settings.data_dir) / "deployment-notes.txt", notes.encode())
+    return {"saved": True}
+
+
+@app.post("/admin/backup")
+async def download_backup(request: Request):
+    payload = await _admin_json(request)
+    async with controller.operation_lock:
+        try:
+            controller.require_drained()
+            temporary = tempfile.TemporaryDirectory(prefix=".backup-", dir=settings.data_dir)
+            try:
+                output = await _finish_thread(create_backup, settings, Path(temporary.name), str(payload.get("passphrase", "")))
+            except BaseException:
+                temporary.cleanup()
+                raise
+            return FileResponse(output, filename="torrent-intake.tibak", media_type="application/octet-stream", background=BackgroundTask(temporary.cleanup))
+        except (OSError, ValueError, sqlite3.DatabaseError):
+            raise HTTPException(status_code=409, detail="Backup failed. Wait for the controller to drain, apply pending settings first, use a 12+ character passphrase, and check local free space and SQLite configuration.")
+
+
+@app.post("/admin/restore")
+async def upload_backup(request: Request):
+    if request.headers.get("X-TI-Confirm-Restore") != "replace-after-restart":
+        raise HTTPException(status_code=422, detail="Explicit restore confirmation is required")
+    async with controller.operation_lock:
+        try:
+            controller.require_drained()
+            phrase = base64.b64decode(request.headers.get("X-TI-Backup-Passphrase", ""), validate=True).decode("utf-8")
+            if len(phrase.encode()) > 1024:
+                raise ValueError("Passphrase too long")
+            with tempfile.TemporaryDirectory(prefix=".restore-upload-", dir=settings.data_dir) as temporary:
+                directory = Path(temporary)
+                upload = directory / "upload.tibak"
+                size = 0
+                with upload.open("xb") as handle:
+                    os.chmod(upload, 0o600)
+                    async for chunk in request.stream():
+                        size += len(chunk)
+                        if size > MAX_BACKUP_BYTES + 64:
+                            raise HTTPException(status_code=413, detail="Backup exceeds the upload size limit")
+                        handle.write(chunk)
+                return await _finish_thread(stage_restore, upload, directory, settings, phrase)
+        except (InvalidTag, ValueError, OSError, UnicodeError, zipfile.BadZipFile, sqlite3.DatabaseError):
+            raise HTTPException(status_code=422, detail="Restore rejected. Check the passphrase, backup validity, local free space, and that the controller is drained. Existing data was not replaced.")
+
+
 def _enrich_jobs(db: Session, jobs: list[Job]) -> list[Job]:
-    service.enrich_jobs_with_live_stats(jobs)
+    # Restored connection details may be unreachable on the receiving host.
+    # Keep the settings/restore UI available without waiting for those requests.
+    if controller is None or not controller.paused:
+        service.enrich_jobs_with_live_stats(jobs)
     return service.scan_coordinator.enrich_jobs(db, jobs)
 
 
@@ -82,7 +298,7 @@ def root() -> RedirectResponse:
 @app.get("/health")
 def health() -> dict[str, str]:
     scanner = service.scan_coordinator.scanner.health()
-    data_dir = Path("/app/data")
+    data_dir = Path(settings.data_dir)
     event_dir = Path(settings.event_dir)
     if not data_dir.is_dir() or not os.access(data_dir, os.R_OK | os.W_OK | os.X_OK):
         raise HTTPException(status_code=503, detail="persistent data directory is unavailable")

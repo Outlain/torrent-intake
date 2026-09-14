@@ -18,7 +18,9 @@ common=(--read-only --network none --user "$(id -u):$(id -g)"
     --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --memory 512m
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m
     --mount "type=bind,src=$test_dir,dst=/test")
-application=(--rm "${common[@]}" --env PYTHONPATH=/app --env TI_TEST_BENCHMARK_WINDOWS
+# This test runs as the host UID, so use its private fixture volume for settings
+# rather than the image-owned default /app/data directory.
+application=(--rm "${common[@]}" --env PYTHONPATH=/app --env TI_DATA_DIR=/test/app-data --env TI_TEST_BENCHMARK_WINDOWS
     --mount "type=bind,src=$PWD/tests,dst=/tests,readonly" --entrypoint python
     "${TI_TEST_APP_IMAGE:-torrent-intake:test}" /tests/integration_media.py)
 

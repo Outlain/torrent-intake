@@ -264,7 +264,7 @@ Events never include passwords, tokens, passkeys, or magnet URIs.
 
 | Host | Container | Access/reason |
 | --- | --- | --- |
-| `/opt/docker/torrent-intake/data` | `/app/data` | rw SQLite and migrations |
+| `/opt/docker/torrent-intake/data` | `/app/data` | rw local-SSD SQLite, settings, admin token and backup/restore work |
 | `/mnt/bulk/docker/torrent-intake/staging` | `/staging-local` | rw local staging |
 | `/mnt/media` | `/downloads` | rw NAS staging and media destinations |
 | `/opt/docker/clamav-shared/events/torrent-intake` | `/events` | rw durable events |
@@ -272,11 +272,13 @@ Events never include passwords, tokens, passkeys, or magnet URIs.
 | `/opt/docker/clamav-shared/defs` | sidecar `/var/lib/clamav` | read-only definitions |
 | `/opt/docker/clamav-shared/sockets/torrent-intake` | both `/run/clamav` | rw private socket only |
 
-The examples run both images as UID/GID `10001:10001`. Prepare their dedicated
-host directories without changing ownership of the whole media tree:
+The image and unset Compose fallbacks use UID/GID `10001:10001`. The supplied
+`.env.example` selects `3000:3000` to match the current media deployment. For
+`3000:3000`, prepare dedicated host directories as follows, without changing
+ownership of the whole media tree:
 
 ```sh
-sudo install -d -m 0750 -o 10001 -g 10001 \
+sudo install -d -m 0750 -o 3000 -g 3000 \
   /opt/docker/torrent-intake/data \
   /opt/docker/clamav-shared/events/torrent-intake \
   /opt/docker/clamav-shared/quarantine/torrent-intake \
@@ -284,7 +286,9 @@ sudo install -d -m 0750 -o 10001 -g 10001 \
 ```
 
 If you set `INTAKE_UID`/`INTAKE_GID` to another identity, create every dedicated
-directory above with that same numeric owner before starting Compose. The socket
+directory above with that same numeric owner before starting Compose. Existing
+SQLite/settings files must also be owned by that identity; bind mounts hide
+the image's built-in directory ownership. The socket
 directory is runtime-only; delete stale `clamd.sock` and `clamd.pid` files only
 while both Torrent Intake containers are stopped.
 
@@ -307,14 +311,28 @@ that endpoint relies on Docker DNS.
 
 ## Important configuration
 
-Copy `.env.example` to a mode-`0600` `.env`. The Compose and Portainer examples
-show all bounded scanner settings. Important values include:
+See [the complete configuration reference](CONFIGURATION.md) for every application
+setting, deployment variable, required mount relationship, and compatibility-only
+setting. The Settings & Help drawer shows the actual current values.
+
+Copy `.env.example` to `.env` for Docker Compose, or enter those deployment values
+in Portainer. The examples now keep application configuration in the persistent
+`/app/data/settings.json` file. An explicit `TI_*` container environment value
+still overrides that file and is persisted into it at startup. Merely adding a
+variable to Portainer's variable list or Compose's host `.env` does **not** pass it
+to an application unless the stack has a corresponding `environment:` mapping.
+
+On a fresh installation the controller starts paused. Open Settings & Help,
+unlock administration with the local token, configure qBittorrent, and restart
+before resuming. Existing installations retain their environment configuration
+and normal restart recovery. Important application settings below can also be
+written without the `TI_` prefix in `settings.json`:
 
 | Variable | Default/example | Purpose |
 | --- | --- | --- |
 | `TI_QBT_HOST` | `http://qbittorrent:8080` | reachable qB Web API |
-| `TI_QBT_USERNAME`, `TI_QBT_PASSWORD` | required deployment values | qB credentials |
-| `TI_COMPLETION_EVENT_TOKEN` | required in examples | authenticate completion hook |
+| `TI_QBT_USERNAME`, `TI_QBT_PASSWORD` | required connection values | qB credentials; environment or private local settings |
+| `TI_COMPLETION_EVENT_TOKEN` | optional unless using a completion hook | authenticate completion hook; polling works without it |
 | `INTAKE_UID`, `INTAKE_GID` | `10001` | shared numeric identity for the app, sidecar, and writable host paths |
 | `TI_CLAMD_SOCKET_HOST_DIR` | `/opt/docker/clamav-shared/sockets/torrent-intake` | private host socket directory |
 | `CLAMD_MAX_SCAN_SIZE_MIB` | `2000` | sidecar cumulative parser/expanded-data limit; bounded to `1`-`4000`, with `4000` as an explicit higher-work opt-in |
@@ -323,7 +341,7 @@ show all bounded scanner settings. Important values include:
 | `TI_FINAL_PARENT_PREFIX` | `/downloads` | primary allowed media root |
 | `TI_FINAL_PARENT_PREFIXES` | empty | optional additional mounted media roots |
 | `TI_SCANNER_MAX_FILE_MIB` | `2000` | native ClamD boundary; larger verified video and raw TrueHD content use the large-media route |
-| `TI_SCANNER_POLICY_VERSION` | `clamav-policy-v4-parallel-adaptive-media` | checkpoint policy identity; changing it deliberately reschedules prior file checkpoints |
+| `TI_SCANNER_POLICY_VERSION` | `clamav-policy-v5-media-attachments` | checkpoint policy identity; changing it deliberately reschedules prior file checkpoints |
 | `TI_SCANNER_SCAN_TIMEOUT_SECONDS` | `1200` | total per-file client deadline |
 | `TI_LARGE_MEDIA_ENABLED` | `true` | enable verified oversized-video and raw-TrueHD routing |
 | `TI_LARGE_MEDIA_MAX_FILE_GIB` | `100` | hard ceiling for one oversized media file |
@@ -395,11 +413,13 @@ The UI has a **Settings & Help** gear button. Its drawer shows every effective
 and how the setting is managed. The list is searchable and includes a short
 workflow guide plus a link back to the live scanner controls.
 
-The drawer is deliberately read-only. Compose or Portainer remains the source of
-truth for deployment configuration, and host bind mounts cannot be changed from
-inside the container. Change an environment value and recreate Torrent Intake
-when the drawer says a restart is required. The existing scan-slot and
-maintenance controls remain live and persist through SQLite.
+Ordinary application settings can now be edited after unlocking administration
+and pausing the whole controller. Saved changes take effect on container restart,
+not midway through an active job. Values overridden by the container environment
+are locked in the editor; remove the override and recreate the container to use
+the saved value instead. The existing scan-slot and scanner-maintenance controls
+remain live and persist through SQLite. They are different from the whole-controller
+pause used for backup/configuration, which also stops qBittorrent management actions.
 
 Compose-only values—the image tag, published host port, numeric UID/GID,
 host-side bind sources, and ClamD sidecar limits—cannot be discovered by the
@@ -410,6 +430,184 @@ configured. Credentials embedded in URLs and URL query strings are redacted.
 Safety-critical values such as staging boundaries, the scanner policy, and
 `TI_INFECTED_ACTION` remain visible with their current behavior explained, but
 cannot be changed through the UI.
+
+## Portable configuration and encrypted backups
+
+### Where state lives
+
+All application-owned durable state is on the existing `/app/data` mount:
+
+| File | Contents |
+| --- | --- |
+| `torrent_intake.db` | Jobs, private magnets, tags, per-file checkpoints, scan queue and runtime scanner controls |
+| `torrent_intake.db-wal`, `torrent_intake.db-shm` | SQLite's live journals; never copy just the main database while it is running |
+| `settings.json` | All effective application settings, including connection secrets and explicit environment overrides |
+| `admin-token` | Locally generated credential for configuration and backup/restore APIs; intentionally not exported/restored |
+| `controller-paused.json` | Persistent whole-controller pause; survives container recreation |
+| `deployment-notes.txt` | Your optional actual stack YAML, Portainer variable values, and host/network notes |
+| `restart-required`, `.restore-pending/` | Pending changes that require a container restart |
+| `before-restore-<id>/`, `last-restore.json` | Previous database/settings retained for offline rollback and a record of their location |
+
+Keep `TI_DATA_HOST_DIR` on **local SSD/M.2 storage**, not NFS/SMB or a media mount.
+This is particularly important for SQLite WAL, locking, and reliable atomic
+replacement. The default `/opt/docker/torrent-intake/data` is only a pathname;
+verify the host actually stores it on a local disk. This does not move your
+torrents onto that disk: their staging/media mounts are separate.
+
+Files containing secrets use mode `0600`; backup work directories use `0700`.
+The live settings file must remain readable without a passphrase for unattended
+startup, so it is **not encrypted at rest** by the application. Protect the host
+data volume. Exported backups are encrypted. No new database, volume, container,
+queue service, or Docker socket is required. `cryptography` is the one added
+Python dependency, installed in the image at build time.
+
+### Settings precedence and Docker-only settings
+
+With the standard mounts, no application environment overrides are required for
+a fresh setup or restore. The examples omit redundant `TI_DATA_DIR=/app/data`;
+old stacks that still include it work unchanged.
+
+The order is container environment → legacy in-container `.env` → `settings.json`
+→ built-in defaults. The host Compose `.env` and an in-container `.env` are not
+the same file. Legacy in-container dotenv loading remains for compatibility;
+new deployments do not need it.
+
+At startup all resolved application values are saved atomically to `settings.json`.
+For example, an explicit `TI_LOCAL_MAX_GIB=200` wins over a file value of `100`
+and saves `200` locally. Removing the environment mapping later preserves `200`.
+Leave an override **absent**, not blank, when the local file should control it.
+Unknown/malformed local setting names fail startup rather than silently reset
+the configuration. A file may initially contain only selected values; defaults
+are filled in and saved at the next successful startup. Example:
+
+```json
+{
+  "schema_version": 1,
+  "settings": {
+    "qbt_host": "http://YOUR-WORKING-GLUETUN-ENDPOINT:8080",
+    "qbt_username": "admin",
+    "qbt_password": "YOUR-PASSWORD",
+    "local_max_gib": 200,
+    "per_job_scan_workers": 4,
+    "infected_action": "hold"
+  }
+}
+```
+
+Safety-critical settings such as `infected_action`, staging boundaries, and
+scanner limits remain read-only in the web editor. Edit their local file values
+while Intake is stopped, or explicitly override them in the stack. Restoring a
+trusted backup restores its saved policy, but automatic actions remain paused
+until you acknowledge the receiving environment.
+
+These settings **must stay in Docker/Portainer**, because they describe the
+environment outside the application:
+
+- image/version, published address and port, Docker networks and Gluetun routing;
+- host bind paths, mount modes, numeric UID/GID, CPU/RAM/PID limits and tmpfs sizes;
+- `TI_DATA_DIR` only if changing the bootstrap **container** path from `/app/data`;
+- ClamD sidecar environment, including `CLAMD_MAX_SCAN_SIZE_MIB`, definition
+  freshness and socket configuration. It is a separate process without the app
+  data mount, so the app cannot read or change those values.
+
+The new `.env.example` covers deployment variables. In particular,
+`TI_DATA_HOST_DIR` selects the host SSD directory mounted at `/app/data`; it is
+not a UI setting. Application paths can be stored locally, but Docker still has
+to mount the corresponding content. qBittorrent and Intake must continue seeing
+the same staging/media content at the same **container** paths. Intake and its
+ClamD sidecar must share the same private socket directory and UID/GID. Keep your
+working qBittorrent API URL; do not assume `qbittorrent:8080` works with Gluetun.
+
+### Download and restore
+
+The admin token is generated once when `admin-token` is absent. Reading it does
+not create/change it. Keeping the data mount keeps the same token across updates
+and restarts; a fresh installation has a new token. You only paste it when using
+administrative controls, not for routine operation. It is intentionally separate
+from the backup passphrase and not imported from a backup. On a new installation,
+use its new token to unlock restore and the original backup passphrase to decrypt.
+
+1. Use the new image with your **existing full environment first**. This saves
+   the currently working values to `/app/data/settings.json`; do not strip your
+   old stack first. Confirm the displayed settings, then the verbose application
+   environment mappings may be removed. Keep any intentional overrides.
+2. In Settings & Help, obtain the token with
+   `docker exec torrent-intake cat /app/data/admin-token` and unlock administration.
+   Use HTTPS or a trusted localhost tunnel. The general job UI/API still requires
+   private-network protection; only the new admin endpoints require this token.
+3. Save your **actual** stack and Portainer variable values in Deployment Notes.
+   The app cannot discover host mounts, image digests, resource limits or the
+   sidecar configuration. Notes are included in the encrypted backup, but never
+   executed or used to provision Docker.
+4. Select **Pause Intake Controller** and wait for **drained**. This prevents new
+   management/API mutations and cooperatively interrupts scan workers. Existing
+   management requests finish first. It does not pause qBittorrent downloads.
+   A qBittorrent location move may also continue independently. Before copying
+   torrent data or qBittorrent's state, wait for those operations to finish and
+   pause/stop qBittorrent as appropriate for that separate backup.
+5. Enter a strong unique passphrase (12+ characters) and download the `.tibak`
+   backup. Keep the passphrase separately; the app cannot recover it. Resume the
+   original controller only if it will remain the active installation.
+6. On the receiving machine, prepare the local data directory and the necessary
+   mounts/network/ClamD, using the same or a compatible newer application image.
+   Keep the same container-visible media/staging paths and restore/copy their
+   contents separately if needed. Stop the old controller before handover.
+7. Start the receiving stack, unlock with **its own** local admin token, pause
+   and drain if it is an existing installation, select the backup, enter its
+   passphrase, and select **Stage Restore for Next Restart**. Confirm replacement.
+8. Restart the container in Portainer. Before opening the app database, the image
+   launcher validates and applies the staged restore. The previous installation
+   is kept in `before-restore-<id>/`. Receiving environment overrides still win;
+   the receiving database/data-directory locations and admin token are retained.
+   Keep the image's standard entrypoint; a normal `command: uvicorn ...` override
+   still runs through that launcher.
+9. Verify mounts, qBittorrent contents, connection settings and the infection
+   action. **Verify & Resume Controller** checks ClamD, qBittorrent connectivity
+   and content directory access before enabling work. Individual jobs still go
+   through the existing ownership/tag/path/file-identity checks.
+
+Matching path strings alone are insufficient: both containers must see the
+same actual torrent data. If files were copied to another host, verify the copy
+and qBittorrent's torrent data before resuming. Update the completion callback's
+target URL if Intake's hostname/address changed; polling remains the fallback.
+While the whole controller is paused, the UI skips live qBittorrent enrichment
+so stale connection details do not prevent you from opening the settings page.
+
+This is restart recovery, not zero downtime or a snapshot of qBittorrent itself.
+The currently interrupted file may be scanned again. Copied files with new
+device/inode identities are deliberately rescanned rather than trusting old
+checkpoints. Old backups may describe a qBittorrent state that has since changed;
+such jobs can require review. Never run both old and restored controllers against
+the same torrents. The local controller lock prevents duplicate processes using
+one data directory, not separate copied directories on different computers.
+
+The backup uses SQLite's [online backup API](https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.backup),
+not a plain copy of a live WAL database. An uncompressed, allowlisted archive is
+encrypted using AES-256-GCM and a passphrase-derived scrypt key. Authentication
+must succeed before archive parsing; restore rejects unexpected paths, symlinks,
+compressed members, malformed databases, and database triggers/views. Database
+backup size is bounded to 512 MiB (torrent data size is unrelated). This does not
+cap the working database; it bounds only portable backup/restore. Unlocking
+administration shows the logical database size including committed WAL pages,
+using lightweight metadata queries, not a full row count. Temporary work
+uses the local data disk with bounded memory; allow several times the database
+size in free space. Larger databases need an offline backup procedure. Browser
+downloads also need enough memory for the encrypted file. Keep this backup limit
+unless measured database growth justifies a larger, tested transfer/restore
+design; many small files and retained history matter more than torrent byte size.
+
+Snapshots exclude torrent content, qBittorrent's own configuration/fast-resume
+database, shared definitions, notifier database/events and Docker images. Back
+those up separately when moving the whole stack. Keep at least one tested backup
+outside the Docker host, along with a matching image version and its passphrase.
+
+For rollback, stop/pause the controller and restore a known-good encrypted backup
+through the same process. The additional `before-restore-<id>` copy is retained
+for offline recovery; never copy it over a running SQLite database or retain old
+WAL/SHM journals with a different database. Before manual recovery, stop the app,
+preserve the current data directory, and restore the previous database/settings
+with no other process using them. Rollback directories are private but plaintext
+and are not pruned automatically. Remove them only after validating recovery.
 
 ## Completion hook
 
@@ -433,6 +631,9 @@ placeholders. The background poller still discovers missed callbacks.
 - retry, bulk retry/delete/clear, switch-waiting-jobs-to-NAS-staging, and scan
   priority/pause/resume endpoints used by the UI
 - `GET /scanner/status`, `POST /scanner/slots`, `POST /scanner/maintenance`
+- `GET /controller/status` (whole-controller pause, not only scanner maintenance)
+- `/admin/status`, `/admin/pause`, `/admin/resume`, `/admin/settings`,
+  `/admin/deployment-notes`, `/admin/backup`, `/admin/restore` (local admin token required)
 - qB category/transfer and approved final-path suggestion endpoints
 - server-filtered qB tag suggestions at `GET /qbt/tags`
 - `POST /events/qbt-complete` and `/events/qbt-complete-form`
@@ -466,6 +667,12 @@ docker run --rm --mount type=bind,src="$PWD",dst=/workspace,readonly \
   --entrypoint python torrent-intake:test \
   -m unittest discover -s /workspace/tests -v
 bash tests/run_media_integration.sh
+docker run --rm --read-only --network none --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
+  --mount type=bind,src="$PWD/tests",dst=/tests,readonly \
+  --env PYTHONPATH=/app --entrypoint python torrent-intake:test \
+  /tests/integration_portability.py
 ```
 
 Run the integration script as a non-root Docker user. It uses only disposable
@@ -477,6 +684,13 @@ native and large-media attachment scans, cover images, a hash-only attachment
 signature missed by the opaque whole-container scan, encrypted-archive holding,
 and malformed-media rejection. Window sizes are reduced for these small tests;
 this is not a multi-gigabyte throughput test or a full signature-database test.
+
+The portability integration test uses real HTTP and the image's startup launcher
+inside one isolated test container. It checks first-run setup, local settings,
+environment override persistence, encrypted export/import, token enforcement,
+offline replacement, duplicate-controller locking, and paused recovery. It never
+connects to your qBittorrent or uses production mounts. Unit tests also simulate
+corrupt archives, invalid schemas, symlinks and interruption midway through restore.
 
 For a repeatable synthetic advanced-check/window-size comparison, run
 `TI_TEST_BENCHMARK_WINDOWS=1 bash tests/run_media_integration.sh`. It uses a sparse

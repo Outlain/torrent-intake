@@ -23,6 +23,13 @@ data/
 logs/
 app/data/
 app/logs/
+*.tibak
+/settings.json
+/admin-token
+/deployment-notes.txt
+/before-restore-*/
+/.backup-*/
+/.restore-*/
 *.db
 *.sqlite
 *.sqlite3

@@ -6,77 +6,27 @@ services:
     init: true
     restart: unless-stopped
     read_only: true
-    environment:
-      TI_DEBUG: "false"
-      TI_DATABASE_URL: sqlite:////app/data/torrent_intake.db
-      # Keep this URL compatible with the qBittorrent/Gluetun network arrangement.
-      TI_QBT_HOST: ${TI_QBT_HOST:-http://qbittorrent:8080}
-      TI_QBT_USERNAME: ${TI_QBT_USERNAME:-admin}
-      TI_QBT_PASSWORD: ${TI_QBT_PASSWORD:?set TI_QBT_PASSWORD in .env}
-      TI_QBT_VERIFY_CERTIFICATE: "false"
-      TI_QBT_REQUEST_TIMEOUT_SECONDS: "20"
-      TI_QBT_WEB_URL: ${TI_QBT_WEB_URL:-http://localhost:8080}
-      TI_INTAKE_CATEGORY: intake
-      TI_MANAGED_TAG: torrent_intake
-      TI_AUTO_CREATE_FINAL_CATEGORY: "true"
-      TI_LOCAL_STAGING_ROOT: /staging-local
-      TI_NAS_STAGING_ROOT: /downloads/torrent-intake/staging
-      TI_FINAL_PARENT_PREFIX: /downloads
-      TI_FINAL_PARENT_PREFIXES: ${TI_FINAL_PARENT_PREFIXES:-}
-      TI_LOCAL_OVERFLOW_POLICY: ${TI_LOCAL_OVERFLOW_POLICY:-queue}
-      TI_LOCAL_MAX_GIB: ${TI_LOCAL_MAX_GIB:-200}
-      TI_LOCAL_FREE_SPACE_BUFFER_GIB: ${TI_LOCAL_FREE_SPACE_BUFFER_GIB:-5}
-      TI_POLLING_INTERVAL_SECONDS: ${TI_POLLING_INTERVAL_SECONDS:-300}
-      TI_COMPLETION_GRACE_SECONDS: "15"
-      TI_COMPLETION_EVENT_TOKEN: ${TI_COMPLETION_EVENT_TOKEN:?set TI_COMPLETION_EVENT_TOKEN in .env}
-      TI_SCANNER_BACKEND: clamd
-      TI_CLAMD_SOCKET_PATH: /run/clamav/clamd.sock
-      TI_SCANNER_POLICY_VERSION: ${TI_SCANNER_POLICY_VERSION:-clamav-policy-v5-media-attachments}
-      TI_SCANNER_MAX_FILE_MIB: ${TI_SCANNER_MAX_FILE_MIB:-2000}
-      TI_SCANNER_HEALTH_CACHE_SECONDS: "15"
-      TI_SCANNER_CONNECT_TIMEOUT_SECONDS: "5"
-      TI_SCANNER_SCAN_TIMEOUT_SECONDS: ${TI_SCANNER_SCAN_TIMEOUT_SECONDS:-1200}
-      TI_SCANNER_DEFINITIONS_WARN_HOURS: "36"
-      TI_SCANNER_DEFINITIONS_STALE_HOURS: "48"
-      TI_LARGE_MEDIA_ENABLED: ${TI_LARGE_MEDIA_ENABLED:-true}
-      TI_LARGE_MEDIA_MAX_FILE_GIB: ${TI_LARGE_MEDIA_MAX_FILE_GIB:-100}
-      TI_LARGE_MEDIA_CHUNK_MIB: ${TI_LARGE_MEDIA_CHUNK_MIB:-512}
-      TI_LARGE_MEDIA_MIN_CHUNK_MIB: ${TI_LARGE_MEDIA_MIN_CHUNK_MIB:-64}
-      TI_LARGE_MEDIA_OVERLAP_KIB: ${TI_LARGE_MEDIA_OVERLAP_KIB:-1024}
-      TI_LARGE_MEDIA_PROBE_TIMEOUT_SECONDS: ${TI_LARGE_MEDIA_PROBE_TIMEOUT_SECONDS:-120}
-      TI_LARGE_MEDIA_SCAN_TIMEOUT_SECONDS: ${TI_LARGE_MEDIA_SCAN_TIMEOUT_SECONDS:-172800}
-      TI_FFPROBE_BINARY: /usr/bin/ffprobe
-      TI_FFMPEG_BINARY: /usr/bin/ffmpeg
-      TI_MEDIA_ATTACHMENT_MAX_MIB: ${TI_MEDIA_ATTACHMENT_MAX_MIB:-16}
-      TI_MEDIA_ATTACHMENT_TOTAL_MIB: ${TI_MEDIA_ATTACHMENT_TOTAL_MIB:-64}
-      TI_PER_JOB_SCAN_WORKERS: ${TI_PER_JOB_SCAN_WORKERS:-4}
-      TI_CLAMD_MAX_INFLIGHT_REQUESTS: ${TI_CLAMD_MAX_INFLIGHT_REQUESTS:-4}
-      TI_MAX_CONCURRENT_SCANS: ${TI_MAX_CONCURRENT_SCANS:-2}
-      TI_MAX_SCAN_SLOTS: ${TI_MAX_SCAN_SLOTS:-4}
-      TI_MAX_CONCURRENT_LARGE_SCANS: ${TI_MAX_CONCURRENT_LARGE_SCANS:-1}
-      TI_LARGE_SCAN_GIB: ${TI_LARGE_SCAN_GIB:-2}
-      TI_SCAN_SCHEDULER_INTERVAL_SECONDS: "3"
-      TI_SCAN_LEASE_SECONDS: "90"
-      TI_SCAN_HEARTBEAT_SECONDS: "10"
-      TI_SCAN_RETRY_BASE_SECONDS: "30"
-      TI_SCAN_MAX_FAILURES: "3"
-      TI_SCAN_YIELD_AFTER_FILES: "10"
-      TI_PAUSE_CONFIRMATION_TIMEOUT_SECONDS: "30"
-      TI_INFECTED_ACTION: ${TI_INFECTED_ACTION:-hold}
-      TI_QUARANTINE_ROOT: /quarantine
-      TI_EVENT_DIR: /events
+    stop_grace_period: 60s
+    # No application environment overrides are required for the standard mounts.
+    # Settings/secrets live in /app/data/settings.json (including after restore).
+    # Optional explicit overrides still work and are persisted at startup:
+    # environment:
+    #   TI_QBT_HOST: ${TI_QBT_HOST}
+    #   TI_INFECTED_ACTION: ${TI_INFECTED_ACTION}
     volumes:
-      - /opt/docker/torrent-intake/data:/app/data:rw
-      - /mnt/bulk/docker/torrent-intake/staging:/staging-local:rw
-      - /mnt/media:/downloads:rw
-      - /opt/docker/clamav-shared/events/torrent-intake:/events:rw
-      - /opt/docker/clamav-shared/quarantine/torrent-intake:/quarantine:rw
+      - ${TI_DATA_HOST_DIR:-/opt/docker/torrent-intake/data}:/app/data:rw
+      - ${TI_LOCAL_STAGING_HOST_DIR:-/mnt/bulk/docker/torrent-intake/staging}:/staging-local:rw
+      - ${TI_MEDIA_HOST_DIR:-/mnt/media}:/downloads:rw
+      - ${TI_EVENTS_HOST_DIR:-/opt/docker/clamav-shared/events/torrent-intake}:/events:rw
+      - ${TI_QUARANTINE_HOST_DIR:-/opt/docker/clamav-shared/quarantine/torrent-intake}:/quarantine:rw
       - ${TI_CLAMD_SOCKET_HOST_DIR:-/opt/docker/clamav-shared/sockets/torrent-intake}:/run/clamav:rw
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
     ports:
-      # The intake UI/API has no user authentication.
-      - "127.0.0.1:${TI_UI_HOST_PORT:-8095}:8000"
+      # Job UI/API is private-network only; new admin controls require a local token.
+      - "${TI_UI_PUBLISH_IP:-127.0.0.1}:${TI_UI_HOST_PORT:-8095}:8000"
+    networks:
+      - shared_media_net
     depends_on:
       torrent-intake-clamd:
         condition: service_healthy
@@ -106,13 +56,13 @@ services:
     read_only: true
     network_mode: none
     environment:
-      DEFINITIONS_DIR: /var/lib/clamav
       DEFINITIONS_WAIT_TIMEOUT: "1800"
       DEFINITIONS_MAX_AGE_SECONDS: ${DEFINITIONS_MAX_AGE_SECONDS:-172800}
-      CLAMD_SOCKET: /run/clamav/clamd.sock
       CLAMD_MAX_SCAN_SIZE_MIB: ${CLAMD_MAX_SCAN_SIZE_MIB:-2000}
+    # The image fixes DatabaseDirectory=/var/lib/clamav and
+    # LocalSocket=/run/clamav/clamd.sock; their health-check defaults match.
     volumes:
-      - /opt/docker/clamav-shared/defs:/var/lib/clamav:ro
+      - ${CLAMAV_DEFS_HOST_DIR:-/opt/docker/clamav-shared/defs}:/var/lib/clamav:ro
       - ${TI_CLAMD_SOCKET_HOST_DIR:-/opt/docker/clamav-shared/sockets/torrent-intake}:/run/clamav:rw
     tmpfs:
       # ClamD stages each INSTREAM request here. Four 512 MiB parallel
@@ -134,3 +84,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  shared_media_net:
+    name: ${MEDIA_NETWORK:-shared_media_net}
+    external: true

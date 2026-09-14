@@ -1935,9 +1935,39 @@
 
       <div class="settings-content">
         <div class="settings-callout">
-          <strong>Configuration is read-only here.</strong>
-          Docker Compose or Portainer remains the source of truth. Secret values are never displayed, and safety-critical settings cannot be changed from this panel.
+          <strong>Portable settings, with explicit Docker overrides.</strong>
+          Settings are saved in <code>/app/data/settings.json</code>. Docker/Portainer environment values take priority and are saved there too. Unlock administration to edit ordinary settings; safety-critical settings remain read-only here. Secret values are never filled into setting inputs.
         </div>
+
+        <details class="settings-help" id="portable-controls" open>
+          <summary>Configuration, encrypted backup &amp; restore</summary>
+          <div class="settings-help-body">
+            <p>A backup contains Intake's database, checkpoints, settings, secrets, and your deployment notes—not the torrent files, qBittorrent state, shared definitions, or notifier state.</p>
+            <p>The app creates one local administrator token on first startup and reuses it while you keep the data directory. Read it whenever needed with <code>docker exec torrent-intake cat /app/data/admin-token</code>. A fresh installation has its own token; restoring a backup does not replace it. It is separate from your backup passphrase and is not saved in browser storage. Use HTTPS or a trusted localhost tunnel for these controls.</p>
+            <label for="admin-token-input">Local administrator token</label>
+            <input id="admin-token-input" type="password" autocomplete="off" placeholder="Paste the local administrator token">
+            <button id="admin-unlock" class="button-secondary" type="button">Unlock Administration</button>
+            <p id="controller-state" role="status" aria-live="polite">Checking controller status…</p>
+            <div id="admin-controls" hidden>
+              <button id="controller-pause" class="button-secondary" type="button">Pause Intake Controller</button>
+              <button id="controller-resume" class="button-secondary" type="button">Verify &amp; Resume Controller</button>
+              <p>Pause stops new Intake actions and interrupts current scans safely; an unfinished file may be rescanned later. Wait for “drained” before backing up. qBittorrent downloads themselves continue.</p>
+              <p id="backup-database-size">Database size is checked when you unlock administration.</p>
+              <label for="backup-passphrase">Backup passphrase (12+ characters; keep it separately)</label>
+              <input id="backup-passphrase" type="password" autocomplete="new-password">
+              <button id="backup-download" class="button-secondary" type="button">Download Encrypted Backup</button>
+              <label for="backup-upload">Restore an encrypted .tibak backup</label>
+              <input id="backup-upload" type="file" accept=".tibak,application/octet-stream">
+              <button id="backup-restore" class="button-secondary danger-soft" type="button">Stage Restore for Next Restart</button>
+              <p>Restore is applied only after you restart the container in Portainer. It keeps a rollback copy and starts paused. Keep the same container-visible media paths, stop the old controller, and restore qBittorrent/data separately if they moved too.</p>
+              <label for="deployment-notes">Deployment notes / your actual Portainer stack (included in the encrypted backup)</label>
+              <textarea id="deployment-notes" rows="7" spellcheck="false" placeholder="Paste your stack YAML and host mount/network notes here. These notes are never executed."></textarea>
+              <button id="deployment-notes-save" class="button-secondary" type="button">Save Deployment Notes</button>
+              <button id="local-settings-save" class="button-secondary" type="button">Save Edited Settings (Restart Required)</button>
+            </div>
+            <p id="admin-result" role="status" aria-live="polite"></p>
+          </div>
+        </details>
 
         <div class="settings-overview">
           <div class="settings-overview-card">
@@ -1964,7 +1994,7 @@
               <li>Clean content is promoted to its approved media destination. Infected content follows the read-only action shown above.</li>
               <li>Structured events are written durably for the central notifier; Torrent Intake does not send Telegram directly.</li>
             </ol>
-            <p>Host bind mounts cannot be changed from inside this container. Update the Compose or Portainer stack and recreate the application when a deployment-managed setting changes.</p>
+            <p>Host bind mounts cannot be changed from inside this container. Update the Compose or Portainer stack and recreate the application when a deployment-managed setting changes. Ordinary settings can be saved locally after pausing the controller; restart to apply them.</p>
             <p>Compose-only values such as the image tag, host port, numeric UID/GID, host-side bind paths, and ClamD sidecar limits are not visible to the application. Inspect the deployed stack for those values.</p>
             <p>The live scan-slot and maintenance controls are intentionally kept in the Scan Queue toolbar.</p>
             <button id="settings-runtime-controls-button" class="button-secondary" type="button">Go to runtime scanner controls</button>
@@ -2008,7 +2038,7 @@
                     {% if item.sensitive %}
                     <span class="setting-badge secret">Secret hidden</span>
                     {% endif %}
-                    <span class="setting-badge">Read-only</span>
+                    <span class="setting-badge">{{ 'Admin editable' if item.editable else 'Read-only' }}</span>
                   </div>
                 </div>
                 <div class="setting-values">
@@ -2022,6 +2052,20 @@
                   </div>
                 </div>
                 <p class="setting-description">{{ item.description }}</p>
+                <p class="setting-change-hint">Source: {{ item.source }}</p>
+                {% if item.editable %}
+                <div class="local-setting-editor" hidden>
+                  <label for="edit-{{ item.name }}">New value (applied after restart)</label>
+                  {% if item.input_type == 'boolean' %}
+                  <select id="edit-{{ item.name }}" data-local-setting="{{ item.name }}">
+                    <option value="true" {% if item.input_value %}selected{% endif %}>Enabled</option>
+                    <option value="false" {% if not item.input_value %}selected{% endif %}>Disabled</option>
+                  </select>
+                  {% else %}
+                  <input id="edit-{{ item.name }}" data-local-setting="{{ item.name }}" type="{{ item.input_type }}" autocomplete="off" value="{{ item.input_value if item.input_value is not none else '' }}" placeholder="{{ 'Leave unchanged unless replacing this value' if item.input_value is none else '' }}">
+                  {% endif %}
+                </div>
+                {% endif %}
                 {% if item.current_effect %}
                 <p class="setting-effect"><strong>Current behavior:</strong> {{ item.current_effect }}</p>
                 {% endif %}
@@ -2037,6 +2081,102 @@
   </section>
 
   <script>
+    // The administration token stays in this page's memory, never localStorage.
+    let adminToken = '';
+    const adminResult = document.getElementById('admin-result');
+    async function adminRequest(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: { 'X-TI-Admin-Token': adminToken, ...(options.headers || {}) },
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.detail || `Request failed (${response.status})`);
+      }
+      return response;
+    }
+    async function adminPost(path, payload = {}) {
+      return (await adminRequest(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })).json();
+    }
+    async function refreshControllerStatus() {
+      try {
+        const state = await (await fetch('/controller/status', {cache: 'no-store'})).json();
+        document.getElementById('controller-state').textContent = state.paused
+          ? `Controller paused (${state.drained ? 'drained' : 'draining'}). ${state.reason || ''}${state.restart_required ? ' Container restart required.' : ''}`
+          : 'Controller is running.';
+      } catch (_) { /* Existing health/status panels report connection failures. */ }
+    }
+    async function adminAction(action) {
+      adminResult.textContent = 'Working…';
+      try { await action(); }
+      catch (error) { adminResult.textContent = error.message; }
+      await refreshControllerStatus();
+    }
+    document.getElementById('admin-unlock').addEventListener('click', () => adminAction(async () => {
+      adminToken = document.getElementById('admin-token-input').value.trim();
+      const state = await (await adminRequest('/admin/status')).json();
+      document.getElementById('admin-token-input').value = '';
+      document.getElementById('admin-controls').hidden = false;
+      document.querySelectorAll('.local-setting-editor').forEach((element) => { element.hidden = false; });
+      document.getElementById('deployment-notes').value = state.deployment_notes;
+      const limitMiB = state.backup.database_limit_bytes / 1048576;
+      const databaseMiB = state.backup.database_bytes === null ? null : state.backup.database_bytes / 1048576;
+      document.getElementById('backup-database-size').textContent = databaseMiB === null
+        ? `Database size unavailable. Portable backup/restore limit: ${limitMiB} MiB; this does not limit the working database or torrent sizes.`
+        : `Database: ${databaseMiB.toFixed(2)} MiB when unlocked. Portable backup/restore limit: ${limitMiB} MiB; this does not limit the working database or torrent sizes.${databaseMiB > limitMiB ? ' This database needs an offline backup.' : ''}`;
+      adminResult.textContent = 'Administration unlocked for this page. Pause and wait for drained before saving settings or taking a backup.';
+    }));
+    document.getElementById('controller-pause').addEventListener('click', () => adminAction(async () => {
+      await adminPost('/admin/pause');
+      adminResult.textContent = 'Controller pause requested. Wait for drained; qBittorrent downloads continue.';
+    }));
+    document.getElementById('controller-resume').addEventListener('click', () => {
+      if (!confirm('Confirm that media/staging mounts and qBittorrent state are correct, and no other Intake controller is managing these torrents. Resume automatic management, scanning, and the configured infection action?')) return;
+      adminAction(async () => {
+        await adminPost('/admin/resume', {confirm_external_state: true});
+        adminResult.textContent = 'Controller resumed.';
+      });
+    });
+    document.getElementById('backup-download').addEventListener('click', () => adminAction(async () => {
+      const passphrase = document.getElementById('backup-passphrase').value;
+      if (passphrase.length < 12) throw new Error('Choose a passphrase of at least 12 characters. It cannot be recovered if lost.');
+      const response = await adminRequest('/admin/backup', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({passphrase})});
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url; link.download = `torrent-intake-${new Date().toISOString().slice(0,10)}.tibak`; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      document.getElementById('backup-passphrase').value = '';
+      adminResult.textContent = 'Encrypted backup downloaded. Keep the passphrase separately. Resume this controller only if it will remain the active installation.';
+    }));
+    document.getElementById('backup-restore').addEventListener('click', () => {
+      if (!confirm('Stage this backup to replace the current Intake database/settings at the next container restart? A rollback copy will be kept. The controller will stay paused after restore.')) return;
+      adminAction(async () => {
+        const file = document.getElementById('backup-upload').files[0];
+        if (!file) throw new Error('Select a .tibak backup first.');
+        const phrase = document.getElementById('backup-passphrase').value;
+        const encoded = btoa(Array.from(new TextEncoder().encode(phrase), (byte) => String.fromCharCode(byte)).join(''));
+        const response = await adminRequest('/admin/restore', {method: 'POST', headers: {'Content-Type': 'application/octet-stream', 'X-TI-Backup-Passphrase': encoded, 'X-TI-Confirm-Restore': 'replace-after-restart'}, body: file});
+        document.getElementById('backup-passphrase').value = '';
+        adminResult.textContent = (await response.json()).message;
+      });
+    });
+    document.getElementById('deployment-notes-save').addEventListener('click', () => adminAction(async () => {
+      await adminPost('/admin/deployment-notes', {notes: document.getElementById('deployment-notes').value});
+      adminResult.textContent = 'Deployment notes saved; they will be included in the encrypted backup.';
+    }));
+    document.querySelectorAll('[data-local-setting]').forEach((input) => {
+      input.addEventListener('input', () => { input.dataset.changed = 'true'; });
+    });
+    document.getElementById('local-settings-save').addEventListener('click', () => adminAction(async () => {
+      const updates = {};
+      document.querySelectorAll('[data-local-setting][data-changed="true"]').forEach((input) => { updates[input.dataset.localSetting] = input.value; });
+      if (!Object.keys(updates).length) throw new Error('No settings were edited.');
+      const result = await adminPost('/admin/settings', {settings: updates});
+      adminResult.textContent = result.message;
+    }));
+    refreshControllerStatus();
+    setInterval(refreshControllerStatus, 5000);
     const heroDetails = document.getElementById('hero-details');
     const settingsOpenButton = document.getElementById('settings-open-button');
     const settingsDialog = document.getElementById('settings-dialog');
