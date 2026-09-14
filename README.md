@@ -43,14 +43,63 @@ TrueHD audio. Torrent Intake then reads every byte in independent `512 MiB` Clam
 windows with a `1024 KiB` overlap. Up to four windows from that file are streamed
 concurrently through separate private Unix-socket connections. The file is
 opened once and read with explicit offsets; Torrent Intake does not copy it or
-create temporary chunk files. The overlap keeps signatures crossing a window
-edge visible. Device, inode, size, mtime, and ctime are still checked throughout.
+create temporary chunk files. The overlap allows short byte signatures crossing
+a window edge to remain visible; it cannot preserve every signature or parser
+context. Device, inode, size, mtime, and ctime are still checked throughout.
 
-Approved large-video containers are AVI, FLV, Matroska/WebM, MOV/MP4, MPEG,
+Approved large-video containers are ASF, AVI, FLV, Matroska/WebM, MOV/MP4, MPEG,
 MPEG-TS, and Ogg. Raw TrueHD is the only approved audio-only format and must
 have a `.thd` or `.truehd` suffix, byte-level `ffprobe` identification as
 `truehd`, and exactly one TrueHD audio stream. Other audio-only formats remain
 held. Media recognition never relies on the filename extension alone.
+For example, an `.avi` filename whose contents are identified as ASF uses the
+ASF route and still requires a video stream and supported stream types.
+
+Matroska attachments named exactly `kodi-metadata` or `kodi-override-metadata`
+are accepted with a declared `application/xml`, `text/xml`, or `text/plain` MIME
+type. These are [Kodi's embedded NFO names](https://kodi.wiki/view/Video_file_tagging#MKV_tag_options),
+which have no filename extension.
+This is an admission rule, not proof that the attachment is harmless: its bytes
+are still included in the ClamD windows and are also scanned as complete objects.
+No attachment is opened in Kodi or used to fetch a URL. Missing/other MIME types and other
+extensionless attachments remain blocked. The existing font, image, subtitle,
+and text suffix rules are unchanged.
+
+### Complete attachment scans
+
+The large-media route extracts each reported attachment (including attached cover
+images) and requires a complete native ClamD scan of that object before scanning
+the video windows. Matroska content identified by its EBML header also gets this
+attachment pass after a successful native scan, even below 2000 MiB. Small
+audio-only Matroska files remain supported; cover art alone cannot qualify an
+oversized file as video. This does not claim to extract every possible metadata
+field or codec payload from every container.
+
+Extraction uses FFmpeg stream-copy/attachment output, not movie transcoding or
+general-purpose torrent archive extraction. It reads from the already-open source
+descriptor. One object at a time is bounded while arriving through a pipe, then
+written to a private, application-named temporary file under `/tmp`. The source
+identity is checked again; each temporary object is scanned whole and removed
+before the next. Embedded filenames are never used as output paths. An attachment
+limit/error cannot enter the media fallback or be subdivided.
+
+Defaults are `TI_MEDIA_ATTACHMENT_MAX_MIB=16` per attachment and
+`TI_MEDIA_ATTACHMENT_TOTAL_MIB=64` per media file, with at most 64 attachments.
+The configurable hard ceilings are 64 MiB per attachment and 256 MiB total.
+Unknown-size cover images reserve their per-attachment maximum against the total
+budget. Empty, oversized, missing, or incomplete output holds the torrent.
+There is no extra persistent volume or database. The application's existing
+256 MiB `/tmp` tmpfs covers the default bounded temporary files; streamed movie
+windows still use the separate ClamD tmpfs.
+
+FFprobe and FFmpeg run with 512 MiB address-space, CPU-time, and wall-clock bounds,
+a 64 MiB single-allocation limit, and no regular-file output allowance. FFprobe
+stdout is limited to 1 MiB and both tools' stderr to 64 KiB *while being read*.
+Attachment stdout is limited to its remaining extraction budget. Pause/lost-lease
+requests terminate and reap the helper. Protocol and format allowlists exclude
+network/playlist demuxers. These are resource and input restrictions, not a
+complete security sandbox for a compromised parser; keep FFmpeg and the image
+updated. `TI_LARGE_MEDIA_PROBE_TIMEOUT_SECONDS` bounds each helper invocation.
 
 `MaxScanSize` measures parser/expanded data, not only the input file's raw size.
 It defaults to `2000 MiB` and the sidecar permits a bounded deployment override
@@ -72,10 +121,14 @@ increases the maximum parser and archive-expansion work ClamAV may perform, so
 and concurrency limits keep a `4000` opt-in bounded. Resource exhaustion or any
 other incomplete scan still fails closed.
 
-If ClamD still reports a parser or expanded-data limit for one window, that
-window is split into smaller overlapping windows and retried, down to a
-configured `64 MiB` minimum. A limit at the minimum remains a policy failure; it
-is never reported as clean or malware. A single application-wide semaphore caps
+Only a raw stream or `MaxFileSize` limit allows a window to split into smaller
+overlapping windows, down to the configured `64 MiB` minimum. `MaxScanSize` within
+a window, recursion limits, file-count limits, and unknown limits remain held;
+splitting must not hide an unresolved expansion/inspection problem. A native
+`MaxScanSize` result can still enter the verified-media route once, but every
+attachment must pass a complete scan and every media window must finish without
+an expansion limit. A limit at the minimum remains a policy failure, never a
+clean or malware verdict. A single application-wide semaphore caps
 all active ClamD streams at four, matching the sidecar's `MaxThreads 4`; `MaxQueue
 8` remains burst capacity rather than eight active scanners.
 
@@ -89,15 +142,57 @@ undersized temporary filesystem can make ClamD close a socket before returning a
 verdict.
 
 This policy is intentionally recorded as
-`large_media_parallel_adaptive_windows`, not a native whole-file ClamAV verdict.
-ClamD sees all raw bytes and `ffprobe` validates the container, but whole-file
-hashes and parsers cannot span independent ClamD windows. The default bounded
+`media_windows_and_attachments`, not a native whole-file ClamAV verdict.
+Native scans with the extra attachment pass record `clamd_native_with_attachments`;
+other completed native scans record `clamd_native`. Historical method values
+remain readable in existing checkpoints.
+ClamD sees all raw bytes and `ffprobe` identifies the container and stream table;
+it does not fully decode or prove the file is harmless. Whole-file hashes and
+parsers cannot span independent ClamD windows. The default bounded
 ceiling is `100 GiB`, so normal 5-50 GiB MKV/MP4 files can complete without being
 skipped. Oversized archives, disk images, executables, unapproved audio-only
 files, unknown formats, unsafe media attachments, files above the configured
 ceiling, and limit/error responses that the validated-media fallback cannot
 safely resolve remain held with no clean verdict. A filename extension never
 selects the large-media path.
+
+### Inspection warnings and remaining limits
+
+The sidecar enables encrypted-content and broken-executable/image warnings.
+Torrent Intake holds these as inspection-policy failures, **not infections**,
+including when `TI_INFECTED_ACTION=delete`. Known malware and other threat
+detections still follow the configured infection action. ClamAV's broken-media
+warning covers certain image formats; it is not a full AVI/MKV decoder test.
+
+Sending every byte does not mean every detection method ran. The sidecar keeps
+bounded `MaxEmbeddedPE 40M` and `PCREMaxFileSize 100M` checks; some advanced checks
+can be omitted on larger inputs. Complete small attachments restore their own
+whole-object hash and parser context, not the whole movie's context. The 512 MiB
+window default is unchanged pending representative full-signature/NAS throughput
+measurements. An optional smaller-window profile is `TI_LARGE_MEDIA_CHUNK_MIB=32`
+with `TI_LARGE_MEDIA_MIN_CHUNK_MIB=16`. It is below those advanced-check size caps,
+but trades more requests and ~3.2% overlapping reads for smaller parser context;
+it is not universally better for every signature.
+
+Use occasional full scans with current definitions as well as changed-file scans.
+FreshClam updates signatures only: update ClamAV/FFmpeg images and media players
+separately. Do not treat a no-detection result as proof that opening media is safe.
+
+### Upgrading to the attachment policy
+
+Pause/stop Torrent Intake before recreating **both** the application and its ClamD
+sidecar from this release. Do not run an old application against the newly enabled
+warning options: old response parsers may misclassify them as infections. No mount
+or database-schema change is needed; keep `/app/data`. The default label is now
+`clamav-policy-v5-media-attachments`. A built-in implementation revision is also
+included in the policy fingerprint, so retaining an explicit older environment
+label cannot reuse weaker clean checkpoints. Active jobs re-evaluate their old
+clean files once under this policy; already-promoted jobs are not recalled.
+Newly completed checkpoints retain the usual restart recovery behavior.
+
+For rollback, restore matching application and sidecar image versions together,
+keeping the database and mounts. Older policy fingerprints may require another
+scan of active jobs. No automatic deletion or new infection action is introduced.
 
 ## qBittorrent safety gates
 
@@ -131,6 +226,8 @@ pending files finish, so additions, replacements, deletions, symlinks, and
 special files block the final clean gate. Engine or policy changes reset relevant
 checkpoints; a signature-only database update is recorded without discarding
 completed per-file work.
+Directory enumeration errors also block promotion; an unreadable or disappeared
+subfolder must not silently remove files from the manifest or their checkpoints.
 
 Parallel range workers never write SQLite. The owning torrent worker collects
 their results and performs every checkpoint update serially. A restart during
@@ -368,10 +465,28 @@ docker build -f Dockerfile.clamd -t torrent-intake-clamd:test .
 docker run --rm --mount type=bind,src="$PWD",dst=/workspace,readonly \
   --entrypoint python torrent-intake:test \
   -m unittest discover -s /workspace/tests -v
+bash tests/run_media_integration.sh
 ```
+
+Run the integration script as a non-root Docker user. It uses only disposable
+test directories and isolated, read-only-root containers, never deployment
+volumes. Real FFmpeg creates ASF/AVI-name and Kodi-attachment MKV fixtures; real
+ClamD scans them over a private Unix socket with a tiny EICAR test signature
+database. It checks clean files, embedded EICAR, an overlapping-window boundary,
+native and large-media attachment scans, cover images, a hash-only attachment
+signature missed by the opaque whole-container scan, encrypted-archive holding,
+and malformed-media rejection. Window sizes are reduced for these small tests;
+this is not a multi-gigabyte throughput test or a full signature-database test.
+
+For a repeatable synthetic advanced-check/window-size comparison, run
+`TI_TEST_BENCHMARK_WINDOWS=1 bash tests/run_media_integration.sh`. It uses a sparse
+128 MiB fixture, a tiny test database, disabled engine cache, and forced media-window
+routing. It compares 512 and 32 MiB windows with a PCRE-only logical detection;
+timings do not predict real movie, NAS, or production-signature throughput.
 
 Both containers run non-root with read-only root filesystems, dropped
 capabilities, no-new-privileges, bounded PIDs/CPU/memory, tmpfs scratch, health
-checks, and rotated Docker logs. GitHub Actions tests and publishes both images
-for `linux/amd64` and `linux/arm64`. See the parent
+checks, and rotated Docker logs. GitHub Actions validates on native amd64 and
+arm64 runners (including helper resource limits and the synthetic window check)
+before publishing both images for `linux/amd64` and `linux/arm64`. See the parent
 `REPOSITORY_TRANSITION.md` for suite-wide migration and rollback steps.

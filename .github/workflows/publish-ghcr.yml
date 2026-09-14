@@ -9,7 +9,11 @@ on:
 
 jobs:
   validate:
-    runs-on: ubuntu-24.04
+    # Run the process resource-limit tests natively, not inside QEMU's address space.
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     steps:
@@ -31,7 +35,7 @@ jobs:
         run: docker build --tag torrent-intake:test .
 
       - name: Run application tests in the built image
-        run: docker run --rm --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python torrent-intake:test -m unittest discover -s /workspace/tests -v
+        run: docker run --rm --read-only --network none --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python torrent-intake:test -m unittest discover -s /workspace/tests -v
 
       - name: Verify application hardening compatibility
         run: |
@@ -58,17 +62,10 @@ jobs:
             torrent-intake-clamd:test -c \
             'import clamd_entrypoint; clamd_entrypoint.configured_max_scan_size_mib()'
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - name: Validate arm64 builds
-        run: |
-          docker buildx build --platform linux/arm64 --load --tag torrent-intake:test-arm64 .
-          docker buildx build --platform linux/arm64 --load --file Dockerfile.clamd --tag torrent-intake-clamd:test-arm64 .
-          docker run --rm --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python torrent-intake:test-arm64 -m unittest discover -s /workspace/tests -v
+      - name: Test real media scanning over the private ClamD socket
+        env:
+          TI_TEST_BENCHMARK_WINDOWS: "1"
+        run: bash tests/run_media_integration.sh
 
   publish:
     if: github.event_name != 'pull_request'

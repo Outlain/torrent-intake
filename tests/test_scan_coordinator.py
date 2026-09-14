@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import errno
+import os
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -62,6 +65,35 @@ class ScanCheckpointTests(unittest.TestCase):
             (root / "escape.bin").symlink_to(outside)
             with self.assertRaisesRegex(RuntimeError, "symbolic-link file"):
                 self.coordinator._filesystem_manifest(root)
+
+    def test_incomplete_enumeration_preserves_checkpoints_and_blocks_manifest_update(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, Session(self.engine) as db:
+            blocked = Path(directory) / "unreadable"
+            blocked.mkdir()
+            (blocked / "payload.bin").write_bytes(b"unscanned data")
+            job = make_job("job-enumeration")
+            run = ScanRun(job_id=job.id, worker_id="worker")
+            db.add_all([job, run])
+            db.commit()
+            self.coordinator._prepare_manifest(db, job, run, directory, identity())
+            original_scandir = os.scandir
+
+            for code in (errno.EACCES, errno.EIO, errno.ENOENT):
+                with self.subTest(errno=code):
+                    def scandir(path):
+                        if Path(path) == blocked:
+                            raise OSError(code, os.strerror(code), str(blocked))
+                        return original_scandir(path)
+
+                    with patch("app.scan_coordinator.os.scandir", side_effect=scandir):
+                        with self.assertRaisesRegex(RuntimeError, "enumeration failed at .*unreadable"):
+                            self.coordinator._prepare_manifest(db, job, run, directory, identity())
+                    rows = list(db.scalars(select(ScanFile).where(ScanFile.job_id == job.id)))
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0].relative_path, "unreadable/payload.bin")
+                    self.assertEqual(rows[0].status, "pending")
+                    self.assertEqual(run.total_files, 1)
+                    self.assertEqual(run.completed_files, 0)
 
     def test_definition_update_preserves_checkpoint_but_engine_update_resets_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory, Session(self.engine) as db:

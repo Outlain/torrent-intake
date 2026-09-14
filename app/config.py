@@ -37,7 +37,7 @@ class Settings(BaseSettings):
 
     scanner_backend: Literal["clamd"] = "clamd"
     clamd_socket_path: str = "/run/clamav/clamd.sock"
-    scanner_policy_version: str = "clamav-policy-v4-parallel-adaptive-media"
+    scanner_policy_version: str = "clamav-policy-v5-media-attachments"
     scanner_max_file_mib: int = 2000
     scanner_health_cache_seconds: int = 15
     scanner_connect_timeout_seconds: int = 5
@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     large_media_probe_timeout_seconds: int = 120
     large_media_scan_timeout_seconds: int = 172800
     ffprobe_binary: str = "/usr/bin/ffprobe"
+    ffmpeg_binary: str = "/usr/bin/ffmpeg"
+    media_attachment_max_mib: int = 16
+    media_attachment_total_mib: int = 64
     per_job_scan_workers: int = 1
     clamd_max_inflight_requests: int = 4
     max_concurrent_scans: int = 2

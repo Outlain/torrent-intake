@@ -7,7 +7,7 @@ import re
 import socket
 import stat
 import struct
-import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -15,8 +15,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from subprocess import CompletedProcess
 
 from .config import get_settings
+from .media_tools import MAX_SINGLE_ALLOCATION_BYTES, MAX_STDOUT_BYTES, MediaToolError, run_media_tool
 
 VERSION_PATTERN = re.compile(r"ClamAV\s+([^/\s]+)/([^/\s]+)/([^\r\n]+)", re.IGNORECASE)
 LIMIT_DETECTION_MARKERS = (
@@ -28,11 +30,12 @@ LIMIT_DETECTION_MARKERS = (
 )
 STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_REPLY_BYTES = 1024 * 1024
-MAX_FFPROBE_OUTPUT_BYTES = 1024 * 1024
 FileIdentity = tuple[int, int, int, int, int]
+SCANNER_IMPLEMENTATION_POLICY = "bounded-media-attachments-v1"
 
 LARGE_VIDEO_FORMATS = frozenset(
     {
+        "asf",
         "avi",
         "flv",
         "matroska",
@@ -47,6 +50,8 @@ LARGE_VIDEO_FORMATS = frozenset(
 LARGE_TRUEHD_FORMAT = "truehd"
 LARGE_TRUEHD_SUFFIXES = frozenset({".thd", ".truehd"})
 LARGE_MEDIA_STREAM_TYPES = frozenset({"audio", "attachment", "subtitle", "video"})
+KODI_METADATA_FILENAMES = frozenset({"kodi-metadata", "kodi-override-metadata"})
+KODI_METADATA_MIMETYPES = frozenset({"application/xml", "text/xml", "text/plain"})
 SAFE_ATTACHMENT_SUFFIXES = frozenset(
     {
         ".ass",
@@ -122,6 +127,20 @@ class _WindowScanOutcome:
     replies: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MediaAttachment:
+    index: int
+    filename: str
+    size_bytes: int | None
+    is_picture: bool = False
+
+
+@dataclass(frozen=True)
+class MediaProbe:
+    format_name: str
+    attachments: tuple[MediaAttachment, ...] = ()
+
+
 class ScanInterrupted(RuntimeError):
     pass
 
@@ -144,6 +163,18 @@ class ScannerPolicyError(RuntimeError):
 
 class ScannerLimitError(ScannerPolicyError):
     """ClamD reached a configured inspection limit without a clean verdict."""
+
+    def __init__(self, message: str, *, limit_name: str = "unknown") -> None:
+        super().__init__(message)
+        self.limit_name = limit_name
+
+    @property
+    def can_subdivide(self) -> bool:
+        return self.limit_name in {"maxfilesize", "streammaxlength"}
+
+    @property
+    def can_use_media_fallback(self) -> bool:
+        return self.can_subdivide or self.limit_name == "maxscansize"
 
 
 def parse_scanner_version(raw_output: str) -> tuple[str | None, str | None, datetime | None]:
@@ -172,14 +203,24 @@ def parse_scan_response(response: str) -> tuple[bool, str | None]:
     if not response:
         raise RuntimeError("scanner returned an empty response")
     if any(marker in response.casefold() for marker in LIMIT_DETECTION_MARKERS):
+        match = re.search(r"Heuristics\.Limits\.Exceeded\.(\w+)", response, re.IGNORECASE)
+        limit_name = match.group(1).casefold() if match else "unknown"
+        if "instream size limit exceeded" in response.casefold():
+            limit_name = "streammaxlength"
         raise ScannerLimitError(
             "ClamAV could not fully inspect this file because a configured limit was exceeded: "
-            f"{response[:500]}"
+            f"{response[:500]}", limit_name=limit_name,
         )
     if response.endswith(": OK") or response == "OK":
         return False, None
     if response.endswith(" FOUND"):
         threat_name = response.rsplit(": ", 1)[-1].removesuffix(" FOUND").strip() or "unknown"
+        if threat_name.casefold().startswith((
+            "heuristics.encrypted.", "heuristics.broken.", "broken.executable", "broken.media",
+        )):
+            raise ScannerPolicyError(
+                f"ClamAV reported encrypted or malformed content requiring review, not a malware verdict: {threat_name}"
+            )
         return True, threat_name
     if response.endswith(" ERROR"):
         raise RuntimeError(f"scanner could not inspect the file: {response}")
@@ -241,7 +282,14 @@ def split_large_media_window(
     return (offset, left_length), (right_offset, right_length)
 
 
-def parse_large_media_probe(raw_output: str, path: str) -> str:
+def parse_large_media_probe(
+    raw_output: str,
+    path: str,
+    *,
+    require_video: bool = True,
+    attachment_max_bytes: int = 16 * 1024 * 1024,
+    attachment_total_bytes: int = 64 * 1024 * 1024,
+) -> MediaProbe:
     try:
         payload = json.loads(raw_output)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -290,10 +338,12 @@ def parse_large_media_probe(raw_output: str, path: str) -> str:
             raise ScannerPolicyError(
                 f"raw TrueHD content must contain exactly one TrueHD audio stream: {path}"
             )
-        return LARGE_TRUEHD_FORMAT
+        return MediaProbe(LARGE_TRUEHD_FORMAT)
 
     video_streams = 0
-    attachment_streams = 0
+    attachments: list[MediaAttachment] = []
+    reserved_attachment_bytes = 0
+    attachment_indices: set[int] = set()
     for stream in streams:
         if not isinstance(stream, dict):
             raise ScannerPolicyError(
@@ -304,25 +354,53 @@ def parse_large_media_probe(raw_output: str, path: str) -> str:
             raise ScannerPolicyError(
                 f"oversized media contains unsupported stream type {stream_type or 'unknown'}: {path}"
             )
-        if stream_type == "video":
+        disposition = stream.get("disposition")
+        is_picture = isinstance(disposition, dict) and disposition.get("attached_pic") == 1
+        if is_picture and stream_type != "video":
+            raise ScannerPolicyError(f"media has an invalid attached-picture stream: {path}")
+        if stream_type == "video" and not is_picture:
             video_streams += 1
-        if stream_type == "attachment":
-            attachment_streams += 1
-            if attachment_streams > 64:
+        if stream_type == "attachment" or is_picture:
+            if len(attachments) >= 64:
                 raise ScannerPolicyError(
                     f"oversized media contains too many attachments: {path}"
                 )
             tags = stream.get("tags")
             filename = tags.get("filename") if isinstance(tags, dict) else None
+            mimetype = tags.get("mimetype") if isinstance(tags, dict) else None
             suffix = os.path.splitext(str(filename or ""))[1].casefold()
-            if suffix not in SAFE_ATTACHMENT_SUFFIXES:
+            is_kodi_metadata = (
+                "matroska" in approved_video_formats
+                and str(filename or "") in KODI_METADATA_FILENAMES
+                and str(mimetype or "").split(";", 1)[0].strip().casefold()
+                in KODI_METADATA_MIMETYPES
+            )
+            if suffix not in SAFE_ATTACHMENT_SUFFIXES and not is_kodi_metadata:
                 raise ScannerPolicyError(
                     "oversized media contains an attachment that is not a recognized font, "
-                    f"image, subtitle, or text file ({filename or 'unnamed'}): {path}"
+                    "image, subtitle, text file, or named Kodi text/XML metadata "
+                    f"({filename or 'unnamed'}; MIME={mimetype or 'missing'}): {path}"
                 )
-    if video_streams == 0:
+            index = stream.get("index")
+            if type(index) is not int or index < 0 or index in attachment_indices:
+                raise ScannerPolicyError(f"media attachment has an invalid or duplicate stream index: {path}")
+            attachment_indices.add(index)
+            size = stream.get("extradata_size")
+            if is_picture:
+                # Cover art is an attached packet, not codec extradata. Reserve
+                # its full per-attachment allowance before starting extraction.
+                size = None
+                reserved_attachment_bytes += attachment_max_bytes
+            else:
+                if type(size) is not int or not 0 < size <= attachment_max_bytes:
+                    raise ScannerPolicyError(f"media attachment has a missing, empty, or excessive size: {filename}: {path}")
+                reserved_attachment_bytes += size
+            if reserved_attachment_bytes > attachment_total_bytes:
+                raise ScannerPolicyError(f"media attachments exceed the total extraction budget: {path}")
+            attachments.append(MediaAttachment(index, str(filename), size, is_picture))
+    if require_video and video_streams == 0:
         raise ScannerPolicyError(f"oversized container does not contain a video stream: {path}")
-    return ",".join(sorted(approved_video_formats))
+    return MediaProbe(",".join(sorted(approved_video_formats)), tuple(attachments))
 
 
 class ScannerService:
@@ -337,6 +415,7 @@ class ScannerService:
 
     def policy_version(self) -> str:
         policy = {
+            "implementation": SCANNER_IMPLEMENTATION_POLICY,
             "backend": "clamd-instream",
             "max_file_bytes": self.settings.scanner_max_file_bytes,
             "large_media_enabled": self.settings.large_media_enabled,
@@ -345,6 +424,8 @@ class ScannerService:
             "large_media_min_chunk_bytes": self.settings.large_media_min_chunk_bytes,
             "large_media_overlap_bytes": self.settings.large_media_overlap_bytes,
             "policy_version": self.settings.scanner_policy_version,
+            "media_attachment_max_mib": self.settings.media_attachment_max_mib,
+            "media_attachment_total_mib": self.settings.media_attachment_total_mib,
         }
         fingerprint = hashlib.sha256(
             json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -407,6 +488,7 @@ class ScannerService:
                 raise ScanInterrupted("scan interrupted before the current file started")
             started_at = datetime.utcnow()
             started = time.monotonic()
+            native_deadline = started + max(self.settings.scanner_scan_timeout_seconds, 60)
             if initial_stat.st_size <= self.settings.scanner_max_file_bytes:
                 try:
                     infected, threat_name, output = self._scan_descriptor(
@@ -415,9 +497,12 @@ class ScannerService:
                         expected,
                         heartbeat=heartbeat,
                         should_stop=should_stop,
+                        deadline=native_deadline,
                     )
                     scan_method = "clamd_native"
                 except ScannerLimitError as native_limit:
+                    if not native_limit.can_use_media_fallback:
+                        raise
                     # MaxScanSize accounts for parser/expanded content, so a
                     # file below the raw native-size boundary can still reach
                     # it. Retry only through the media route: that route first
@@ -438,7 +523,23 @@ class ScannerService:
                     output = (
                         f"native-limit fallback ({native_limit}); {output}"
                     )[:MAX_REPLY_BYTES]
-                    scan_method = "large_media_parallel_adaptive_windows"
+                    scan_method = "media_windows_and_attachments"
+                else:
+                    # Matroska attachments are not necessarily extracted by
+                    # ClamAV's native scan. Inspect them even below 2000 MiB.
+                    if not infected and os.pread(descriptor, 4, 0) == b"\x1aE\xdf\xa3":
+                        deadline = native_deadline
+                        probe = self._probe_large_media_descriptor(
+                            descriptor, path, deadline=deadline, require_video=False,
+                            heartbeat=heartbeat, should_stop=should_stop,
+                        )
+                        infected, threat_name, attachment_output = self._scan_media_attachments(
+                            descriptor, path, expected, probe, deadline=deadline,
+                            heartbeat=heartbeat, should_stop=should_stop,
+                        )
+                        if probe.attachments:
+                            scan_method = "clamd_native_with_attachments"
+                            output = f"{output}; {attachment_output}"
             else:
                 infected, threat_name, output = self._scan_large_media_descriptor(
                     descriptor,
@@ -447,7 +548,8 @@ class ScannerService:
                     heartbeat=heartbeat,
                     should_stop=should_stop,
                 )
-                scan_method = "large_media_parallel_adaptive_windows"
+                scan_method = "media_windows_and_attachments"
+            self._verify_file_identity(descriptor, path, expected)
             return ScanResult(
                 clean=not infected,
                 infected=infected,
@@ -563,14 +665,13 @@ class ScannerService:
                 "TI_PER_JOB_SCAN_WORKERS must be positive and no larger than "
                 "TI_CLAMD_MAX_INFLIGHT_REQUESTS"
             )
-        if self.settings.large_media_enabled and (
-            not os.path.isabs(self.settings.ffprobe_binary)
-            or not os.access(self.settings.ffprobe_binary, os.X_OK)
-        ):
-            raise ScannerPolicyError(
-                f"TI_FFPROBE_BINARY is not an executable absolute path: "
-                f"{self.settings.ffprobe_binary}"
-            )
+        if not 1 <= self.settings.media_attachment_max_mib <= 64:
+            raise ScannerPolicyError("TI_MEDIA_ATTACHMENT_MAX_MIB must be between 1 and 64")
+        if not self.settings.media_attachment_max_mib <= self.settings.media_attachment_total_mib <= 256:
+            raise ScannerPolicyError("TI_MEDIA_ATTACHMENT_TOTAL_MIB must cover one attachment and be at most 256")
+        for binary in (self.settings.ffprobe_binary, self.settings.ffmpeg_binary):
+            if not os.path.isabs(binary) or not os.access(binary, os.X_OK):
+                raise ScannerPolicyError(f"media inspection tool is not an executable absolute path: {binary}")
 
     def _version_output(self) -> str:
         return self._clamd_request("VERSION")
@@ -596,9 +697,10 @@ class ScannerService:
         *,
         heartbeat: Callable[[], bool] | None,
         should_stop: Callable[[], bool] | None,
+        deadline: float | None = None,
     ) -> tuple[bool, str | None, str]:
         timeout = max(int(self.settings.scanner_scan_timeout_seconds), 60)
-        deadline = time.monotonic() + timeout
+        deadline = min(deadline or float("inf"), time.monotonic() + timeout)
         raw_reply = self._scan_descriptor_window(
             descriptor,
             offset=0,
@@ -644,8 +746,16 @@ class ScannerService:
 
         timeout = max(int(self.settings.large_media_scan_timeout_seconds), 60)
         deadline = time.monotonic() + timeout
-        media_format = self._probe_large_media_descriptor(descriptor, path, deadline=deadline)
+        probe = self._probe_large_media_descriptor(
+            descriptor, path, deadline=deadline, heartbeat=heartbeat, should_stop=should_stop,
+        )
         self._verify_file_identity(descriptor, path, expected)
+        infected, threat, attachment_output = self._scan_media_attachments(
+            descriptor, path, expected, probe, deadline=deadline,
+            heartbeat=heartbeat, should_stop=should_stop,
+        )
+        if infected:
+            return infected, threat, attachment_output
 
         cancellation = threading.Event()
         shared_heartbeat = self._shared_parallel_heartbeat(heartbeat)
@@ -700,8 +810,9 @@ class ScannerService:
 
         replies = [reply for index in sorted(outcomes) for reply in outcomes[index].replies]
         return False, None, (
-            f"large-media format={media_format} initial_windows={len(ranges)} "
+            f"large-media format={probe.format_name} initial_windows={len(ranges)} "
             f"clamd_requests={len(replies)} workers={worker_count} coverage=all-bytes; "
+            f"{attachment_output}; "
             + "; ".join(replies)
         )[:MAX_REPLY_BYTES]
 
@@ -746,6 +857,12 @@ class ScannerService:
         try:
             infected, threat_name = parse_scan_response(output)
         except ScannerLimitError as exc:
+            if not exc.can_subdivide:
+                raise ScannerPolicyError(
+                    f"ClamAV could not inspect a media window ({exc.limit_name}); "
+                    "expansion, recursion, and unknown limits cannot be resolved by splitting: "
+                    f"{exc}"
+                ) from exc
             split = split_large_media_window(
                 offset,
                 length,
@@ -822,49 +939,135 @@ class ScannerService:
         path: str,
         *,
         deadline: float | None = None,
-    ) -> str:
+        require_video: bool = True,
+        heartbeat: Callable[[], bool] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> MediaProbe:
         command = [
             self.settings.ffprobe_binary,
             "-v",
             "error",
+            "-threads", "1",
+            "-max_alloc", str(MAX_SINGLE_ALLOCATION_BYTES),
             "-protocol_whitelist",
             "file,pipe",
+            "-format_whitelist", ",".join(sorted(LARGE_VIDEO_FORMATS | {LARGE_TRUEHD_FORMAT})),
             "-show_entries",
-            "format=format_name:stream=index,codec_type,codec_name:stream_tags=filename,mimetype",
+            "format=format_name:stream=index,codec_type,codec_name,extradata_size:"
+            "stream_tags=filename,mimetype:stream_disposition=attached_pic",
             "-of",
             "json",
             f"/proc/self/fd/{descriptor}",
         ]
-        probe_timeout = max(float(self.settings.large_media_probe_timeout_seconds), 1.0)
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ScannerPolicyError(f"oversized media validation timed out: {path}")
-            probe_timeout = min(probe_timeout, remaining)
+        completed = self._run_media_tool(
+            command, descriptor, path, deadline=deadline or float("inf"),
+            heartbeat=heartbeat, should_stop=should_stop,
+        )
         try:
-            completed = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=probe_timeout,
-                check=False,
-                pass_fds=(descriptor,),
+            description = completed.stdout.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise ScannerPolicyError(f"ffprobe returned an invalid media description: {path}") from exc
+        return parse_large_media_probe(
+            description, path, require_video=require_video,
+            attachment_max_bytes=self.settings.media_attachment_max_mib * 1024 * 1024,
+            attachment_total_bytes=self.settings.media_attachment_total_mib * 1024 * 1024,
+        )
+
+    def _run_media_tool(
+        self, command: list[str], descriptor: int, path: str, *, deadline: float,
+        heartbeat: Callable[[], bool] | None, should_stop: Callable[[], bool] | None,
+        cwd: str | None = None,
+        max_stdout_bytes: int = MAX_STDOUT_BYTES,
+    ) -> CompletedProcess[bytes]:
+        next_heartbeat = 0.0
+
+        def check_active() -> None:
+            nonlocal next_heartbeat
+            if should_stop and should_stop():
+                raise ScanInterrupted("scan interrupted during media inspection")
+            if time.monotonic() >= next_heartbeat:
+                if heartbeat and not heartbeat():
+                    raise ScanInterrupted("scan lease was lost during media inspection")
+                next_heartbeat = time.monotonic() + 5
+
+        tool_deadline = min(deadline, time.monotonic() + max(self.settings.large_media_probe_timeout_seconds, 1))
+        try:
+            completed = run_media_tool(
+                command, descriptor=descriptor, deadline=tool_deadline,
+                max_file_bytes=0, max_stdout_bytes=max_stdout_bytes,
+                check_active=check_active, cwd=cwd,
             )
-        except FileNotFoundError as exc:
-            raise ScannerUnavailable(
-                f"large-media validation is unavailable because ffprobe was not found: {exc}"
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise ScannerPolicyError(f"oversized media validation timed out: {path}") from exc
-        if len(completed.stdout.encode("utf-8", "replace")) > MAX_FFPROBE_OUTPUT_BYTES:
-            raise ScannerPolicyError(f"oversized media has an excessive stream description: {path}")
+        except (OSError, MediaToolError) as exc:
+            raise ScannerPolicyError(f"bounded media inspection failed: {exc}: {path}") from exc
         if completed.returncode != 0:
-            detail = " ".join(completed.stderr.strip().split())[:500]
+            detail = " ".join(completed.stderr.decode("utf-8", "replace").strip().split())[:500]
             raise ScannerPolicyError(
-                f"oversized file failed media-container validation{': ' + detail if detail else ''}: {path}"
+                f"media inspection/extraction failed (exit={completed.returncode})"
+                f"{': ' + detail if detail else ''}: {path}"
             )
-        return parse_large_media_probe(completed.stdout, path)
+        return completed
+
+    def _scan_media_attachments(
+        self, descriptor: int, path: str, expected: FileIdentity, probe: MediaProbe, *,
+        deadline: float, heartbeat: Callable[[], bool] | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> tuple[bool, str | None, str]:
+        self._verify_file_identity(descriptor, path, expected)
+        if not probe.attachments:
+            return False, None, "attachments=0"
+        total_bytes = 0
+        for attachment in probe.attachments:
+            maximum = min(
+                self.settings.media_attachment_max_mib * 1024 * 1024,
+                self.settings.media_attachment_total_mib * 1024 * 1024 - total_bytes,
+                self.settings.scanner_max_file_bytes,
+            )
+            if attachment.size_bytes is not None:
+                maximum = min(maximum, attachment.size_bytes)
+            if maximum <= 0:
+                raise ScannerPolicyError(f"media attachments exceed the total extraction budget: {path}")
+            command = [
+                self.settings.ffmpeg_binary, "-v", "error", "-nostdin", "-n",
+                "-max_alloc", str(MAX_SINGLE_ALLOCATION_BYTES),
+                "-protocol_whitelist", "file,pipe",
+                "-format_whitelist", ",".join(sorted(LARGE_VIDEO_FORMATS | {LARGE_TRUEHD_FORMAT})),
+                "-threads", "1",
+            ]
+            if not attachment.is_picture:
+                command += [f"-dump_attachment:{attachment.index}", "pipe:1"]
+            command += ["-i", f"/proc/self/fd/{descriptor}"]
+            if attachment.is_picture:
+                command += [
+                    "-map", f"0:{attachment.index}", "-c", "copy", "-frames:v", "1",
+                    "-f", "image2pipe", "pipe:1",
+                ]
+            else:
+                # Complete header/attachment extraction without decoding a movie.
+                command += ["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-t", "0", "-f", "null", "-"]
+            completed = self._run_media_tool(
+                command, descriptor, path, deadline=deadline, heartbeat=heartbeat,
+                should_stop=should_stop, max_stdout_bytes=maximum,
+            )
+            self._verify_file_identity(descriptor, path, expected)
+            size = len(completed.stdout)
+            if not 0 < size <= maximum or (attachment.size_bytes is not None and size != attachment.size_bytes):
+                raise ScannerPolicyError(f"media attachment extraction was incomplete: stream={attachment.index}: {path}")
+            total_bytes += size
+            # Only one bounded, application-named temporary file exists at a
+            # time. Embedded filenames are never passed to filesystem APIs.
+            with tempfile.NamedTemporaryFile(prefix="ti-attachment-") as target:
+                target.write(completed.stdout)
+                target.flush()
+                info = os.fstat(target.fileno())
+                # Never subdivide an attachment or send it to media fallback.
+                infected, threat, _ = self._scan_descriptor(
+                    target.fileno(), target.name, file_identity(info), deadline=deadline,
+                    heartbeat=heartbeat, should_stop=should_stop,
+                )
+                self._verify_file_identity(descriptor, path, expected)
+                if infected:
+                    return True, threat, f"attachment stream={attachment.index} threat={threat}"
+        return False, None, f"attachments={len(probe.attachments)} attachment_bytes={total_bytes}"
 
     def _scan_descriptor_window(
         self,

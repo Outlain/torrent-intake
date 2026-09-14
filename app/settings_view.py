@@ -223,13 +223,13 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "large_media_min_chunk_mib": SettingSpec(
         "ClamAV scanner",
         "Minimum adaptive media window",
-        "Smallest MiB window allowed when ClamD reaches a parser or expanded-data limit and Torrent Intake safely subdivides that range.",
+        "Smallest MiB window allowed for a raw stream/file size limit. Expansion, recursion, and unknown limits within a window remain blocked instead of being subdivided.",
         safety_critical=True,
     ),
     "large_media_overlap_kib": SettingSpec(
         "ClamAV scanner",
         "Large-media window overlap",
-        "KiB repeated between neighboring windows so signatures crossing a window boundary are still visible.",
+        "KiB repeated between neighboring windows to preserve short byte signatures at boundaries; this cannot preserve every signature or container parser context.",
         safety_critical=True,
     ),
     "large_media_probe_timeout_seconds": SettingSpec(
@@ -246,6 +246,21 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         "ClamAV scanner",
         "ffprobe executable",
         "Image-provided ffprobe path used to validate oversized media. The Docker image installs it at build time.",
+        safety_critical=True,
+    ),
+    "ffmpeg_binary": SettingSpec(
+        "ClamAV scanner", "ffmpeg executable",
+        "Image-provided tool for bounded attachment extraction. It does not transcode movies or unpack torrent archives.",
+        safety_critical=True,
+    ),
+    "media_attachment_max_mib": SettingSpec(
+        "ClamAV scanner", "Maximum attachment size",
+        "MiB allowed for one extracted attachment, between 1 and 64. Each attachment must complete a native ClamD scan; it is never chunked or skipped.",
+        safety_critical=True,
+    ),
+    "media_attachment_total_mib": SettingSpec(
+        "ClamAV scanner", "Total attachment budget",
+        "Maximum MiB extracted from one media file, at most 256. Cover images reserve their per-attachment maximum because their size is unknown before extraction.",
         safety_critical=True,
     ),
     "per_job_scan_workers": SettingSpec(

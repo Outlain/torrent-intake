@@ -14,6 +14,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 from app.scanner import (
+    MediaProbe,
     ScannerUnavailable,
     ScannerIdentity,
     ScannerLimitError,
@@ -62,14 +63,16 @@ class ScannerParsingTests(unittest.TestCase):
             "streams": [
                 {"codec_type": "video", "codec_name": "hevc"},
                 {
+                    "index": 1,
                     "codec_type": "attachment",
                     "codec_name": "ttf",
+                    "extradata_size": 1024,
                     "tags": {"filename": "subtitle-font.ttf"},
                 },
             ],
         }
         self.assertEqual(
-            parse_large_media_probe(json.dumps(payload), "/downloads/movie.mkv"),
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.mkv").format_name,
             "matroska,webm",
         )
 
@@ -86,7 +89,7 @@ class ScannerParsingTests(unittest.TestCase):
             ],
         }
         self.assertEqual(
-            parse_large_media_probe(json.dumps(payload), "/downloads/movie.flv"),
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.flv").format_name,
             "flv",
         )
 
@@ -94,17 +97,77 @@ class ScannerParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ScannerPolicyError, "unsupported stream type"):
             parse_large_media_probe(json.dumps(payload), "/downloads/movie.flv")
 
+    def test_large_media_probe_accepts_asf_bytes_with_an_avi_filename(self) -> None:
+        payload = {
+            "format": {"format_name": "asf"},
+            "streams": [
+                {"codec_type": "video", "codec_name": "msmpeg4v3"},
+                {"codec_type": "audio", "codec_name": "wmav2"},
+            ],
+        }
+        self.assertEqual(
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.avi").format_name,
+            "asf",
+        )
+        payload["streams"].append({"codec_type": "data"})
+        with self.assertRaisesRegex(ScannerPolicyError, "unsupported stream type"):
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.avi")
+        payload["streams"] = [{"codec_type": "audio", "codec_name": "wmav2"}]
+        with self.assertRaisesRegex(ScannerPolicyError, "video stream"):
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.avi")
+
+    def test_large_media_probe_accepts_named_kodi_text_metadata_in_matroska(self) -> None:
+        for filename in ("kodi-metadata", "kodi-override-metadata"):
+            for mimetype in ("application/xml", "text/xml", "text/plain", "Text/XML; charset=utf-8"):
+                with self.subTest(filename=filename, mimetype=mimetype):
+                    payload = {
+                        "format": {"format_name": "matroska,webm"},
+                        "streams": [
+                            {"codec_type": "video", "codec_name": "hevc"},
+                            {"index": 1, "codec_type": "attachment", "extradata_size": 1024, "tags": {
+                                "filename": filename, "mimetype": mimetype,
+                            }},
+                        ],
+                    }
+                    self.assertEqual(
+                        parse_large_media_probe(json.dumps(payload), "/downloads/movie.mkv").format_name,
+                        "matroska,webm",
+                    )
+
+    def test_kodi_attachment_rule_does_not_accept_arbitrary_names_types_or_formats(self) -> None:
+        for filename, mimetype, format_name in (
+            ("kodi-metadata", "", "matroska,webm"),
+            ("kodi-metadata", "application/octet-stream", "matroska,webm"),
+            ("kodi-metadata", "application/x-msdownload", "matroska,webm"),
+            ("kodi-metadata.exe", "application/xml", "matroska,webm"),
+            ("../kodi-metadata", "application/xml", "matroska,webm"),
+            ("other-metadata", "application/xml", "matroska,webm"),
+            ("kodi-metadata", "application/xml", "asf"),
+        ):
+            with self.subTest(filename=filename, mimetype=mimetype, format_name=format_name):
+                payload = {
+                    "format": {"format_name": format_name},
+                    "streams": [
+                        {"codec_type": "video"},
+                        {"codec_type": "attachment", "tags": {
+                            "filename": filename, "mimetype": mimetype,
+                        }},
+                    ],
+                }
+                with self.assertRaisesRegex(ScannerPolicyError, "attachment"):
+                    parse_large_media_probe(json.dumps(payload), "/downloads/movie.mkv")
+
     def test_large_media_probe_accepts_only_strict_raw_truehd_audio(self) -> None:
         payload = {
             "format": {"format_name": "truehd"},
             "streams": [{"codec_type": "audio", "codec_name": "truehd"}],
         }
         self.assertEqual(
-            parse_large_media_probe(json.dumps(payload), "/downloads/movie.en.thd"),
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.en.thd").format_name,
             "truehd",
         )
         self.assertEqual(
-            parse_large_media_probe(json.dumps(payload), "/downloads/movie.truehd"),
+            parse_large_media_probe(json.dumps(payload), "/downloads/movie.truehd").format_name,
             "truehd",
         )
 
@@ -232,7 +295,7 @@ class ScannerHealthTests(unittest.TestCase):
                 ):
                     result = service.scan_path(str(path), identity=identity)
                 self.assertTrue(result.clean)
-                self.assertEqual(result.scan_method, "large_media_parallel_adaptive_windows")
+                self.assertEqual(result.scan_method, "media_windows_and_attachments")
                 large_scan.assert_called_once()
                 native_scan.assert_not_called()
             finally:
@@ -260,14 +323,14 @@ class ScannerHealthTests(unittest.TestCase):
                         b"stream: OK",
                     ],
                 ) as stream_scan,
-                patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                patch.object(service, "_probe_large_media_descriptor", return_value=MediaProbe("matroska")),
             ):
                 result = service.scan_path(str(path), identity=identity)
 
             self.assertEqual(stream_scan.call_count, 2)
             self.assertEqual([call.kwargs["offset"] for call in stream_scan.call_args_list], [0, 0])
             self.assertTrue(result.clean)
-            self.assertEqual(result.scan_method, "large_media_parallel_adaptive_windows")
+            self.assertEqual(result.scan_method, "media_windows_and_attachments")
             self.assertIn("native-limit fallback", result.raw_output)
 
     def test_native_scan_limit_keeps_non_media_fallback_held(self) -> None:
@@ -288,7 +351,7 @@ class ScannerHealthTests(unittest.TestCase):
                     service,
                     "_scan_descriptor",
                     side_effect=ScannerLimitError(
-                        "ClamAV limit: Heuristics.Limits.Exceeded.MaxScanSize"
+                        "ClamAV limit: Heuristics.Limits.Exceeded.MaxScanSize", limit_name="maxscansize",
                     ),
                 ),
                 patch.object(
@@ -316,7 +379,7 @@ class InStreamTests(unittest.TestCase):
                 planned = [(0, 10), (8, 10), (16, 10)]
                 with (
                     patch("app.scanner.large_media_window_ranges", return_value=planned),
-                    patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                    patch.object(service, "_probe_large_media_descriptor", return_value=MediaProbe("matroska")),
                     patch.object(
                         service,
                         "_scan_descriptor_window",
@@ -380,7 +443,7 @@ class InStreamTests(unittest.TestCase):
                         "app.scanner.large_media_window_ranges",
                         return_value=[(0, 10), (4, 10), (8, 10), (16, 10)],
                     ),
-                    patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                    patch.object(service, "_probe_large_media_descriptor", return_value=MediaProbe("matroska")),
                     patch.object(service, "_scan_descriptor_window", side_effect=scan_window),
                 ):
                     infected, threat, output = service._scan_large_media_descriptor(
@@ -419,7 +482,7 @@ class InStreamTests(unittest.TestCase):
             def scan_window(*_args, **kwargs) -> bytes:
                 lengths.append(kwargs["length"])
                 if kwargs["length"] > 2 * mebibyte:
-                    return b"stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND"
+                    return b"stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND"
                 return b"stream: OK"
 
             try:
@@ -428,7 +491,7 @@ class InStreamTests(unittest.TestCase):
                         "app.scanner.large_media_window_ranges",
                         return_value=[(0, 4 * mebibyte)],
                     ),
-                    patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                    patch.object(service, "_probe_large_media_descriptor", return_value=MediaProbe("matroska")),
                     patch.object(service, "_scan_descriptor_window", side_effect=scan_window),
                 ):
                     infected, threat, output = service._scan_large_media_descriptor(
@@ -472,11 +535,11 @@ class InStreamTests(unittest.TestCase):
                         "app.scanner.large_media_window_ranges",
                         return_value=[(0, mebibyte)],
                     ),
-                    patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                    patch.object(service, "_probe_large_media_descriptor", return_value=MediaProbe("matroska")),
                     patch.object(
                         service,
                         "_scan_descriptor_window",
-                        return_value=b"stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND",
+                        return_value=b"stream: Heuristics.Limits.Exceeded.MaxFileSize FOUND",
                     ),
                     self.assertRaisesRegex(ScannerPolicyError, "adaptive minimum window"),
                 ):
@@ -514,7 +577,7 @@ class InStreamTests(unittest.TestCase):
                         "app.scanner.large_media_window_ranges",
                         return_value=[(0, 10), (8, 10)],
                     ),
-                    patch.object(service, "_probe_large_media_descriptor", return_value="matroska"),
+                    patch.object(service, "_probe_large_media_descriptor", return_value=MediaProbe("matroska")),
                     patch.object(service, "_scan_descriptor_window", side_effect=scan_window),
                     self.assertRaisesRegex(RuntimeError, "simulated ClamD failure"),
                 ):

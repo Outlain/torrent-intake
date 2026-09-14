@@ -717,7 +717,13 @@ class ScanCoordinator:
 
         manifest: list[tuple[str, int, int, int, int, int]] = []
         files_seen = 0
-        for current_root, directories, filenames in os.walk(root):
+
+        def enumeration_failed(error: OSError) -> None:
+            raise RuntimeError(
+                f"scan file-list enumeration failed at {error.filename or root}: {error}"
+            ) from error
+
+        for current_root, directories, filenames in os.walk(root, onerror=enumeration_failed):
             if heartbeat and not heartbeat():
                 raise ScanInterrupted("scan lease was lost while preparing the manifest")
             current = Path(current_root)
