@@ -1,0 +1,46 @@
+/* The drawer uses the existing page palette and native form controls. */
+.settings-drawer { display: flex; flex-direction: column; overflow: hidden; }
+.settings-head { position: static; flex: 0 0 auto; }
+.settings-content { overflow-y: auto; min-height: 0; flex: 1; }
+.settings-content [hidden] { display: none !important; }
+.settings-access { padding: 16px; border: 1px solid var(--line); border-radius: 14px; }
+.settings-access p, #settings-backup p { color: var(--muted); line-height: 1.5; }
+.settings-access code, .setting-card code { overflow-wrap: anywhere; }
+.settings-inline { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.settings-inline input { flex: 1 1 200px; min-width: 0; }
+.settings-navigation { display: grid; gap: 8px; }
+.settings-content label { display: block; margin: 10px 0 6px; font-weight: 600; }
+.settings-content input:not([type=checkbox]), .settings-content select { width: 100%; box-sizing: border-box; min-width: 0; }
+.settings-content .settings-check { display: flex; gap: 10px; align-items: flex-start; font-weight: 500; line-height: 1.5; }
+.settings-check input { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 3px; }
+.settings-content button { min-height: 44px; white-space: normal; }
+.settings-content input:disabled, .settings-content select:disabled { opacity: .6; cursor: not-allowed; }
+.setting-card { min-width: 0; }
+.setting-card p, .setting-card label { margin: 0; }
+.setting-card-head { flex-wrap: wrap; }
+.setting-card h4 { flex: 1 1 150px; }
+.setting-active, .setting-pending { overflow-wrap: anywhere; font-size: .9rem; }
+.setting-pending { color: #f3c870; border-left: 3px solid #f3c870; padding-left: 8px; }
+.setting-lock-reason, .setting-details { color: var(--muted); font-size: .85rem; line-height: 1.5; overflow-wrap: anywhere; }
+.setting-details { margin-top: 12px; }
+.setting-details summary { cursor: pointer; }
+.setting-error, #admin-result.error, #qbt-test-result.error { color: #ffb7ac; }
+[aria-invalid=true] { outline: 2px solid #ffb7ac; }
+.settings-actions { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 24px; border-top: 1px solid var(--line); background: #0d1725; }
+.settings-actions span { flex: 1 1 160px; color: var(--muted); }
+.settings-actions button { min-height: 44px; }
+#settings-review-list { padding-left: 20px; }
+#settings-review-list li { margin-bottom: 10px; overflow-wrap: anywhere; }
+#settings-review button { margin: 8px 8px 0 0; }
+#setup-results { padding-left: 20px; overflow-wrap: anywhere; }
+#setup-results:empty, #admin-result:empty { display: none; }
+@media (max-width: 720px) {
+  .settings-head { padding: 12px 14px; }
+  .settings-head h2 { font-size: 1.3rem; }
+  .settings-head p { font-size: .85rem; }
+  .settings-content { padding: 14px; }
+  .settings-actions { padding: 10px 14px; }
+  .settings-actions span { flex-basis: 100%; }
+  .settings-actions button { flex: 1; }
+  .settings-list { grid-template-columns: minmax(0, 1fr); }
+}

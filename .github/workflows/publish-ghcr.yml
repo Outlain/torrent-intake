@@ -23,6 +23,9 @@ jobs:
       - name: Check Python syntax
         run: python3 -m py_compile app/*.py clamav/*.py
 
+      - name: Check settings editor JavaScript syntax
+        run: node --check templates/settings.js
+
       - name: Validate Compose examples
         run: |
           docker compose -f docker-compose.example.yml config --quiet

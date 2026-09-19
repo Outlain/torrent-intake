@@ -18,13 +18,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 from cryptography.exceptions import InvalidTag
-from pydantic import ValidationError
 from .admin import Controller
 from .backup import MAX_BACKUP_BYTES, MAX_DATABASE_BYTES, create_backup, database_path, database_size_bytes
-from .config import Settings, environment_settings, get_settings, persist_settings, saved_settings
+from .config import Settings, get_settings, persist_settings
 from .restore import stage_restore
-from .scanner import ScannerPolicyError
-from .state_files import read_private, write_private
+from .state_files import write_private
 from .db import Base, engine, get_db, upgrade_schema
 from .models import Job
 from .schemas import (
@@ -39,7 +37,9 @@ from .schemas import (
     ScannerSlotsUpdate,
 )
 from .service import JobService
-from .settings_view import build_settings_catalog, ui_editable
+from .settings_view import build_settings_catalog
+from .settings_editor import SettingsEditError, pending_settings, revision, validate_draft
+from .qbt import QbtService
 from .tags import MAX_CUSTOM_TAG_LENGTH, MAX_CUSTOM_TAGS, PRIVATE_JOB_TAG_PREFIX
 
 logging.basicConfig(
@@ -141,18 +141,95 @@ def controller_status():
 @app.get("/admin/status")
 def admin_status():
     try:
-        notes = read_private(Path(settings.data_dir) / "deployment-notes.txt").decode()
-    except FileNotFoundError:
-        notes = ""
-    try:
         database_bytes = database_size_bytes(settings)
     except (OSError, ValueError, sqlite3.DatabaseError):
         database_bytes = None
     return {
-        **controller.status(), "deployment_notes": notes,
-        "settings": build_settings_catalog(settings),
+        **controller.status(), "revision": revision(settings),
+        "settings": build_settings_catalog(settings, pending_settings(settings)),
         "backup": {"database_bytes": database_bytes, "database_limit_bytes": MAX_DATABASE_BYTES},
     }
+
+
+def _draft(payload: dict):
+    expected = payload.get("revision")
+    if expected is not None and expected != revision(settings):
+        raise HTTPException(status_code=409, detail="Settings changed in another session. Reload this page and review your changes again.")
+    try:
+        return validate_draft(settings, payload.get("settings"))
+    except SettingsEditError as exc:
+        raise HTTPException(status_code=exc.status, detail={"message": str(exc), "fields": exc.fields}) from exc
+
+
+@app.post("/admin/settings/review")
+async def review_local_settings(request: Request):
+    payload = await _admin_json(request)
+    async with controller.operation_lock:
+        if controller.status()["restart_required"]:
+            raise HTTPException(status_code=409, detail="Restart to apply the saved changes before editing again.")
+        _, changes = _draft(payload)
+        return {"changes": changes, "revision": revision(settings)}
+
+
+async def _connection_check(candidate: Settings) -> dict:
+    if not candidate.qbt_password or candidate.qbt_password.upper().startswith("REPLACE_"):
+        return {"name": "qBittorrent connection", "ok": False, "message": "Set the qBittorrent password in Connection settings."}
+    probe = QbtService()
+    probe.settings = candidate
+    try:
+        await asyncio.to_thread(probe.test_connection)
+        return {"name": "qBittorrent connection", "ok": True, "message": "Authentication and read-only API check succeeded. No torrents were changed."}
+    except Exception:
+        return {"name": "qBittorrent connection", "ok": False, "message": "Cannot authenticate or reach qBittorrent. Check its address, credentials, TLS and Docker network. No settings were saved."}
+
+
+@app.post("/admin/test-connection")
+async def test_qbt_connection(request: Request):
+    payload = await _admin_json(request)
+    async with controller.operation_lock:
+        updates = payload.get("settings", {})
+        if not isinstance(updates, dict) or set(updates) - {
+            "qbt_host", "qbt_username", "qbt_password", "qbt_web_url",
+            "qbt_request_timeout_seconds",
+        }:
+            raise HTTPException(status_code=422, detail="Only qBittorrent connection fields can be tested here.")
+        candidate = _draft({**payload, "settings": updates})[0] if updates else settings
+        return await _connection_check(candidate)
+
+
+def _storage_checks() -> list[dict]:
+    checks = []
+    paths = [settings.data_dir, settings.event_dir, settings.local_staging_root,
+             settings.nas_staging_root, settings.final_parent_prefix]
+    if settings.final_parent_prefixes:
+        paths.extend(path.strip() for path in settings.final_parent_prefixes.split(",") if path.strip())
+    if settings.infected_action == "quarantine":
+        paths.append(settings.quarantine_root)
+    for name in dict.fromkeys(paths):
+        try:
+            accessible = Path(name).is_dir() and os.access(name, os.R_OK | os.W_OK | os.X_OK)
+        except OSError:
+            accessible = False
+        checks.append({"name": f"Storage: {name}", "ok": accessible,
+                       "message": "Directory is accessible. Also verify the intended host mount in Portainer." if accessible else "Directory is missing or not readable/writable/searchable. Check its host mount and UID/GID permissions."})
+    return checks
+
+
+async def _readiness_checks() -> list[dict]:
+    checks = [await _connection_check(settings)]
+    try:
+        await asyncio.to_thread(service.scan_coordinator.scanner.require_healthy, force=True)
+        checks.append({"name": "ClamD and definitions", "ok": True, "message": "Private scanner connection and definition freshness checks passed."})
+    except Exception:
+        checks.append({"name": "ClamD and definitions", "ok": False, "message": "Check sidecar health, definitions and the shared private socket in Portainer."})
+    checks.extend(await asyncio.to_thread(_storage_checks))
+    return checks
+
+
+@app.post("/admin/checks")
+async def check_setup():
+    async with controller.operation_lock:
+        return {"checks": await _readiness_checks()}
 
 
 @app.post("/admin/pause")
@@ -169,15 +246,12 @@ async def resume_controller(request: Request):
     async with controller.operation_lock:
         try:
             controller.require_drained()
-            await asyncio.to_thread(service.scan_coordinator.scanner.require_healthy, force=True)
-            await asyncio.to_thread(service.qbt.list_torrents)
-            paths = [settings.local_staging_root, settings.nas_staging_root, *settings.allowed_final_parent_prefixes]
-            if settings.infected_action == "quarantine":
-                paths.append(settings.quarantine_root)
-            for name in paths:
-                if not Path(name).is_dir() or not os.access(name, os.R_OK | os.W_OK | os.X_OK):
-                    raise ValueError(f"Configured content directory is not accessible: {name}")
+            checks = await _readiness_checks()
+            if not all(check["ok"] for check in checks):
+                raise HTTPException(status_code=409, detail={"message": "Resume checks failed; the controller remains paused.", "checks": checks})
             return controller.resume()
+        except HTTPException:
+            raise
         except Exception:
             logger.warning("Controller resume checks failed; controller remains paused")
             raise HTTPException(status_code=409, detail="Resume checks failed. Verify settings, ClamD health, qBittorrent access, and all content mounts; the controller remains paused.")
@@ -186,36 +260,22 @@ async def resume_controller(request: Request):
 @app.post("/admin/settings")
 async def save_local_settings(request: Request):
     payload = await _admin_json(request)
-    updates = payload.get("settings")
-    if not isinstance(updates, dict) or not updates:
-        raise HTTPException(status_code=422, detail="Provide settings to update")
     async with controller.operation_lock:
         try:
             controller.require_drained()
-            overrides = environment_settings()
-            for name in updates:
-                if not ui_editable(name):
-                    raise ValueError("One or more settings are read-only; use the local file or deployment configuration")
-                if name in overrides:
-                    raise ValueError("An environment override is active; remove it and recreate the container before editing that setting here")
-            values = {**settings.model_dump(), **saved_settings(), **overrides, **updates}
-            candidate = Settings(**values)
-            for name in updates:
-                value = getattr(candidate, name)
-                if isinstance(value, int) and not isinstance(value, bool) and value < (0 if name in {"completion_grace_seconds", "local_free_space_buffer_gib"} else 1):
-                    raise ValueError("Numeric settings must be positive (grace periods and space reserves may be zero)")
-            scanner = service.scan_coordinator.scanner.__class__()
-            scanner.settings = candidate
-            scanner._validate_policy_configuration()
-            persist_settings(candidate)
+            candidate, changes = _draft(payload)
+            if not changes:
+                raise HTTPException(status_code=422, detail="No settings changed. Blank secret replacement fields preserve the current value.")
+            if any(change["advanced"] for change in changes) and payload.get("confirm_advanced") is not True:
+                raise HTTPException(status_code=409, detail="Advanced scanner changes require explicit confirmation.")
+            # Mark pending before the atomic replacement; a write error must not
+            # allow the old process to resume with a different saved policy.
             write_private(Path(settings.data_dir) / "restart-required", b"settings changed\n")
-        except ValidationError as exc:
-            fields = sorted({str(error["loc"][0]) for error in exc.errors(include_input=False)})
-            raise HTTPException(status_code=422, detail="Invalid setting values: " + ", ".join(fields))
+            persist_settings(candidate)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
-        except ScannerPolicyError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
+        except OSError:
+            raise HTTPException(status_code=409, detail="Could not save settings. Check the local data directory permissions and free space; Intake remains paused. Restart and verify the saved values before resuming.")
     return {"restart_required": True, "message": "Settings saved locally. Restart the container to apply them."}
 
 
@@ -586,7 +646,7 @@ def ui(request: Request, db: Session = Depends(get_db)):
             "title": settings.ui_title,
             "jobs": jobs,
             "settings": settings,
-            "settings_catalog": build_settings_catalog(settings),
+            "settings_catalog": build_settings_catalog(settings, pending_settings(settings)),
             "max_custom_tags": MAX_CUSTOM_TAGS,
             "max_custom_tag_length": MAX_CUSTOM_TAG_LENGTH,
             "private_job_tag_prefix": PRIVATE_JOB_TAG_PREFIX,

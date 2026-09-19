@@ -1,0 +1,108 @@
+<section id="settings-dialog" class="settings-dialog" aria-hidden="true" hidden>
+  <aside id="settings-drawer" class="settings-drawer" role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-describedby="settings-summary">
+    <header class="settings-head">
+      <div><h2 id="settings-title">Settings &amp; Help</h2><p id="settings-summary">Edit individual fields. Review, pause and save, restart in Portainer, then verify and resume.</p></div>
+      <button id="settings-close-button" class="button-secondary settings-close" type="button" aria-label="Close settings">×</button>
+    </header>
+    <div class="settings-content">
+      <section class="settings-access" aria-label="Administration">
+        <strong id="settings-access-state">View mode · unlock to edit</strong>
+        <p id="controller-state" role="status" aria-live="polite">Checking controller status…</p>
+        <div id="settings-unlock-fields">
+          <label for="admin-token-input">Administration token</label>
+          <div class="settings-inline"><input id="admin-token-input" type="password" autocomplete="off" placeholder="Paste your local token"><button id="admin-unlock" class="button-primary" type="button">Unlock administration</button></div>
+          <details><summary>Where do I find my token?</summary><p>Run this on the Docker VM:</p><code>docker exec torrent-intake cat /app/data/admin-token</code><p>Use HTTPS or a trusted localhost tunnel. The token is kept only in this page's memory, not browser storage. A fresh installation has its own token, including after restore.</p></details>
+        </div>
+        <div id="admin-controls" hidden>
+          <div class="settings-inline">
+            <button id="controller-pause" class="button-secondary" type="button">Pause Intake</button>
+            <button id="controller-resume" class="button-primary" type="button">Verify &amp; resume</button>
+            <button id="setup-check" class="button-secondary" type="button">Check setup</button>
+            <button id="admin-lock" class="button-secondary" type="button">Lock editing</button>
+          </div>
+          <p>Pausing stops Intake's management and scan workers, not qBittorrent downloads or moves already requested. Wait for “drained” before saving or backing up.</p>
+        </div>
+        <div id="settings-restart-guide" class="settings-callout" hidden><strong>Saved, awaiting restart</strong><p>The running process still has its old settings. In Portainer, restart <code>torrent-intake</code>. Reopen this page, unlock administration, then choose <strong>Verify &amp; resume</strong>. No Docker socket or automatic restart is used.</p></div>
+        <p id="admin-result" role="status" aria-live="polite"></p>
+        <ul id="setup-results" aria-live="polite"></ul>
+      </section>
+
+      <div class="settings-navigation">
+        <label for="settings-section">Section</label>
+        <select id="settings-section">
+          <option value="connection">qBittorrent connection</option><option value="storage">Downloads and storage</option>
+          <option value="scanner">Scanning</option><option value="general">General</option>
+          <option value="backup">Backup and restore</option><option value="deployment">Deployment information</option>
+        </select>
+        <label for="settings-search">Search all settings</label>
+        <input id="settings-search" class="settings-search" type="search" placeholder="Search by name, variable or purpose" autocomplete="off">
+      </div>
+      <p id="settings-no-results" hidden>No settings match your search.</p>
+
+      <div class="settings-groups">
+        {% for group in settings_catalog %}
+        <section class="settings-group" data-settings-group data-section="{{ group.id }}" {% if group.id != 'connection' %}hidden{% endif %}>
+          <header class="settings-group-head"><h3>{{ group.name }}</h3><p>{{ group.description }}</p></header>
+          {% if group.id == 'connection' %}
+          <div class="settings-inline"><button id="qbt-test" class="button-secondary" type="button" disabled>Test connection using these fields</button><span id="qbt-test-result" role="status"></span></div>
+          {% elif group.id == 'scanner' %}
+          <div class="settings-callout"><label class="settings-check"><input id="advanced-unlock" type="checkbox" disabled>Unlock advanced scanner fields for this page</label><p>Limits affect inspection coverage and resource use. Changes are validated and require a separate confirmation before saving. Scan-policy changes can require files to be rescanned.</p><button id="settings-runtime-controls-button" class="button-secondary" type="button">Go to live scan-queue controls</button></div>
+          {% elif group.id == 'deployment' %}
+          <div class="settings-callout"><strong>Docker deployment is separate from application settings.</strong><p>Host mount paths, ports, UID/GID, image tags and resource limits must be changed in Portainer. This app sees container paths, not the host mapping. Keep <code>/app/data</code> on local SSD storage.</p><p>The separate ClamD container controls <code>CLAMD_MAX_SCAN_SIZE_MIB</code>, its own definition-age limit and socket configuration. This UI cannot read or change those sidecar values. Application stream limits do not override them.</p><p>Retain your Compose/Portainer stack separately for disaster recovery. No YAML needs to be pasted here.</p></div>
+          {% endif %}
+          <div class="settings-list">
+            {% for item in group.settings if not item.legacy %}
+            <article class="setting-card{% if item.advanced %} safety-critical{% endif %}" id="setting-{{ item.name }}" data-setting-item data-name="{{ item.name }}" data-setting-search="{{ item.label }} {{ item.env_name }} {{ item.description }} {{ item.current }}">
+              <div class="setting-card-head"><h4>{{ item.label }}</h4><span class="setting-badge{% if item.advanced %} warning{% endif %}">{{ {'editable': 'Editable', 'advanced': 'Advanced lock', 'environment': 'Portainer override', 'deployment': 'Deployment-only'}[item.permission] }}</span></div>
+              <p class="setting-description" id="help-{{ item.name }}">{{ item.description }}</p>
+              <p class="setting-active">Active: <code data-active-value>{{ item.current }}</code></p>
+              <p class="setting-pending" data-pending-value {% if item.pending is none %}hidden{% endif %}>Saved for next restart: {{ item.pending or '' }}</p>
+              {% if item.editable %}
+              <label for="edit-{{ item.name }}">{{ 'Replace value' if item.input_value is none else 'Value' }}{% if item.unit %} ({{ item.unit }}){% endif %}</label>
+              {% if item.input_type == 'boolean' or item.choices %}
+              <select id="edit-{{ item.name }}" data-local-setting="{{ item.name }}" data-advanced="{{ 'true' if item.advanced else 'false' }}" data-type="{{ item.input_type }}" aria-describedby="help-{{ item.name }} error-{{ item.name }}" disabled>
+                {% if item.input_type == 'boolean' %}<option value="true" {% if item.input_value %}selected{% endif %}>Enabled</option><option value="false" {% if not item.input_value %}selected{% endif %}>Disabled</option>
+                {% else %}{% for choice in item.choices %}<option value="{{ choice }}" {% if choice == item.input_value %}selected{% endif %}>{{ choice }}</option>{% endfor %}{% endif %}
+              </select>
+              {% else %}
+              <input id="edit-{{ item.name }}" data-local-setting="{{ item.name }}" data-advanced="{{ 'true' if item.advanced else 'false' }}" data-type="{{ item.input_type }}" type="{{ item.input_type }}" {% if item.input_type == 'number' %}min="{{ item.minimum }}" {% if item.maximum is not none %}max="{{ item.maximum }}"{% endif %} step="1"{% endif %} value="{{ item.input_value if item.input_value is not none else '' }}" autocomplete="off" spellcheck="false" placeholder="{{ 'Leave blank to keep the existing value' if item.input_value is none else '' }}" aria-describedby="help-{{ item.name }} error-{{ item.name }}" disabled>
+              {% endif %}
+              {% if item.name in ['qbt_web_url', 'completion_event_token'] %}<label class="settings-check"><input type="checkbox" data-clear-setting="{{ item.name }}" disabled>Clear this optional value</label>{% endif %}
+              {% endif %}
+              <p class="setting-error" id="error-{{ item.name }}" data-field-error hidden></p>
+              <p class="setting-lock-reason">{{ item.lock_reason }}</p>
+              {% if item.current_effect %}<p class="setting-effect">{{ item.current_effect }}</p>{% endif %}
+              <details class="setting-details"><summary>Default and technical details</summary><p>Built-in default: <code>{{ item.default }}</code></p><p><code>{{ item.env_name }}</code> · {{ item.source }}</p><p>{{ item.change_hint }}</p></details>
+            </article>
+            {% endfor %}
+          </div>
+        </section>
+        {% endfor %}
+      </div>
+
+      <section id="settings-backup" class="settings-group" hidden>
+        <h3>Backup and restore</h3>
+        <p>Includes Intake's database, checkpoints, settings and secrets. Does not include downloaded files, qBittorrent state, shared definitions, notifier state or Docker deployment configuration. Older saved deployment notes are preserved automatically for compatibility.</p>
+        <p>Unlock administration, pause Intake and wait for drained. Apply pending settings with a restart before backing up.</p>
+        <p id="backup-database-size">Unlock administration to check database size.</p>
+        <label for="backup-passphrase">Encryption passphrase (12+ characters)</label><input id="backup-passphrase" type="password" autocomplete="new-password"><p>Keep it separately; it cannot be recovered. Use the original passphrase when restoring.</p>
+        <button id="backup-download" class="button-primary" type="button" disabled>Download encrypted backup</button>
+        <hr><label for="backup-upload">Restore an encrypted .tibak backup</label><input id="backup-upload" type="file" accept=".tibak,application/octet-stream">
+        <button id="backup-restore" class="button-secondary danger-soft" type="button" disabled>Stage restore for next restart</button>
+        <p>Restart in Portainer to apply the restore. A rollback copy is kept and Intake stays paused. Restore qBittorrent and downloaded files separately, verify matching mounts, and stop the old Intake controller before resuming this one.</p>
+      </section>
+
+      <section id="settings-review" class="settings-callout" tabindex="-1" hidden aria-labelledby="settings-review-title">
+        <h3 id="settings-review-title">Review changes</h3><ul id="settings-review-list"></ul>
+        <label id="advanced-confirm-label" class="settings-check" hidden><input id="advanced-confirm" type="checkbox">I understand these advanced scanner changes affect inspection limits or resource use. Do not bypass incomplete scans; policy changes may require rescanning.</label>
+        <p>Pause and save stops Intake's workers safely. qBittorrent downloads continue. After saving, restart the container in Portainer, then verify and resume.</p>
+        <button id="settings-save" class="button-primary" type="button">Pause and save</button><button id="settings-review-cancel" class="button-secondary" type="button">Back to editing</button>
+      </section>
+    </div>
+    <footer class="settings-actions">
+      <span id="settings-draft-count" role="status">No unsaved changes</span>
+      <button id="settings-discard" class="button-secondary" type="button" disabled>Discard</button>
+      <button id="settings-review-button" class="button-primary" type="button" disabled>Review changes</button>
+    </footer>
+  </aside>
+</section>

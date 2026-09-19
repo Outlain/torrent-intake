@@ -26,7 +26,7 @@ the supplied `.env.example` explicitly selects UID/GID `3000:3000`.
 | `INTAKE_UID`, `INTAKE_GID` | `10001`, `10001` | Numeric owners for both processes. Set **both to 3000** for the current deployment and retain matching host permissions. |
 | `TI_UI_PUBLISH_IP` | `127.0.0.1` | Host interface for the UI. Localhost requires a tunnel/proxy for remote access; a host LAN address permits access through that interface. |
 | `TI_UI_HOST_PORT` | `8095` | Browser-facing host port; the app still listens on container port `8000`. |
-| `MEDIA_NETWORK` | `shared_media_net` | Existing external Docker network that can reach qBittorrent's working Gluetun endpoint. |
+| `MEDIA_NETWORK` | `shared_media_net` | Existing external Docker network that can reach qBittorrent's API endpoint. VLAN/VPN routing is managed outside Intake. |
 | `TI_DATA_HOST_DIR` | `/opt/docker/torrent-intake/data` | Local SSD/M.2 directory for SQLite, settings, token and restore work. |
 | `TI_LOCAL_STAGING_HOST_DIR` | `/mnt/bulk/docker/torrent-intake/staging` | Local unfinished/intake torrent content. |
 | `TI_MEDIA_HOST_DIR` | `/mnt/media` | Intentional broad media mount, including NAS staging. |
@@ -48,7 +48,9 @@ health-check defaults already match the image's fixed `DatabaseDirectory` and
 Image, network, bind mounts, `user`, port publishing, CPU/RAM/PID limits, tmpfs,
 capabilities, restart policy and Docker log rotation remain in YAML. None can be
 restored or provisioned by uploading the application backup. The app has no
-Docker socket. Save your actual YAML and variable values in Deployment Notes.
+Docker socket. Keep your actual YAML and Portainer variable values separately
+in your deployment backup. The settings UI does not require pasted YAML. Any
+legacy `deployment-notes.txt` is still preserved in encrypted backups/restores.
 
 ### Mounts that must exist
 
@@ -77,10 +79,36 @@ an explicit value, not a request to use the saved value. The host Compose `.env`
 is not automatically mounted into the application.
 
 Use lower-case field names without `TI_` in the file: `TI_LOCAL_MAX_GIB` becomes
-`"local_max_gib": 200`. Settings & Help shows **every current value, default,
-description and override source**. Ordinary edits need an admin token and a
-drained controller, then a restart. Safety-critical fields remain read-only in
-the UI; change them offline in the file or with an explicit environment override.
+`"local_max_gib": 200`. Settings & Help shows active values, defaults, descriptions
+and override sources, grouped into Connection, Downloads/storage, Scanning,
+General, Backup/restore and Deployment sections. The legacy no-op `TI_APP_NAME`
+is accepted in existing files but omitted from the editor.
+
+Unlock with the local admin token, edit individual fields, then **Review changes**.
+Nothing is saved during editing or review. **Pause and save** requests a whole-
+controller pause and waits for workers to drain before saving atomically. If the
+wait expires, edits stay unsaved and Intake stays paused; retry once drained.
+Restart `torrent-intake` in Portainer, reopen the page, unlock and choose
+**Verify & resume**. Saved-but-not-applied values are labeled separately from
+active values. A stale draft from another session is rejected instead of
+silently overwriting newer settings.
+
+Scanner limits, definition ages and other advanced fields require both the
+Scanning section's warning unlock and confirmation at review. Destructive
+infection actions, filesystem/database boundaries, executable paths, ownership
+tags, TLS policy and scanner implementation/policy identifiers remain
+deployment-only. Change these offline in the file or by explicit environment
+override, not through this UI. An environment-controlled field explains which
+`TI_*` mapping to **remove entirely** and redeploy before editing locally.
+
+Secret fields are blank replacement inputs: leave blank to retain the saved
+secret. Optional fields have an explicit clear checkbox. Connection testing
+uses the unsaved connection fields in a separate short-lived session; it only
+authenticates and reads the API version, never changes torrents or saves settings.
+The test has a short fixed request timeout, independent of the normal worker's
+request timeout. **Check setup** tests active qBittorrent/ClamD settings and
+directory permissions; it cannot prove that an intended NAS export is mounted.
+
 `TI_DATA_DIR`, if changed, must be provided in the container environment because
 it locates the settings file itself.
 
@@ -95,7 +123,7 @@ The tables below show built-in defaults, not overrides from your deployment.
 | `TI_DEBUG` | `false` | Verbose application logging; normally leave off. |
 | `TI_UI_TITLE` | `Torrent Intake` | Page heading. |
 | `TI_APP_NAME` | `torrent-intake` | **Legacy no-op**, accepted to avoid breaking older saved files. Not UI-editable; use `TI_UI_TITLE` for the heading. |
-| `TI_QBT_HOST` | `http://qbittorrent:8080` | qBittorrent API address. Keep the URL that works with your Gluetun arrangement. |
+| `TI_QBT_HOST` | `http://qbittorrent:8080` | API address reachable from Intake's Docker network. Keep your working endpoint; there is no Gluetun requirement. |
 | `TI_QBT_USERNAME`, `TI_QBT_PASSWORD` | `admin`, placeholder | qBittorrent credentials; must be set correctly or restored before resuming. |
 | `TI_QBT_VERIFY_CERTIFICATE` | `false` | Validate the server certificate for HTTPS. Separate from the connection URL. |
 | `TI_QBT_REQUEST_TIMEOUT_SECONDS` | `20` | Time bound on a qBittorrent API request. |
@@ -211,8 +239,8 @@ procedure until larger portable backups are implemented and tested.
 
 - Removed default-only `TI_DATA_DIR`, `DEFINITIONS_DIR` and `CLAMD_SOCKET`
   mappings from the standard examples; old mappings at the standard paths work.
-- `TI_APP_NAME` is an explicitly labeled, read-only legacy no-op. It remains
-  accepted so existing local files and backups are not broken by removal.
+- `TI_APP_NAME` is a legacy no-op, omitted from the editor. It remains accepted
+  so existing local files and backups are not broken by removal.
 - `TI_SCANNER_BACKEND=clamd` is optional and retained as a compatibility guard;
   setting `clamscan` must still fail rather than silently change behavior.
 - Keep native versus large-media limits/deadlines, default versus maximum slots,

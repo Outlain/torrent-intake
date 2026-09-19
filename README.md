@@ -408,18 +408,39 @@ and [`Tag::isValid`](https://github.com/qbittorrent/qBittorrent/blob/master/src/
 
 ## Settings and help panel
 
-The UI has a **Settings & Help** gear button. Its drawer shows every effective
-`TI_*` application setting, the built-in default, a plain-language explanation,
-and how the setting is managed. The list is searchable and includes a short
-workflow guide plus a link back to the live scanner controls.
+Open the **Settings & Help** gear button on desktop or mobile. Choose Connection,
+Downloads and storage, Scanning, General, Backup and restore, or Deployment
+information. Search works across sections. Each setting explains its purpose,
+active value, default, and whether it is editable, advanced, deployment-only,
+or controlled by a Portainer/environment override. The unused legacy application
+name is hidden; existing settings files still accept it.
 
-Ordinary application settings can now be edited after unlocking administration
-and pausing the whole controller. Saved changes take effect on container restart,
-not midway through an active job. Values overridden by the container environment
-are locked in the editor; remove the override and recreate the container to use
-the saved value instead. The existing scan-slot and scanner-maintenance controls
-remain live and persist through SQLite. They are different from the whole-controller
-pause used for backup/configuration, which also stops qBittorrent management actions.
+1. Unlock administration with the token from
+   `docker exec torrent-intake cat /app/data/admin-token`.
+2. Edit individual fields. Blank secret inputs keep the existing secret; use
+   the explicit clear checkbox to remove an optional value. **Test connection**
+   checks the edited qBittorrent credentials without saving or changing torrents.
+3. In Scanning, unlock advanced fields if needed. **Review changes** shows a
+   before/after summary without exposing secrets. Advanced changes need a second
+   confirmation. Validation errors appear beside their fields. Discard abandons
+   unsaved edits.
+4. Choose **Pause and save**. Intake drains its workers before saving; qBittorrent
+   downloads and previously requested moves can continue independently. Saved
+   values are labeled **for next restart**, not mistaken for active values.
+5. Restart **torrent-intake** in Portainer, reopen the page and unlock. Choose
+   **Verify & resume**. Intake remains paused until its qBittorrent, scanner and
+   storage checks pass. **Check setup** lists each result for troubleshooting.
+
+There is no hot reload or Docker socket. Values overridden by container
+environment are locked: remove the relevant mapping completely (not an empty
+value) and redeploy to edit the saved local value. No new environment variables
+are needed for this editor. Existing settings, checkpoints and backups keep
+their formats. Keep deployment YAML separately; there is no paste-a-stack box.
+Previously saved deployment notes are preserved in old and new backups.
+
+The scan-slot and scanner-maintenance controls remain live and persist through
+SQLite. They differ from the whole-controller pause used for settings/backups,
+which also stops Intake's qBittorrent management actions.
 
 Compose-only values—the image tag, published host port, numeric UID/GID,
 host-side bind sources, and ClamD sidecar limits—cannot be discovered by the
@@ -427,9 +448,11 @@ application and therefore remain visible only in the deployed stack.
 
 Passwords and completion tokens are displayed only as configured or not
 configured. Credentials embedded in URLs and URL query strings are redacted.
-Safety-critical values such as staging boundaries, the scanner policy, and
-`TI_INFECTED_ACTION` remain visible with their current behavior explained, but
-cannot be changed through the UI.
+Destructive actions (`TI_INFECTED_ACTION`), database/mount boundaries, ownership
+tags, executable paths, TLS policy and scanner policy identifiers remain visible
+but deployment-only. Advanced size/freshness/resource settings are editable with
+the extra warning and server-side validation. This cannot change the sidecar's
+separate limits or make an incomplete scan count as clean.
 
 ## Portable configuration and encrypted backups
 
@@ -444,7 +467,7 @@ All application-owned durable state is on the existing `/app/data` mount:
 | `settings.json` | All effective application settings, including connection secrets and explicit environment overrides |
 | `admin-token` | Locally generated credential for configuration and backup/restore APIs; intentionally not exported/restored |
 | `controller-paused.json` | Persistent whole-controller pause; survives container recreation |
-| `deployment-notes.txt` | Your optional actual stack YAML, Portainer variable values, and host/network notes |
+| `deployment-notes.txt` | Legacy optional notes, preserved for backup compatibility; no longer edited in the UI |
 | `restart-required`, `.restore-pending/` | Pending changes that require a container restart |
 | `before-restore-<id>/`, `last-restore.json` | Previous database/settings retained for offline rollback and a record of their location |
 
@@ -484,7 +507,7 @@ are filled in and saved at the next successful startup. Example:
 {
   "schema_version": 1,
   "settings": {
-    "qbt_host": "http://YOUR-WORKING-GLUETUN-ENDPOINT:8080",
+    "qbt_host": "http://YOUR-QBITTORRENT-ENDPOINT:8080",
     "qbt_username": "admin",
     "qbt_password": "YOUR-PASSWORD",
     "local_max_gib": 200,
@@ -494,16 +517,17 @@ are filled in and saved at the next successful startup. Example:
 }
 ```
 
-Safety-critical settings such as `infected_action`, staging boundaries, and
-scanner limits remain read-only in the web editor. Edit their local file values
-while Intake is stopped, or explicitly override them in the stack. Restoring a
-trusted backup restores its saved policy, but automatic actions remain paused
-until you acknowledge the receiving environment.
+Deployment-only settings such as `infected_action` and staging/database
+boundaries remain read-only in the web editor. Edit their local file values
+while Intake is stopped, or explicitly override them in the stack. Scanner
+limits use the advanced warning/unlock described above. Restoring a trusted
+backup restores its saved policy, but automatic actions remain paused until you
+acknowledge the receiving environment.
 
 These settings **must stay in Docker/Portainer**, because they describe the
 environment outside the application:
 
-- image/version, published address and port, Docker networks and Gluetun routing;
+- image/version, published address and port, Docker networks and host VPN/VLAN routing;
 - host bind paths, mount modes, numeric UID/GID, CPU/RAM/PID limits and tmpfs sizes;
 - `TI_DATA_DIR` only if changing the bootstrap **container** path from `/app/data`;
 - ClamD sidecar environment, including `CLAMD_MAX_SCAN_SIZE_MIB`, definition
@@ -535,11 +559,10 @@ use its new token to unlock restore and the original backup passphrase to decryp
    `docker exec torrent-intake cat /app/data/admin-token` and unlock administration.
    Use HTTPS or a trusted localhost tunnel. The general job UI/API still requires
    private-network protection; only the new admin endpoints require this token.
-3. Save your **actual** stack and Portainer variable values in Deployment Notes.
-   The app cannot discover host mounts, image digests, resource limits or the
-   sidecar configuration. Notes are included in the encrypted backup, but never
-   executed or used to provision Docker.
-4. Select **Pause Intake Controller** and wait for **drained**. This prevents new
+3. Keep your **actual** stack and Portainer variable values in a separate protected
+   deployment backup. The app cannot discover host mounts, image digests, resource
+   limits or the sidecar configuration, and does not provision Docker.
+4. Select **Pause Intake** and wait for **drained**. This prevents new
    management/API mutations and cooperatively interrupts scan workers. Existing
    management requests finish first. It does not pause qBittorrent downloads.
    A qBittorrent location move may also continue independently. Before copying
@@ -562,7 +585,7 @@ use its new token to unlock restore and the original backup passphrase to decryp
    Keep the image's standard entrypoint; a normal `command: uvicorn ...` override
    still runs through that launcher.
 9. Verify mounts, qBittorrent contents, connection settings and the infection
-   action. **Verify & Resume Controller** checks ClamD, qBittorrent connectivity
+   action. **Verify & resume** checks ClamD, qBittorrent connectivity
    and content directory access before enabling work. Individual jobs still go
    through the existing ownership/tag/path/file-identity checks.
 
@@ -632,8 +655,10 @@ placeholders. The background poller still discovers missed callbacks.
   priority/pause/resume endpoints used by the UI
 - `GET /scanner/status`, `POST /scanner/slots`, `POST /scanner/maintenance`
 - `GET /controller/status` (whole-controller pause, not only scanner maintenance)
-- `/admin/status`, `/admin/pause`, `/admin/resume`, `/admin/settings`,
-  `/admin/deployment-notes`, `/admin/backup`, `/admin/restore` (local admin token required)
+- `/admin/status`, `/admin/pause`, `/admin/resume`, `/admin/checks`,
+  `/admin/settings/review`, `/admin/settings`, `/admin/test-connection`,
+  `/admin/backup`, `/admin/restore` (local admin token required)
+- `/admin/deployment-notes` is retained only for compatibility with older clients
 - qB category/transfer and approved final-path suggestion endpoints
 - server-filtered qB tag suggestions at `GET /qbt/tags`
 - `POST /events/qbt-complete` and `/events/qbt-complete-form`
@@ -691,6 +716,17 @@ environment override persistence, encrypted export/import, token enforcement,
 offline replacement, duplicate-controller locking, and paused recovery. It never
 connects to your qBittorrent or uses production mounts. Unit tests also simulate
 corrupt archives, invalid schemas, symlinks and interruption midway through restore.
+
+The optional browser test needs development-only Puppeteer and Chrome (neither
+is added to the app image). After building `torrent-intake:test`, run
+`node tests/test_settings_ui.cjs` with Puppeteer on Node's module path. Set
+`CHROME_PATH` if using an existing Chrome executable. It creates and removes
+its own disposable container/volume, publishes only to localhost, and checks
+desktop/narrow-mobile layouts, field locks/errors, advanced confirmation,
+connection-test isolation, save/restart/pending values and failed-resume guidance.
+Set `TI_UI_TEST_IMAGE` to test another local build; `TI_UI_SCREENSHOT_DIR` optionally
+captures desktop/mobile screenshots in an existing directory. This script must
+not be pointed at a production server; it always creates its own test instance.
 
 For a repeatable synthetic advanced-check/window-size comparison, run
 `TI_TEST_BENCHMARK_WINDOWS=1 bash tests/run_media_integration.sh`. It uses a sparse

@@ -48,6 +48,20 @@ class QbtService:
     def __init__(self) -> None:
         self.settings = get_settings()
 
+    def test_connection(self) -> None:
+        """Use a separate short-lived session; never replace the worker's client."""
+        client = qbittorrentapi.Client(
+            host=self.settings.qbt_host,
+            username=self.settings.qbt_username,
+            password=self.settings.qbt_password,
+            VERIFY_WEBUI_CERTIFICATE=self.settings.qbt_verify_certificate,
+            REQUESTS_ARGS={"timeout": (5, 5)},
+        )
+        try:
+            self._log_in(client)  # Login plus a read-only application version request.
+        finally:
+            client._session.close()
+
     def client(self) -> qbittorrentapi.Client:
         with type(self)._client_lock:
             client = type(self)._shared_client

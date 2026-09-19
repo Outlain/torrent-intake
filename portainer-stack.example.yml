@@ -9,6 +9,8 @@ services:
     stop_grace_period: 60s
     # No application environment overrides are required for the standard mounts.
     # Settings/secrets live in /app/data/settings.json (including after restore).
+    # Gear > unlock > edit > review > pause/save > restart here > verify/resume.
+    # Any explicit TI_* override locks that field in the UI until removed/redeployed.
     # Optional explicit overrides still work and are persisted at startup:
     # environment:
     #   TI_QBT_HOST: ${TI_QBT_HOST}

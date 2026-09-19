@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from .config import Settings, environment_settings
+from .config import Settings, environment_settings, saved_settings
 
 
 @dataclass(frozen=True)
@@ -19,13 +19,12 @@ class SettingSpec:
     value_explanations: dict[str, str] | None = None
 
 
-CATEGORY_DETAILS = {
-    "Application": "Application identity, persistence, logging behavior, and UI presentation.",
-    "qBittorrent": "Connection, authentication, tagging, and category behavior for the managed qBittorrent instance.",
-    "Storage and placement": "Container-visible staging roots, approved destinations, and local-to-NAS capacity policy.",
-    "ClamAV scanner": "Private ClamD communication, definition freshness, file limits, and scan deadlines.",
-    "Scan scheduling": "Bounded concurrency, leases, retry timing, and cooperative scan behavior.",
-    "Infection and events": "The safety-critical infection action, quarantine boundary, and durable event spool.",
+SECTIONS = {
+    "connection": ("qBittorrent connection", "Connection details, credentials, tags and categories."),
+    "storage": ("Downloads and storage", "Local capacity and temporary download placement."),
+    "scanner": ("Scanning", "Workers, timeouts and protected advanced scan limits."),
+    "general": ("General", "Display and logging preferences."),
+    "deployment": ("Deployment information", "Protected paths and policies. Change these in Portainer or the local file while Intake is stopped."),
 }
 
 
@@ -61,7 +60,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "qbt_host": SettingSpec(
         "qBittorrent",
         "qBittorrent API URL",
-        "Private Web API endpoint reachable from Torrent Intake. It must match the existing Gluetun networking arrangement.",
+        "Private Web API endpoint reachable from Torrent Intake, for example http://qbittorrent:8080 on a shared Docker network. This is separate from the URL you open in your browser.",
         url_value=True,
     ),
     "qbt_username": SettingSpec(
@@ -285,7 +284,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         "Scan scheduling",
         "Default concurrent scans",
         "Default torrent scan slots for a new queue and after a temporary boost ends. Existing slot requests are saved in SQLite.",
-        change_hint="Use the Scan Queue slot control for live adjustments. Change the local file or an environment override for the default, then restart; a saved queue request is not automatically reset by restarting.",
+        change_hint="Use the Scan Queue slot control for live adjustments. Edit this field, the local file or an environment override for the default, then restart; a saved queue request is not automatically reset by restarting.",
     ),
     "max_scan_slots": SettingSpec(
         "Scan scheduling",
@@ -397,26 +396,70 @@ def _display_value(spec: SettingSpec, value: Any, *, default: bool = False) -> s
     return str(value)
 
 
+ADVANCED_SETTINGS = frozenset({
+    "scanner_max_file_mib", "scanner_definitions_warn_hours", "scanner_definitions_stale_hours",
+    "large_media_enabled", "large_media_max_file_gib", "large_media_chunk_mib",
+    "large_media_min_chunk_mib", "large_media_overlap_kib", "media_attachment_max_mib",
+    "media_attachment_total_mib", "clamd_max_inflight_requests", "max_scan_slots",
+    "pause_confirmation_timeout_seconds",
+})
+
+# Shared by the form controls and the settings API.
+NUMBER_LIMITS = {
+    "completion_grace_seconds": (0, None), "local_free_space_buffer_gib": (0, None),
+    "large_media_overlap_kib": (0, None), "scanner_max_file_mib": (1, 2000),
+    "per_job_scan_workers": (1, 4), "clamd_max_inflight_requests": (1, 4),
+    "media_attachment_max_mib": (1, 64), "media_attachment_total_mib": (1, 256),
+}
+
+
 def ui_editable(name: str) -> bool:
     spec = SETTING_SPECS.get(name)
-    return bool(spec and not spec.safety_critical and name not in {"app_name", "database_url", "data_dir"})
+    return bool(spec and (not spec.safety_critical or name in ADVANCED_SETTINGS)
+                and name not in {"app_name", "database_url", "data_dir"})
 
 
-def build_settings_catalog(settings: Settings) -> list[dict[str, object]]:
+def display_setting(name: str, value: Any) -> str:
+    return _display_value(SETTING_SPECS[name], value)
+
+
+def build_settings_catalog(settings: Settings, pending: Settings | None = None) -> list[dict[str, object]]:
     overrides = environment_settings()
-    grouped: dict[str, list[dict[str, object]]] = {
-        category: [] for category in CATEGORY_DETAILS
-    }
+    saved = saved_settings()
+    grouped: dict[str, list[dict[str, object]]] = {key: [] for key in SECTIONS}
     for name, spec in SETTING_SPECS.items():
         field = Settings.model_fields[name]
         current_value = getattr(settings, name)
         current_display = _display_value(spec, current_value)
         default_display = _display_value(spec, field.get_default(call_default_factory=True), default=True)
         editable = ui_editable(name) and name not in overrides
+        if not ui_editable(name):
+            permission = "deployment"
+            lock_reason = "Deployment-only. Edit settings.json while Intake is stopped, or change the Portainer configuration and redeploy."
+            if name in {"database_url", "data_dir"}:
+                lock_reason = "Requires an offline migration. Changing this path does not move your database or its records. Configure the matching Docker mount in Portainer."
+            elif name == "infected_action":
+                lock_reason = "Destructive-action policy is intentionally not editable here. Change it in Portainer or settings.json while Intake is stopped."
+        elif name in overrides:
+            permission = "environment"
+            lock_reason = f"Controlled by Portainer/environment through TI_{name.upper()}. Remove that mapping completely (do not leave it blank) and redeploy to edit here. The saved value is retained."
+        else:
+            permission = "advanced" if name in ADVANCED_SETTINGS else "editable"
+            lock_reason = "Unlock administration to edit. Advanced changes also require confirmation when saving." if permission == "advanced" else "Unlock administration to edit this setting."
+        section = "deployment" if not ui_editable(name) else {
+            "qBittorrent": "connection", "Storage and placement": "storage",
+            "ClamAV scanner": "scanner", "Scan scheduling": "scanner",
+        }.get(spec.category, "general")
+        hidden_input = spec.sensitive or (spec.url_value and current_value and _safe_url(current_value) != current_value)
+        input_type = "password" if hidden_input else "boolean" if isinstance(current_value, bool) else "number" if isinstance(current_value, int) else "text"
+        choices = ["queue", "nas"] if name == "local_overflow_policy" else []
+        minimum, maximum = NUMBER_LIMITS.get(name, (1, None))
+        unit = next((unit for suffix, unit in (("_seconds", "seconds"), ("_hours", "hours"), ("_mib", "MiB"), ("_kib", "KiB"), ("_gib", "GiB")) if name.endswith(suffix)), "")
+        has_pending = pending is not None and getattr(pending, name) != current_value
         current_effect = None
         if spec.value_explanations:
             current_effect = spec.value_explanations.get(current_display)
-        grouped[spec.category].append(
+        grouped[section].append(
             {
                 "name": name,
                 "env_name": f"TI_{name.upper()}",
@@ -431,18 +474,25 @@ def build_settings_catalog(settings: Settings) -> list[dict[str, object]]:
                     "Read-only in the UI. Edit settings.json or Compose or Portainer, then restart/recreate Torrent Intake."
                     if not ui_editable(name) else DEFAULT_CHANGE_HINT
                 ),
-                "source": "Environment override" if name in overrides else "Local settings / built-in default",
+                "source": "Environment override" if name in overrides else "Saved locally" if name in saved else "Built-in default",
                 "editable": editable,
-                "input_type": "password" if spec.sensitive or spec.url_value else "boolean" if isinstance(current_value, bool) else "number" if isinstance(current_value, int) else "text",
-                "input_value": None if spec.sensitive or spec.url_value else current_value,
+                "permission": permission,
+                "lock_reason": lock_reason,
+                "legacy": name == "app_name",
+                "advanced": name in ADVANCED_SETTINGS,
+                "input_type": input_type,
+                "input_value": None if hidden_input else current_value,
+                "choices": choices, "minimum": minimum, "maximum": maximum, "unit": unit,
+                "pending": ("Replacement saved (hidden)" if spec.sensitive else display_setting(name, getattr(pending, name))) if has_pending else None,
             }
         )
 
     return [
         {
-            "name": category,
-            "description": description,
-            "settings": grouped[category],
+            "id": section,
+            "name": details[0],
+            "description": details[1],
+            "settings": grouped[section],
         }
-        for category, description in CATEGORY_DETAILS.items()
+        for section, details in SECTIONS.items()
     ]
