@@ -179,7 +179,7 @@ def create_backup(settings: Settings, directory: Path, passphrase: str) -> Path:
         "application": "torrent-intake", "backup_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "includes_secrets": True,
-        "excludes": ["torrent files", "qBittorrent state", "ClamAV definitions", "notifier state and events", "Docker images"],
+        "excludes": ["downloaded payload files", "qBittorrent state", "ClamAV definitions", "notifier state and events", "Docker images"],
     })
     archive = directory / "snapshot.zip"
     with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_STORED) as handle:

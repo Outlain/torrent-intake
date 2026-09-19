@@ -27,6 +27,7 @@ from app.models import Job, ScanRun, ScanFile
 from app.restore import apply_pending_restore, stage_restore
 from app.settings_view import build_settings_catalog, ui_editable
 from app.state_files import read_private, write_json, write_private
+from test_torrent_files import torrent
 
 
 PASSPHRASE = "a long test-only backup phrase"
@@ -39,6 +40,7 @@ def make_database(root: Path, identifier: str = "original") -> Settings:
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         db.add(Job(id=identifier, magnet_uri="magnet:?private-passkey=test-private-key", final_parent="/downloads/Movies",
+                   torrent_file_name="example.torrent", torrent_file_data=torrent(),
                    staging_preference="nas", staging_root_initial="/downloads/torrent-intake/staging",
                    managed_tag="torrent_intake", unique_tag=f"ti_job_{identifier}"))
         db.commit()
@@ -136,6 +138,7 @@ class BackupRestoreTests(unittest.TestCase):
             backup = self.backup()
         self.assertNotIn(b"private-qbt-password", backup.read_bytes())
         self.assertNotIn(b"test-private-key", backup.read_bytes())
+        self.assertNotIn(torrent(), backup.read_bytes())
         archive = self.root / "verified.zip"
         decrypt_archive(backup, archive, PASSPHRASE)
         restored = self.root / "unpacked"
@@ -146,6 +149,8 @@ class BackupRestoreTests(unittest.TestCase):
         with closing(sqlite3.connect(restored / "torrent_intake.db")) as db:
             self.assertEqual(db.execute("SELECT torrent_name FROM jobs").fetchone()[0], "WAL-only update")
             self.assertEqual(db.execute("SELECT status FROM scan_files").fetchone()[0], "clean")
+            self.assertEqual(db.execute("SELECT torrent_file_name,torrent_file_data FROM jobs").fetchone(),
+                             ("example.torrent", torrent()))
 
     def test_wrong_passphrase_and_modified_ciphertext_leave_no_plaintext(self):
         backup = self.backup()

@@ -14,6 +14,12 @@ required by the example stack's `depends_on` before the application starts.
 
 ## Deployment variables
 
+Magnet links and `.torrent` uploads share these same settings and mounts. Original
+uploaded metadata is kept in the jobs database under `/app/data`, including in
+encrypted backups. No upload directory or new environment variables are required.
+The UI accepts up to 50 combined items, with a 32 MiB limit per metadata file
+(not downloaded content); see [Adding magnets and .torrent files](README.md#adding-magnets-and-torrent-files).
+
 These names are substitutions in [the stack example](portainer-stack.example.yml),
 not UI settings. You can use literal values in YAML instead. A Portainer variable
 does nothing unless the YAML refers to it. Defaults below are the YAML fallbacks;

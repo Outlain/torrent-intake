@@ -17,6 +17,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.models import Job, ScanRun, ScanFile
+from test_torrent_files import torrent
 
 
 PASSPHRASE = "integration-only backup passphrase"
@@ -74,6 +75,7 @@ def seed(directory, identifier):
     engine = create_engine(f"sqlite:///{directory / 'torrent_intake.db'}")
     with Session(engine) as db:
         db.add(Job(id=identifier, magnet_uri="magnet:?private=integration-passkey", final_parent="/downloads/Movies",
+                   torrent_file_name="example.torrent", torrent_file_data=torrent(),
                    staging_preference="nas", staging_root_initial="/downloads/torrent-intake/staging",
                    managed_tag="torrent_intake", unique_tag=f"ti_job_{identifier}"))
         db.commit()
@@ -108,6 +110,7 @@ def main():
             assert backup_status["database_bytes"] > 0
             assert backup_status["database_limit_bytes"] == 512 * 1024 * 1024
             assert request(18000, "/jobs", payload={})[0] == 503
+            assert request(18000, "/jobs/torrent", raw=b"invalid", headers={"Content-Type": "application/octet-stream"})[0] == 503
             assert request(18000, "/qbt/categories")[0] == 503
             assert request(18000, "/admin/settings", token=token, payload={"settings": {"infected_action": "delete"}})[0] == 409
             assert request(18000, "/admin/settings", token=token, payload={"settings": {"app_name": "unused"}})[0] == 409
@@ -154,6 +157,8 @@ def main():
             second = launch(destination, 18001, TI_UI_TITLE="Receiving environment title")
             processes.append(second)
             assert ids(destination) == ["original"]
+            with sqlite3.connect(destination / "torrent_intake.db") as db:
+                assert db.execute("SELECT torrent_file_name,torrent_file_data FROM jobs").fetchone() == ("example.torrent", torrent())
             assert request(18001, "/ui")[0] == 200  # No blocking qB lookup while paused.
             state = json.loads(request(18001, "/controller/status")[1])
             assert state["paused"] and state["drained"] and not state["restore_pending"]

@@ -41,6 +41,7 @@ from .settings_view import build_settings_catalog
 from .settings_editor import SettingsEditError, pending_settings, revision, validate_draft
 from .qbt import QbtService
 from .tags import MAX_CUSTOM_TAG_LENGTH, MAX_CUSTOM_TAGS, PRIVATE_JOB_TAG_PREFIX
+from .uploads import read_torrent_upload
 
 logging.basicConfig(
     level=logging.DEBUG if get_settings().debug else logging.INFO,
@@ -53,6 +54,7 @@ service = JobService()
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 controller: Controller | None = None
+upload_slots = asyncio.Semaphore(2)
 
 
 @asynccontextmanager
@@ -424,6 +426,21 @@ def create_jobs_bulk(payload: JobBatchCreate, db: Session = Depends(get_db)):
     result["jobs"] = created_jobs
     result["errors"] = errors
     return result
+
+
+@app.post("/jobs/torrent", response_model=JobOut)
+async def create_job_from_torrent(request: Request, db: Session = Depends(get_db)):
+    async with upload_slots:
+        options, filename, data = await read_torrent_upload(request)
+        try:
+            return await _finish_thread(
+                service.submit_job, db, **options.model_dump(),
+                torrent_file_name=filename, torrent_file_data=data,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc)) from exc
 
 
 @app.get("/jobs/{job_id}", response_model=JobOut)

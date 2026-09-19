@@ -1,0 +1,9 @@
+# Test-only image: qBittorrent and Intake communicate exclusively over loopback.
+# Do not publish or deploy this image.
+ARG TI_TEST_APP_IMAGE=torrent-intake:test
+FROM ${TI_TEST_APP_IMAGE}
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends qbittorrent-nox \
+    && rm -rf /var/lib/apt/lists/*
+USER 10001:10001

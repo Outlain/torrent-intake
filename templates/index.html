@@ -424,6 +424,15 @@
       grid-column: 1 / -1;
     }
 
+    #torrent-file-input {
+      min-width: 0;
+      max-width: 100%;
+    }
+
+    #torrent-file-summary {
+      overflow-wrap: anywhere;
+    }
+
     label span {
       font-size: 0.92rem;
       font-weight: 600;
@@ -1500,7 +1509,7 @@
           <div class="eyebrow">Torrent Intake Control Plane</div>
           <h1>{{ title }}</h1>
           <p class="lede">
-            Submit a magnet, stage it safely, scan on completion, and only promote clean content into the final library.
+            Submit magnets or .torrent files, stage them safely, scan on completion, and only then promote content into the final library.
             The form defaults to the configured main final root so you are not retyping the same prefix for every intake.
           </p>
           <div class="meta-grid">
@@ -1556,15 +1565,23 @@
 
       <div class="panel form-panel">
         <h2 class="section-title">New Intake</h2>
-        <p class="section-copy">Paste the full magnet URI, confirm the destination, and submit. The final path starts at the configured root and the form keeps category/path values in place between submissions.</p>
+        <p class="section-copy">Paste magnets, choose .torrent files, or combine both. Confirm the destination and submit. Multiple items use the same bulk review, with shared or individual destination settings.</p>
 
         <form id="job-form">
           <div class="field-grid">
             <label class="field-wide">
-              <span>Magnet Link</span>
-              <textarea id="magnet-input" class="mono" name="magnet_uri" placeholder="magnet:?xt=urn:btih:..." spellcheck="false" required></textarea>
-              <span class="hint">Paste one magnet, or paste multiple magnet links on separate lines to review and add them as individually tracked jobs.</span>
+              <span>Magnet Links (optional when uploading files)</span>
+              <textarea id="magnet-input" class="mono" name="magnet_uri" placeholder="magnet:?xt=urn:btih:..." spellcheck="false"></textarea>
+              <span class="hint">Paste one or more magnets on separate lines. Up to 50 magnets and .torrent files combined per submission.</span>
             </label>
+
+            <div class="field-wide">
+              <label for="torrent-file-input">Torrent Files</label>
+              <input id="torrent-file-input" type="file" accept=".torrent,application/x-bittorrent" multiple aria-describedby="torrent-file-help torrent-file-summary">
+              <span id="torrent-file-help" class="hint">Choose one or more .torrent metadata files; you can choose more files again to add to the selection. Maximum 32 MiB per metadata file, not per download. Original tracker information is preserved.</span>
+              <span id="torrent-file-summary" class="hint" role="status" aria-live="polite">No .torrent files selected.</span>
+              <button id="torrent-files-clear" class="button-secondary" type="button" hidden>Clear selected files</button>
+            </div>
 
             <label class="field-wide">
               <span>Final Parent Path</span>
@@ -1653,7 +1670,7 @@
         <div class="bulk-dialog-head">
           <div>
             <h2 id="bulk-dialog-title" class="bulk-dialog-title">Review Bulk Intake</h2>
-            <p id="bulk-dialog-copy" class="bulk-dialog-copy">Multiple magnet links were detected. Each row will become its own tracked intake job.</p>
+            <p id="bulk-dialog-copy" class="bulk-dialog-copy">Each magnet or .torrent file becomes its own tracked intake job.</p>
           </div>
           <button id="bulk-dialog-close" class="button-secondary bulk-dialog-close" type="button" aria-label="Close bulk review">×</button>
         </div>
@@ -1772,7 +1789,7 @@
               <tr>
                 <td class="cell-select"><input class="job-checkbox" type="checkbox" data-job-id="{{ job.id }}"></td>
                 <td class="mono cell-id">{{ job.id }}</td>
-                <td class="cell-name">{{ job.torrent_name or '-' }}</td>
+                <td class="cell-name">{{ job.torrent_name or job.torrent_file_name or '-' }}</td>
                 <td class="cell-state"><span class="state-pill" data-state="{{ job.state }}">{{ job.state }}</span></td>
                 <td class="mono cell-final-parent">{{ job.final_parent }}</td>
                 <td class="cell-stage">{{ job.staging_actual or job.staging_preference }}</td>
@@ -1810,6 +1827,9 @@
     const selectedCustomTagsContainer = document.getElementById('selected-custom-tags');
     const customTagStatus = document.getElementById('custom-tag-status');
     const magnetInput = document.getElementById('magnet-input');
+    const torrentFileInput = document.getElementById('torrent-file-input');
+    const torrentFileSummary = document.getElementById('torrent-file-summary');
+    const torrentFilesClear = document.getElementById('torrent-files-clear');
     const formStatus = document.getElementById('form-status');
     const submitButton = document.getElementById('submit-button');
     const refreshJobsButton = document.getElementById('refresh-jobs-button');
@@ -1863,7 +1883,10 @@
     let jobsSortOrder = 'newest';
     let jobsFilter = 'all';
     let currentScannerStatus = null;
-    let pendingBulkMagnets = [];
+    let selectedTorrentFiles = [];
+    let pendingBulkItems = [];
+    let bulkSubmitting = false;
+    let singleSubmitting = false;
     let jobsToolbarFlashTimer = null;
     let finalPathTimer = null;
     let jobsRefreshTimer = null;
@@ -2132,6 +2155,7 @@
     }
 
     function describeMagnet(magnet) {
+      if (magnet.file) return magnet.file.name;
       const nameMatch = magnet.uri.match(/(?:^|[?&])dn=([^&]+)/i);
       if (!nameMatch) return magnet.infoHash ? `BTIH ${magnet.infoHash}` : `Line ${magnet.line}`;
       try {
@@ -2161,8 +2185,9 @@
     }
 
     function closeBulkDialog() {
+      if (bulkSubmitting) return;
       bulkDialog.hidden = true;
-      pendingBulkMagnets = [];
+      pendingBulkItems = [];
       bulkList.innerHTML = '';
       setBulkDialogStatus('');
     }
@@ -2170,7 +2195,7 @@
     function syncBulkSettingsMode() {
       const useSameSettings = bulkUseSameSettings.checked;
       bulkList.querySelectorAll('.bulk-final-parent, .bulk-final-category, .bulk-staging-preference').forEach((field) => {
-        field.disabled = useSameSettings;
+        field.disabled = bulkSubmitting || useSameSettings;
       });
     }
 
@@ -2184,8 +2209,16 @@
       const title = document.createElement('strong');
       title.textContent = `${index + 1}. ${describeMagnet(magnet)}`;
       const detail = document.createElement('span');
-      detail.textContent = `Line ${magnet.line}${magnet.infoHash ? ` · ${magnet.infoHash}` : ''}`;
+      detail.textContent = magnet.file
+        ? `.torrent metadata · ${formatBytes(magnet.file.size)}`
+        : `Magnet · Line ${magnet.line}${magnet.infoHash ? ` · ${magnet.infoHash}` : ''}`;
       magnetCell.append(title, detail);
+      if (magnet.error) {
+        const error = document.createElement('span');
+        error.textContent = magnet.error;
+        error.className = 'error';
+        magnetCell.appendChild(error);
+      }
       row.appendChild(magnetCell);
 
       const pathLabel = document.createElement('label');
@@ -2227,16 +2260,16 @@
       return row;
     }
 
-    function openBulkDialog(magnets, settings) {
-      pendingBulkMagnets = magnets;
-      bulkDialogCopy.textContent = `${magnets.length} magnet links were detected. Each row will become its own tracked intake job.`;
+    function openBulkDialog(items, settings) {
+      pendingBulkItems = items;
+      bulkDialogCopy.textContent = `${items.length} intake items (${items.filter(item => item.file).length} files, ${items.filter(item => !item.file).length} magnets). Each row becomes its own tracked job. Files are uploaded one at a time to bound memory and qBittorrent load.`;
       bulkTagsSummary.textContent = settings.custom_tags.length
         ? `Every row will receive these qBittorrent tags: ${settings.custom_tags.join(', ')}.`
         : 'No optional qBittorrent tags are selected. Tags can be added from the main form before opening bulk review.';
-      bulkUseSameSettings.checked = true;
+      bulkUseSameSettings.checked = !items.some(item => item.settings);
       bulkList.innerHTML = '';
-      magnets.forEach((magnet, index) => {
-        bulkList.appendChild(createBulkRow(magnet, index, settings));
+      items.forEach((item, index) => {
+        bulkList.appendChild(createBulkRow(item, index, item.settings || settings));
       });
       syncBulkSettingsMode();
       setBulkDialogStatus('Using the current form settings for every torrent. Uncheck the option above to edit rows individually.');
@@ -2247,9 +2280,10 @@
     function buildBulkPayload() {
       const sharedSettings = getFormSettings();
       const useSameSettings = bulkUseSameSettings.checked;
-      const jobs = pendingBulkMagnets.map((magnet, index) => {
+      const jobs = pendingBulkItems.map((item, index) => {
+        const source = item.file ? {} : {magnet_uri: item.uri};
         if (useSameSettings) {
-          return { magnet_uri: magnet.uri, ...sharedSettings };
+          return { ...source, ...sharedSettings };
         }
 
         const row = bulkList.querySelector(`.bulk-row[data-index="${index}"]`);
@@ -2257,7 +2291,7 @@
         const finalCategory = row.querySelector('.bulk-final-category').value.trim();
         const stagingPreference = row.querySelector('.bulk-staging-preference').value;
         return {
-          magnet_uri: magnet.uri,
+          ...source,
           final_parent: finalParent,
           final_category: finalCategory || null,
           staging_preference: stagingPreference,
@@ -2275,38 +2309,110 @@
     }
 
     async function submitBulkDialog() {
+      if (bulkSubmitting) return;
+      bulkSubmitting = true;
       bulkDialogSubmit.disabled = true;
+      bulkDialogCancel.disabled = true;
+      bulkDialogClose.disabled = true;
+      bulkUseSameSettings.disabled = true;
+      submitButton.disabled = true;
+      syncBulkSettingsMode();
       setBulkDialogStatus('Adding torrents as individually tracked jobs...');
       try {
         const payload = buildBulkPayload();
-        const result = await postJson('/jobs/bulk', payload);
+        let result;
+        if (pendingBulkItems.some(item => item.file)) {
+          result = {created: 0, failed: 0, errors: {}};
+          for (const [index, item] of pendingBulkItems.entries()) {
+            setBulkDialogStatus(`Adding item ${index + 1} of ${pendingBulkItems.length}: ${describeMagnet(item)}`);
+            try {
+              await submitIntakeItem(item, payload.jobs[index]);
+              result.created++;
+            } catch (error) {
+              result.failed++;
+              result.errors[String(index + 1)] = String(error);
+            }
+          }
+        } else {
+          result = await postJson('/jobs/bulk', payload);
+        }
         const failedIndexes = Object.keys(result.errors || {}).map((index) => Number(index) - 1);
         if (result.failed > 0) {
-          const failedMagnets = failedIndexes
-            .map((index) => pendingBulkMagnets[index]?.uri)
-            .filter(Boolean);
-          magnetInput.value = failedMagnets.join('\n');
+          const failedItems = failedIndexes.map(index => ({
+            ...pendingBulkItems[index], settings: payload.jobs[index], error: result.errors[String(index + 1)],
+          }));
+          magnetInput.value = failedItems.map(item => item.uri).filter(Boolean).join('\n');
+          selectedTorrentFiles = failedItems.map(item => item.file).filter(Boolean);
+          updateTorrentFileSelection();
           const detail = formatBatchErrors(result.errors);
-          setFormStatus(
-            `Bulk submit: ${result.created || 0} created, ${result.failed || 0} failed. Failed magnets were left in the textarea.${detail ? ` ${detail}` : ''}`,
-            true,
-          );
+          const message = `Bulk submit: ${result.created || 0} created, ${result.failed || 0} failed. Only failed items remain; their row settings are preserved. Check Recent Jobs before retrying an uncertain submission.${detail ? ` ${detail}` : ''}`;
+          openBulkDialog(failedItems, getFormSettings());
+          setBulkDialogStatus(message, true);
+          setFormStatus(message, true);
         } else {
           magnetInput.value = '';
+          selectedTorrentFiles = [];
+          updateTorrentFileSelection();
           setFormStatus(`Bulk submit complete: ${result.created || 0} torrents added as individually tracked jobs.`);
+          bulkSubmitting = false;
+          closeBulkDialog();
         }
         if ((result.created || 0) > 0) {
           knownCustomTags = sortedUnique([...knownCustomTags, ...selectedCustomTags]);
         }
-        closeBulkDialog();
-        magnetInput.focus();
         await loadJobs();
       } catch (error) {
         setBulkDialogStatus(String(error), true);
       } finally {
+        bulkSubmitting = false;
         bulkDialogSubmit.disabled = false;
+        bulkDialogCancel.disabled = false;
+        bulkDialogClose.disabled = false;
+        bulkUseSameSettings.disabled = false;
+        submitButton.disabled = false;
+        syncBulkSettingsMode();
       }
     }
+
+    function updateTorrentFileSelection() {
+      torrentFileInput.value = '';
+      torrentFileSummary.textContent = selectedTorrentFiles.length
+        ? `${selectedTorrentFiles.length} selected: ${selectedTorrentFiles.map(file => file.name).join(', ')}`
+        : 'No .torrent files selected.';
+      torrentFilesClear.hidden = selectedTorrentFiles.length === 0;
+    }
+
+    torrentFileInput.addEventListener('change', () => {
+      const files = [...torrentFileInput.files];
+      const invalid = files.find(file => !file.name.toLowerCase().endsWith('.torrent') || !file.size || file.size > 32 * 1024 * 1024);
+      if (invalid) {
+        setFormStatus(`Choose nonempty .torrent metadata files up to 32 MiB each. Rejected selection: ${invalid.name}`, true);
+      } else if (selectedTorrentFiles.length + files.length > 50) {
+        setFormStatus('A bulk submission can contain at most 50 files and magnets combined.', true);
+      } else {
+        selectedTorrentFiles.push(...files);
+        setFormStatus('Files selected. Confirm the destination, then submit to review multiple items.');
+      }
+      updateTorrentFileSelection();
+    });
+    torrentFilesClear.addEventListener('click', () => {
+      selectedTorrentFiles = [];
+      updateTorrentFileSelection();
+    });
+
+    async function submitIntakeItem(item, options) {
+      if (!item.file) return postJson('/jobs', {...options, magnet_uri: item.uri});
+      const form = new FormData();
+      form.append('settings', JSON.stringify(options));
+      form.append('file', item.file);
+      const response = await fetch('/jobs/torrent', {method: 'POST', body: form});
+      if (!response.ok) throw new Error(await readErrorDetail(response));
+      return response.json();
+    }
+
+    window.addEventListener('beforeunload', event => {
+      if (bulkSubmitting || singleSubmitting) { event.preventDefault(); event.returnValue = ''; }
+    });
 
     function syncHeroDetailsForViewport() {
       heroDetails.open = !mobileHeroMediaQuery.matches;
@@ -2808,7 +2914,7 @@
         if (isSelected) row.className = 'row-selected';
         row.appendChild(createCheckboxCell(job.id, isSelected));
         row.appendChild(createCell(job.id, 'mono cell-id'));
-        row.appendChild(createCell(job.torrent_name, 'cell-name'));
+        row.appendChild(createCell(job.torrent_name || job.torrent_file_name, 'cell-name'));
         row.appendChild(createStateCell(job.state));
         row.appendChild(createCell(job.final_parent, 'mono cell-final-parent'));
         row.appendChild(createCell(job.staging_actual || job.staging_preference, 'cell-stage'));
@@ -2953,6 +3059,7 @@
 
     jobForm.addEventListener('submit', async (event) => {
       event.preventDefault();
+      if (bulkSubmitting || singleSubmitting) return;
       setFormStatus('');
       submitButton.disabled = true;
       closeCategoryMenu();
@@ -2967,13 +3074,14 @@
         submitButton.disabled = false;
         return;
       }
-      if (parsed.magnets.length === 0) {
-        setFormStatus('Paste at least one valid magnet link.', true);
+      const items = [...parsed.magnets, ...selectedTorrentFiles.map(file => ({file}))];
+      if (items.length === 0) {
+        setFormStatus('Paste a magnet link or choose a .torrent file.', true);
         submitButton.disabled = false;
         return;
       }
-      if (parsed.magnets.length > 50) {
-        setFormStatus(`Bulk intake supports up to 50 magnets at once; ${parsed.magnets.length} were detected.`, true);
+      if (items.length > 50) {
+        setFormStatus(`Bulk intake supports up to 50 files and magnets combined; ${items.length} were selected.`, true);
         submitButton.disabled = false;
         return;
       }
@@ -2987,31 +3095,30 @@
         submitButton.disabled = false;
         return;
       }
-      if (parsed.magnets.length > 1) {
-        openBulkDialog(parsed.magnets, formSettings);
+      if (items.length > 1) {
+        openBulkDialog(items, formSettings);
         submitButton.disabled = false;
         return;
       }
 
-      const payload = { ...formSettings, magnet_uri: parsed.magnets[0].uri };
-
+      singleSubmitting = true;
+      torrentFileInput.disabled = true;
+      torrentFilesClear.disabled = true;
       try {
-        const res = await fetch('/jobs', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (!res.ok) {
-          setFormStatus(await readErrorDetail(res), true);
-          return;
-        }
-
+        await submitIntakeItem(items[0], formSettings);
         magnetInput.value = '';
+        selectedTorrentFiles = [];
+        updateTorrentFileSelection();
         magnetInput.focus();
         knownCustomTags = sortedUnique([...knownCustomTags, ...selectedCustomTags]);
         setFormStatus('Job submitted. The job table will continue updating automatically.');
         await loadJobs();
+      } catch (error) {
+        setFormStatus(String(error), true);
       } finally {
+        singleSubmitting = false;
+        torrentFileInput.disabled = false;
+        torrentFilesClear.disabled = false;
         submitButton.disabled = false;
       }
     });

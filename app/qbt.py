@@ -30,7 +30,8 @@ class TorrentAlreadyExistsError(RuntimeError):
 
 
 class QbtService:
-    _BTIH_PATTERN = re.compile(r"(^|[?&])xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})($|&)")
+    _BTIH_PATTERN = re.compile(r"(^|[?&])xt=urn:btih:([A-Za-z0-9]{32}|[A-Fa-f0-9]{40})($|&)", re.IGNORECASE)
+    _BTMH_PATTERN = re.compile(r"(^|[?&])xt=urn:btmh:1220([A-Fa-f0-9]{64})($|&)", re.IGNORECASE)
     _LOGIN_SUCCESS_STATUSES = {200, 204}
     _AUTH_COOKIE_NAMES = {"SID", "QBT_SID"}
 
@@ -247,9 +248,10 @@ class QbtService:
             return compact
         return f"{compact[:limit]}..."
 
-    def add_torrent(self, magnet_uri: str, save_path: str, tags: list[str], category: str) -> None:
+    def add_torrent(self, magnet_uri: str, save_path: str, tags: list[str], category: str,
+                    *, torrent_file_data: bytes | None = None) -> None:
         def operation(client: qbittorrentapi.Client) -> None:
-            infohash = self._extract_btih_hash(magnet_uri)
+            infohash = self._torrent_hash_filter(magnet_uri)
             existing = self._get_torrent_with_client(client, infohash) if infohash else None
             if existing is not None:
                 raise TorrentAlreadyExistsError(
@@ -258,8 +260,9 @@ class QbtService:
                     save_path=getattr(existing, "save_path", None),
                 )
             try:
+                source = {"torrent_files": torrent_file_data} if torrent_file_data is not None else {"urls": magnet_uri}
                 result = client.torrents_add(
-                    urls=magnet_uri,
+                    **source,
                     save_path=save_path,
                     tags=tags,
                     category=category,
@@ -275,7 +278,7 @@ class QbtService:
                         )
                     raise RuntimeError(
                         f"unexpected qBittorrent add result: {result!r} "
-                        "(generic qB add failure; often duplicate torrent, malformed magnet, or rejected save path/category)"
+                        "(generic qB add failure; often duplicate torrent, invalid metadata, or rejected save path/category)"
                     )
             except TorrentAlreadyExistsError:
                 raise
@@ -288,10 +291,21 @@ class QbtService:
         self._with_client(operation)
 
     def find_existing_from_magnet(self, magnet_uri: str):
-        infohash = self._extract_btih_hash(magnet_uri)
+        infohash = self._torrent_hash_filter(magnet_uri)
         if not infohash:
             return None
         return self._with_client(lambda client: self._get_torrent_with_client(client, infohash))
+
+    def _torrent_hash_filter(self, magnet_uri: str) -> str:
+        hashes = []
+        if v1 := self._extract_btih_hash(magnet_uri):
+            hashes.append(v1)
+        if v2 := self._BTMH_PATTERN.search(magnet_uri):
+            # qBittorrent exposes a truncated v2 TorrentID; versions supporting
+            # info-hash aliases may also accept the full SHA-256 value.
+            digest = v2.group(2).lower()
+            hashes.extend((digest[:40], digest))
+        return "|".join(dict.fromkeys(hashes))
 
     def find_by_unique_tag(self, unique_tag: str):
         def operation(client: qbittorrentapi.Client):

@@ -10,6 +10,49 @@ validation allows normal media libraries below `/downloads` while rejecting
 traversal, symlink escapes, staging roots, and operational locations such as
 `/downloads/docker`, `/app`, `/state`, `/var/lib/clamav`, and `/quarantine`.
 
+## Adding magnets and .torrent files
+
+In **New Intake**, paste magnets, select `.torrent` files, or combine both.
+Desktop and mobile use the same controls. Choose the final destination, category,
+staging preference and optional qBittorrent tags, then submit. Multiple items open
+**Review Bulk Intake**, where you can apply the form settings to everyone or edit
+each row's destination, category and staging choice. Custom tags apply to all rows.
+
+- Up to **50 files and magnets combined** per submission. Selecting files again
+  appends to the selection; **Clear selected files** starts that selection over.
+- Each `.torrent` metadata file is limited to **32 MiB**. This is not a limit on
+  the size of the downloaded torrent or its files; existing scan policies apply.
+- File/mixed batches submit one item at a time, with progress and per-item errors.
+  Successful items are removed from the review; failed items and their row settings
+  remain. Check Recent Jobs before retrying an uncertain/network-failed submission:
+  it may already have a durable error job that should use **Retry selected failed**.
+- v1, v2 and hybrid metadata are supported. The application validates bounded
+  bencoded metadata and rejects unsafe paths/symlink entries; qBittorrent performs
+  the final torrent-format validation. It never extracts files or fetches metadata
+  URLs itself. A `.torrent` file is a download recipe, not proof of safe content.
+
+The original uploaded bytes (including private-tracker information and v2 metadata)
+are submitted to qBittorrent and saved in the job's database record, not converted
+to a replacement magnet. Duplicate checks use the info hash, including when the
+same torrent was already added by magnet. Retrying a missing torrent after a restart
+uses the original bytes. Staging admission, completion checks, pause-before-scan,
+per-file checkpoints, malware handling and final promotion use the same workflow
+as magnets. Uploading metadata does **not** bypass any scan.
+
+No new containers, mounts or environment variables are needed. The original
+metadata is retained with its job in `/app/data/torrent_intake.db` and included in
+encrypted backups; ordinary job listings do not read or return the metadata BLOB.
+Metadata can contain tracker passkeys, so protect the data volume as before.
+Retained metadata counts toward the existing **512 MiB portable database backup
+limit**. Downloaded payloads and qBittorrent's own state still need separate backups.
+
+Before updating, take an encrypted backup, then pull/recreate `torrent-intake`
+while keeping `/app/data`. Startup adds two nullable columns without rebuilding
+jobs or resetting checkpoints. Existing magnet jobs and old backups remain valid.
+For rollback to an image predating uploads, restore the pre-update backup while
+Intake is paused; do not resume new file-upload jobs with that older image, which
+does not know how to resubmit their original metadata.
+
 ## Containers and ClamAV flow
 
 This repository publishes two images:
@@ -462,7 +505,7 @@ All application-owned durable state is on the existing `/app/data` mount:
 
 | File | Contents |
 | --- | --- |
-| `torrent_intake.db` | Jobs, private magnets, tags, per-file checkpoints, scan queue and runtime scanner controls |
+| `torrent_intake.db` | Jobs, private magnets, original uploaded .torrent metadata, tags, per-file checkpoints, scan queue and runtime scanner controls |
 | `torrent_intake.db-wal`, `torrent_intake.db-shm` | SQLite's live journals; never copy just the main database while it is running |
 | `settings.json` | All effective application settings, including connection secrets and explicit environment overrides |
 | `admin-token` | Locally generated credential for configuration and backup/restore APIs; intentionally not exported/restored |
@@ -649,7 +692,11 @@ placeholders. The background poller still discovers missed callbacks.
 
 ## API summary
 
-- `POST /jobs` and `POST /jobs/bulk`: create intake jobs
+- `POST /jobs` and `POST /jobs/bulk`: create magnet intake jobs (JSON)
+- `POST /jobs/torrent`: create one file intake job (multipart `file` plus `settings`
+  JSON containing `final_parent`, optional `final_category`, `staging_preference`
+  and `custom_tags`). Bulk file clients submit this endpoint sequentially, as the
+  UI does; do not encode file bytes in JSON or submit multiple files per request.
 - `GET /jobs`, `GET /jobs/{id}`: inspect jobs
 - retry, bulk retry/delete/clear, switch-waiting-jobs-to-NAS-staging, and scan
   priority/pause/resume endpoints used by the UI
@@ -698,6 +745,13 @@ docker run --rm --read-only --network none --cap-drop ALL \
   --mount type=bind,src="$PWD/tests",dst=/tests,readonly \
   --env PYTHONPATH=/app --entrypoint python torrent-intake:test \
   /tests/integration_portability.py
+docker build -f tests/Dockerfile.qbt -t torrent-intake:qbt-test .
+docker run --rm --read-only --network none --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
+  --mount type=bind,src="$PWD/tests",dst=/tests,readonly \
+  --env PYTHONPATH=/app --entrypoint python torrent-intake:qbt-test \
+  /tests/integration_upload.py
 ```
 
 Run the integration script as a non-root Docker user. It uses only disposable
@@ -717,9 +771,21 @@ offline replacement, duplicate-controller locking, and paused recovery. It never
 connects to your qBittorrent or uses production mounts. Unit tests also simulate
 corrupt archives, invalid schemas, symlinks and interruption midway through restore.
 
+The upload integration test runs real qBittorrent beside the Intake HTTP server
+in a test-only image with **network disabled**, temporary profiles and no mounted
+download directories. It checks v1/v2/hybrid multipart submissions, preserved
+private tracker metadata, matching staging/tags, hash resolution and file/magnet
+duplicates. Neither the test qBittorrent package nor its profile is part of the
+published application image. Unit tests cover original-byte retry after restart,
+metadata size/depth/count limits, unsafe paths, malformed/interrupted uploads,
+temporary-file cleanup, additive migration and encrypted backup inclusion.
+
 The optional browser test needs development-only Puppeteer and Chrome (neither
 is added to the app image). After building `torrent-intake:test`, run
-`node tests/test_settings_ui.cjs` with Puppeteer on Node's module path. Set
+`node tests/test_settings_ui.cjs` and `node tests/test_upload_ui.cjs` with Puppeteer
+on Node's module path. The upload browser test stubs submission responses to test
+mixed bulk review, partial failures, per-row settings, tags and sequential uploads
+on desktop/mobile. Set
 `CHROME_PATH` if using an existing Chrome executable. It creates and removes
 its own disposable container/volume, publishes only to localhost, and checks
 desktop/narrow-mobile layouts, field locks/errors, advanced confirmation,

@@ -15,8 +15,7 @@ def extract_magnet_uris(value: str) -> list[str]:
     return [match.group(0).strip().rstrip("),];>") for match in MAGNET_URI_PATTERN.finditer(value or "")]
 
 
-class JobCreate(BaseModel):
-    magnet_uri: str = Field(min_length=10)
+class JobOptions(BaseModel):
     final_parent: str = Field(min_length=2)
     final_category: str | None = None
     staging_preference: Literal["local", "nas"] = "local"
@@ -27,6 +26,18 @@ class JobCreate(BaseModel):
     def validate_final_parent(cls, value: str) -> str:
         return canonical_final_parent(value, get_settings())
 
+    @field_validator("custom_tags")
+    @classmethod
+    def validate_custom_tags(cls, value: list[str]) -> list[str]:
+        return normalize_custom_tags(
+            value,
+            reserved_tags=(get_settings().managed_tag,),
+        )
+
+
+class JobCreate(JobOptions):
+    magnet_uri: str = Field(min_length=10)
+
     @field_validator("magnet_uri")
     @classmethod
     def validate_magnet(cls, value: str) -> str:
@@ -35,19 +46,11 @@ class JobCreate(BaseModel):
             raise ValueError("submit multiple magnet links through /jobs/bulk so each torrent gets its own intake job")
         value = magnets[0] if magnets else value.strip()
         if not value.lower().startswith("magnet:?"):
-            raise ValueError("Only magnet links are supported in this MVP")
+            raise ValueError("Use a magnet link here, or upload a .torrent file through /jobs/torrent")
         # Require a plausible BTIH hash to avoid opaque downstream qBittorrent errors.
         if not BTIH_PATTERN.search(value):
             raise ValueError("magnet_uri must include a valid xt=urn:btih hash")
         return value
-
-    @field_validator("custom_tags")
-    @classmethod
-    def validate_custom_tags(cls, value: list[str]) -> list[str]:
-        return normalize_custom_tags(
-            value,
-            reserved_tags=(get_settings().managed_tag,),
-        )
 
 
 class JobBatchCreate(BaseModel):
@@ -59,6 +62,7 @@ class JobOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     magnet_uri: str
+    torrent_file_name: str | None = None
     final_parent: str
     final_category: str | None
     staging_preference: str

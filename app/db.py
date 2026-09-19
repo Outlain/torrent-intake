@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Engine, LargeBinary, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import get_settings
@@ -53,6 +53,8 @@ SCHEMA_ADDITIONS: dict[str, dict[str, str]] = {
     "jobs": {
         "quarantine_path": "TEXT",
         "custom_tags_json": "TEXT NOT NULL DEFAULT '[]'",
+        "torrent_file_name": "TEXT",
+        "torrent_file_data": "BLOB",
     },
     "scan_runs": {
         "current_file_started_at": "DATETIME",
@@ -104,6 +106,8 @@ def upgrade_schema(bind: Engine = engine) -> None:
             for column_name, definition in additions.items():
                 if column_name in existing_columns:
                     continue
+                if definition == "BLOB":
+                    definition = str(LargeBinary().compile(dialect=bind.dialect))
                 connection.execute(
                     text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {definition}')
                 )

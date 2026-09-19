@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 from .tags import decode_custom_tags, encode_custom_tags
@@ -13,6 +13,8 @@ class Job(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     magnet_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    torrent_file_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    torrent_file_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)
     final_parent: Mapped[str] = mapped_column(Text, nullable=False)
     final_category: Mapped[str | None] = mapped_column(String(255), nullable=True)
 

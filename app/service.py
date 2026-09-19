@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .event_writer import emit_event
 from .models import Job, ScanRun
+from .metainfo import parse_torrent
 from .paths import canonical_final_parent, path_is_within
 from .qbt import QbtService, TorrentAlreadyExistsError
 from .scan_coordinator import SCAN_ACTION_STATES, SCAN_QUEUE_STATES, ScanCoordinator
@@ -52,12 +53,22 @@ class JobService:
         self,
         db: Session,
         *,
-        magnet_uri: str,
+        magnet_uri: str | None = None,
         final_parent: str,
         final_category: str | None,
         staging_preference: str,
         custom_tags: list[str] | None = None,
+        torrent_file_data: bytes | None = None,
+        torrent_file_name: str | None = None,
     ) -> Job:
+        if torrent_file_data is not None:
+            if magnet_uri is not None:
+                raise ValueError("Submit either a magnet or a .torrent file for each job, not both")
+            metadata = parse_torrent(torrent_file_data)
+            magnet_uri = metadata.magnet_uri
+            torrent_file_name = Path((torrent_file_name or "upload.torrent").replace("\\", "/")).name[:255] or "upload.torrent"
+        elif not magnet_uri:
+            raise ValueError("A magnet or .torrent file is required")
         final_parent = canonical_final_parent(final_parent, self.settings)
         custom_tags = normalize_custom_tags(
             custom_tags,
@@ -88,15 +99,12 @@ class JobService:
             staging_preference=staging_preference,
             staging_root=staging_root,
             custom_tags=custom_tags,
+            torrent_file_data=torrent_file_data,
+            torrent_file_name=torrent_file_name,
         )
 
         try:
-            self.qbt.add_torrent(
-                magnet_uri=magnet_uri,
-                save_path=staging_root,
-                tags=self._qbt_tags_for_job(job),
-                category=self.settings.intake_category,
-            )
+            self._add_job_to_qbt(job, staging_root)
             self._resolve_hash_for_job(db, job)
             self._evaluate_staging_now(db, job)
         except TorrentAlreadyExistsError as exc:
@@ -129,12 +137,16 @@ class JobService:
         staging_preference: str,
         staging_root: str,
         custom_tags: list[str],
+        torrent_file_data: bytes | None = None,
+        torrent_file_name: str | None = None,
     ) -> Job:
         last_exc: Exception | None = None
         for _ in range(5):
             job = Job(
                 id=str(uuid4()),
                 magnet_uri=magnet_uri,
+                torrent_file_data=torrent_file_data,
+                torrent_file_name=torrent_file_name,
                 final_parent=final_parent,
                 final_category=final_category,
                 staging_preference=staging_preference,
@@ -243,12 +255,7 @@ class JobService:
                 job.qbt_hash = None
 
             if not job.qbt_hash:
-                self.qbt.add_torrent(
-                    magnet_uri=job.magnet_uri,
-                    save_path=staging_root,
-                    tags=self._qbt_tags_for_job(job),
-                    category=self.settings.intake_category,
-                )
+                self._add_job_to_qbt(job, staging_root)
                 self._resolve_hash_for_job(db, job)
                 self._evaluate_staging_now(db, job)
                 return job
@@ -307,6 +314,21 @@ class JobService:
             db.add(job)
             db.commit()
             raise RuntimeError(f"Failed to retry job: {error_text}") from exc
+
+    def _add_job_to_qbt(self, job: Job, staging_root: str) -> None:
+        source = {}
+        if job.torrent_file_name is not None:
+            metadata = parse_torrent(job.torrent_file_data)
+            if metadata.magnet_uri != job.magnet_uri:
+                raise ValueError("Saved .torrent metadata does not match this job")
+            source["torrent_file_data"] = metadata.data
+        self.qbt.add_torrent(
+            magnet_uri=job.magnet_uri,
+            save_path=staging_root,
+            tags=self._qbt_tags_for_job(job),
+            category=self.settings.intake_category,
+            **source,
+        )
 
     def delete_job(self, db: Session, *, job_id: str) -> None:
         job = db.get(Job, job_id)
