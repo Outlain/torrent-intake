@@ -106,7 +106,42 @@ This is an admission rule, not proof that the attachment is harmless: its bytes
 are still included in the ClamD windows and are also scanned as complete objects.
 No attachment is opened in Kodi or used to fetch a URL. Missing/other MIME types and other
 extensionless attachments remain blocked. The existing font, image, subtitle,
-and text suffix rules are unchanged.
+and text suffix rules otherwise remain unchanged.
+
+Font collection attachments ending in `.ttc` (case-insensitive) are supported,
+including those labelled `application/octet-stream`. This follows the
+[Matroska font attachment conventions](https://www.matroska.org/technical/attachments.html).
+The suffix admits the attachment to bounded extraction and a complete ClamAV scan;
+it does not prove that its bytes are a valid or harmless font. Unknown attachments
+are not admitted merely because their MIME label claims to describe a font.
+
+### Understanding media-policy errors
+
+An unsupported format/stream/attachment is a **policy block**, not a malware
+detection and not necessarily a size-limit failure. The shared media inspector
+also checks attachments in smaller Matroska files, so its errors no longer label
+every failure as "oversized media".
+
+Media-validation rejections include the affected path, detected container, stream index/type,
+codec and codec tag, and handler name where reported. Attachment rejections also
+include the filename, extension, MIME label and declared size in bytes. Size/count
+failures identify the applicable limit and reported/reserved amount; incomplete
+extraction identifies expected and actual byte counts. Missing fields appear as
+`unknown`. Metadata values are escaped and bounded, not dumped as raw payloads.
+These details appear in the existing job error; no debug logging or new setting
+is needed. Notifications retain their existing message-length bound.
+
+For example, an MP4 rejection may report `stream_type="data"; codec="bin_data";
+codec_tag="tmcd"`. All `data` tracks remain blocked in the media-fallback route,
+including timecode tracks. Extra diagnostics do not grant an exception or change
+native scan routing. Increasing size limits will not fix an unsupported-type
+error. Share the diagnostic context (redacting private path names) for review.
+
+After updating the application image, use **Retry selected failed** for previously
+blocked `.ttc` jobs. Stored error text is refreshed on the next attempt, not when
+an image is pulled. No variables, mounts or database migrations are required.
+This additive compatibility fix does not reset existing clean checkpoints; normal
+file-identity, definition and policy checks still apply.
 
 ### Complete attachment scans
 
@@ -759,7 +794,9 @@ test directories and isolated, read-only-root containers, never deployment
 volumes. Real FFmpeg creates ASF/AVI-name and Kodi-attachment MKV fixtures; real
 ClamD scans them over a private Unix socket with a tiny EICAR test signature
 database. It checks clean files, embedded EICAR, an overlapping-window boundary,
-native and large-media attachment scans, cover images, a hash-only attachment
+native and large-media attachment scans (including synthetic TTC-named objects
+with generic MIME labels), diagnostic rejection of a real MP4 timecode track,
+cover images, a hash-only attachment
 signature missed by the opaque whole-container scan, encrypted-archive holding,
 and malformed-media rejection. Window sizes are reduced for these small tests;
 this is not a multi-gigabyte throughput test or a full signature-database test.

@@ -63,6 +63,7 @@ SAFE_ATTACHMENT_SUFFIXES = frozenset(
         ".png",
         ".srt",
         ".ssa",
+        ".ttc",
         ".ttf",
         ".txt",
         ".webp",
@@ -282,6 +283,48 @@ def split_large_media_window(
     return (offset, left_length), (right_offset, right_length)
 
 
+def _media_policy_error(
+    reason: str,
+    path: str,
+    *,
+    container=None,
+    stream: dict | None = None,
+    **details,
+) -> ScannerPolicyError:
+    """Diagnostic metadata only: bounded, escaped values, never a payload dump."""
+    fields = {"path": path, "container": container}
+    if stream is not None:
+        tags = stream.get("tags")
+        tags = tags if isinstance(tags, dict) else {}
+        fields.update(
+            stream_index=stream.get("index"), stream_type=stream.get("codec_type"),
+            codec=stream.get("codec_name"), codec_tag=stream.get("codec_tag_string"),
+            handler=tags.get("handler_name"),
+        )
+        if stream.get("codec_type") == "attachment" or "filename" in tags:
+            filename = tags.get("filename")
+            fields.update(
+                attachment=filename,
+                extension=os.path.splitext(filename)[1].casefold() if isinstance(filename, str) else None,
+                mime=tags.get("mimetype"), declared_bytes=stream.get("extradata_size"),
+            )
+    fields.update(details)
+
+    def display(key, value):
+        if value is None or value == "":
+            value = "unknown"
+        elif not isinstance(value, (str, int, float, bool)):
+            value = f"invalid {type(value).__name__}"
+        if isinstance(value, str):
+            limit = 4096 if key == "path" else 256
+            if len(value) > limit:
+                value = value[:limit] + "...[truncated]"
+        return json.dumps(value, ensure_ascii=True)
+
+    context = "; ".join(f"{key}={display(key, value)}" for key, value in fields.items())
+    return ScannerPolicyError(f"{reason}; {context}")
+
+
 def parse_large_media_probe(
     raw_output: str,
     path: str,
@@ -293,11 +336,9 @@ def parse_large_media_probe(
     try:
         payload = json.loads(raw_output)
     except (TypeError, json.JSONDecodeError) as exc:
-        raise ScannerPolicyError(
-            f"oversized file is not valid supported media content: {path}"
-        ) from exc
+        raise _media_policy_error("ffprobe returned invalid media JSON", path) from exc
     if not isinstance(payload, dict):
-        raise ScannerPolicyError(f"ffprobe returned an invalid media description: {path}")
+        raise _media_policy_error("ffprobe returned an invalid media description", path)
 
     format_payload = payload.get("format")
     format_name = (
@@ -308,62 +349,62 @@ def parse_large_media_probe(
         for part in str(format_name or "").split(",")
         if part.strip()
     }
+
+    def rejected(reason: str, stream: dict | None = None, **details) -> ScannerPolicyError:
+        return _media_policy_error(reason, path, container=format_name, stream=stream, **details)
+
     approved_video_formats = detected_formats & LARGE_VIDEO_FORMATS
     is_raw_truehd = detected_formats == {LARGE_TRUEHD_FORMAT}
     if not approved_video_formats and not is_raw_truehd:
-        detected = ",".join(sorted(detected_formats)) or "unknown"
-        raise ScannerPolicyError(
-            "oversized content type is not an approved video container or raw "
-            f"TrueHD audio stream ({detected}): {path}"
+        raise rejected(
+            "content type is not an approved video container or raw TrueHD audio stream"
         )
 
     streams = payload.get("streams")
     if not isinstance(streams, list) or len(streams) > 1024:
-        raise ScannerPolicyError(
-            f"oversized media has an invalid or excessive stream table: {path}"
+        raise rejected(
+            "media has an invalid or excessive stream table",
+            stream_count=len(streams) if isinstance(streams, list) else None, max_streams=1024,
         )
     if is_raw_truehd:
         suffix = os.path.splitext(path)[1].casefold()
         if suffix not in LARGE_TRUEHD_SUFFIXES:
-            raise ScannerPolicyError(
-                f"raw TrueHD content requires a .thd or .truehd filename: {path}"
-            )
+            raise rejected("raw TrueHD content requires a .thd or .truehd filename", extension=suffix)
         if len(streams) != 1 or not isinstance(streams[0], dict):
-            raise ScannerPolicyError(
-                f"raw TrueHD content must contain exactly one TrueHD audio stream: {path}"
+            raise rejected(
+                "raw TrueHD content must contain exactly one TrueHD audio stream",
+                stream_count=len(streams),
             )
         stream_type = str(streams[0].get("codec_type") or "").casefold()
         codec_name = str(streams[0].get("codec_name") or "").casefold()
         if stream_type != "audio" or codec_name != LARGE_TRUEHD_FORMAT:
-            raise ScannerPolicyError(
-                f"raw TrueHD content must contain exactly one TrueHD audio stream: {path}"
-            )
+            raise rejected("raw TrueHD content must contain exactly one TrueHD audio stream", streams[0])
         return MediaProbe(LARGE_TRUEHD_FORMAT)
 
     video_streams = 0
     attachments: list[MediaAttachment] = []
     reserved_attachment_bytes = 0
     attachment_indices: set[int] = set()
-    for stream in streams:
+    for position, stream in enumerate(streams):
         if not isinstance(stream, dict):
-            raise ScannerPolicyError(
-                f"oversized media has a malformed stream entry: {path}"
-            )
+            raise rejected("media has a malformed stream entry", stream_position=position)
         stream_type = str(stream.get("codec_type") or "").casefold()
         if stream_type not in LARGE_MEDIA_STREAM_TYPES:
-            raise ScannerPolicyError(
-                f"oversized media contains unsupported stream type {stream_type or 'unknown'}: {path}"
+            raise rejected(
+                "media contains unsupported stream type "
+                "(only video, audio, subtitle and attachment are supported)", stream,
             )
         disposition = stream.get("disposition")
         is_picture = isinstance(disposition, dict) and disposition.get("attached_pic") == 1
         if is_picture and stream_type != "video":
-            raise ScannerPolicyError(f"media has an invalid attached-picture stream: {path}")
+            raise rejected("media has an invalid attached-picture stream", stream)
         if stream_type == "video" and not is_picture:
             video_streams += 1
         if stream_type == "attachment" or is_picture:
             if len(attachments) >= 64:
-                raise ScannerPolicyError(
-                    f"oversized media contains too many attachments: {path}"
+                raise rejected(
+                    "media contains too many attachments", stream,
+                    attachment_count=len(attachments) + 1, max_attachments=64,
                 )
             tags = stream.get("tags")
             filename = tags.get("filename") if isinstance(tags, dict) else None
@@ -376,14 +417,13 @@ def parse_large_media_probe(
                 in KODI_METADATA_MIMETYPES
             )
             if suffix not in SAFE_ATTACHMENT_SUFFIXES and not is_kodi_metadata:
-                raise ScannerPolicyError(
-                    "oversized media contains an attachment that is not a recognized font, "
-                    "image, subtitle, text file, or named Kodi text/XML metadata "
-                    f"({filename or 'unnamed'}; MIME={mimetype or 'missing'}): {path}"
+                raise rejected(
+                    "unsupported attachment: expected a recognized font, image, subtitle, "
+                    "text file, or named Kodi text/XML metadata", stream,
                 )
             index = stream.get("index")
             if type(index) is not int or index < 0 or index in attachment_indices:
-                raise ScannerPolicyError(f"media attachment has an invalid or duplicate stream index: {path}")
+                raise rejected("media attachment has an invalid or duplicate stream index", stream)
             attachment_indices.add(index)
             size = stream.get("extradata_size")
             if is_picture:
@@ -393,13 +433,19 @@ def parse_large_media_probe(
                 reserved_attachment_bytes += attachment_max_bytes
             else:
                 if type(size) is not int or not 0 < size <= attachment_max_bytes:
-                    raise ScannerPolicyError(f"media attachment has a missing, empty, or excessive size: {filename}: {path}")
+                    raise rejected(
+                        "media attachment has a missing, empty, or excessive size", stream,
+                        min_attachment_bytes=1, max_attachment_bytes=attachment_max_bytes,
+                    )
                 reserved_attachment_bytes += size
             if reserved_attachment_bytes > attachment_total_bytes:
-                raise ScannerPolicyError(f"media attachments exceed the total extraction budget: {path}")
+                raise rejected(
+                    "media attachments exceed the total extraction budget", stream,
+                    reserved_bytes=reserved_attachment_bytes, max_total_bytes=attachment_total_bytes,
+                )
             attachments.append(MediaAttachment(index, str(filename), size, is_picture))
     if require_video and video_streams == 0:
-        raise ScannerPolicyError(f"oversized container does not contain a video stream: {path}")
+        raise rejected("container does not contain a video stream")
     return MediaProbe(",".join(sorted(approved_video_formats)), tuple(attachments))
 
 
@@ -953,8 +999,8 @@ class ScannerService:
             "file,pipe",
             "-format_whitelist", ",".join(sorted(LARGE_VIDEO_FORMATS | {LARGE_TRUEHD_FORMAT})),
             "-show_entries",
-            "format=format_name:stream=index,codec_type,codec_name,extradata_size:"
-            "stream_tags=filename,mimetype:stream_disposition=attached_pic",
+            "format=format_name:stream=index,codec_type,codec_name,codec_tag_string,extradata_size:"
+            "stream_tags=filename,mimetype,handler_name:stream_disposition=attached_pic",
             "-of",
             "json",
             f"/proc/self/fd/{descriptor}",
@@ -1025,7 +1071,11 @@ class ScannerService:
             if attachment.size_bytes is not None:
                 maximum = min(maximum, attachment.size_bytes)
             if maximum <= 0:
-                raise ScannerPolicyError(f"media attachments exceed the total extraction budget: {path}")
+                raise _media_policy_error(
+                    "media attachments exceed the total extraction budget", path, container=probe.format_name,
+                    stream_index=attachment.index, attachment=attachment.filename,
+                    extracted_bytes=total_bytes, max_total_bytes=self.settings.media_attachment_total_mib * 1024 * 1024,
+                )
             command = [
                 self.settings.ffmpeg_binary, "-v", "error", "-nostdin", "-n",
                 "-max_alloc", str(MAX_SINGLE_ALLOCATION_BYTES),
@@ -1051,7 +1101,11 @@ class ScannerService:
             self._verify_file_identity(descriptor, path, expected)
             size = len(completed.stdout)
             if not 0 < size <= maximum or (attachment.size_bytes is not None and size != attachment.size_bytes):
-                raise ScannerPolicyError(f"media attachment extraction was incomplete: stream={attachment.index}: {path}")
+                raise _media_policy_error(
+                    "media attachment extraction was incomplete", path, container=probe.format_name,
+                    stream_index=attachment.index, attachment=attachment.filename,
+                    declared_bytes=attachment.size_bytes, extracted_bytes=size, max_attachment_bytes=maximum,
+                )
             total_bytes += size
             # Only one bounded, application-named temporary file exists at a
             # time. Embedded filenames are never passed to filesystem APIs.

@@ -95,6 +95,20 @@ def run() -> None:
                     "-frames:v", "1", "-threads", "1", str(ROOT / "cover.png")], check=True, timeout=30)
     picture_mkv = make_video("picture.mkv", "matroska", attachment="cover.png",
                              filename="cover.png", mimetype="image/png")
+    # Synthetic TTC-named objects test admission/extraction/scanning, not font
+    # rendering or conformance. A filename must never exempt bytes from ClamD.
+    (ROOT / "font-collection.ttc").write_bytes(b"Synthetic harmless font-collection test attachment")
+    (ROOT / "font-eicar.ttc").write_bytes(EICAR)
+    ttc_clean = make_video("ttc-clean.mkv", "matroska", attachment="font-collection.ttc",
+                           filename="2024-01-27@16_13_58_5643_msmincho.ttc", mimetype="application/octet-stream")
+    ttc_eicar = make_video("ttc-eicar.mkv", "matroska", attachment="font-eicar.ttc",
+                           filename="subtitle.TTC", mimetype="application/octet-stream")
+    ttc_hash = make_video("ttc-hash-only.mkv", "matroska", attachment="hash-only.bin",
+                          filename="font.ttc", mimetype="application/octet-stream")
+    timed_mp4 = ROOT / "timecode.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                    "color=size=32x32:rate=25", "-t", "1", "-threads", "1", "-c:v", "mpeg4",
+                    "-timecode", "00:00:00:00", str(timed_mp4)], check=True, timeout=30)
     infected_asf = ROOT / "asf-eicar.avi"
     asf_bytes = clean_asf.read_bytes()
     # Put EICAR across a test-window boundary, beyond the original media data.
@@ -111,8 +125,21 @@ def run() -> None:
 
     for path, infected in ((clean_asf, False), (infected_mkv, True)):
         check(path, infected=infected, method="clamd_native")
-    for path in (clean_mkv, picture_mkv):
+    for path in (clean_mkv, picture_mkv, ttc_clean):
         check(path, infected=False, method="clamd_native_with_attachments")
+
+    descriptor = os.open(ttc_eicar, os.O_RDONLY)
+    try:
+        probe = scanner._probe_large_media_descriptor(descriptor, str(ttc_eicar))
+        assert probe.attachments[0].filename == "subtitle.TTC"
+        infected, threat, _ = scanner._scan_media_attachments(
+            descriptor, str(ttc_eicar), file_identity(os.fstat(descriptor)), probe,
+            deadline=time.monotonic() + 30, heartbeat=None, should_stop=None,
+        )
+        assert infected and "EICAR" in threat
+        print("PASS extracted TTC-named attachment with generic MIME: EICAR detected", flush=True)
+    finally:
+        os.close(descriptor)
 
     descriptor = os.open(hash_mkv, os.O_RDONLY)
     try:
@@ -121,6 +148,7 @@ def run() -> None:
     finally:
         os.close(descriptor)
     check(hash_mkv, infected=True, method="clamd_native_with_attachments", threat="AttachmentHash")
+    check(ttc_hash, infected=True, method="clamd_native_with_attachments", threat="AttachmentHash")
 
     # Scale only routing/window sizes for tiny fixtures. Real ffprobe, opened
     # descriptors, parallel INSTREAM requests, ClamD and replies remain unmocked.
@@ -131,17 +159,31 @@ def run() -> None:
         patch.object(settings_type, "large_media_min_chunk_bytes", new_callable=PropertyMock, return_value=256),
         patch.object(settings_type, "large_media_overlap_bytes", new_callable=PropertyMock, return_value=128),
     ):
-        for path in (clean_asf, clean_mkv, infected_mkv, infected_asf, hash_mkv, picture_mkv):
+        for path in (clean_asf, clean_mkv, infected_mkv, infected_asf, hash_mkv, picture_mkv,
+                     ttc_clean, ttc_eicar, ttc_hash, timed_mp4):
             if path.stat().st_size <= 8192:
                 with path.open("ab") as output:
                     output.write(b"\0" * (8193 - path.stat().st_size))
         for path, infected in (
             (clean_asf, False), (clean_mkv, False),
-            (infected_asf, True), (infected_mkv, True),
+            (infected_asf, True), (infected_mkv, True), (ttc_clean, False), (ttc_eicar, True),
         ):
             check(path, infected=infected, method="media_windows_and_attachments")
         check(hash_mkv, infected=True, method="media_windows_and_attachments", threat="AttachmentHash")
+        check(ttc_hash, infected=True, method="media_windows_and_attachments", threat="AttachmentHash")
         check(picture_mkv, infected=False, method="media_windows_and_attachments")
+
+        try:
+            scanner.scan_path(str(timed_mp4), identity=identity)
+        except ScannerPolicyError as error:
+            message = str(error)
+            for detail in ("unsupported stream type", 'stream_type="data"', 'codec_tag="tmcd"',
+                           "stream_index=", "codec=", "container=", str(timed_mp4)):
+                assert detail in message, message
+            assert "oversized" not in message
+            print(f"PASS MP4 data track remains blocked with diagnostic context: {message}", flush=True)
+        else:
+            raise AssertionError("unsupported MP4 data track was admitted")
 
         (ROOT / "not-video.mkv").write_bytes(b"not a video\n" * 1000)
         try:

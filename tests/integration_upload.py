@@ -100,7 +100,13 @@ def main():
                 with Session(engine) as db:
                     job = db.get(Job, identifier)
                     assert job.torrent_file_data == data
-                    assert job.qbt_hash, "existing hash resolution must work for uploaded metadata"
+                    # qB accepts uploads asynchronously. With the worker disabled
+                    # above, exercise its existing hash-resolution retry here.
+                    deadline = time.monotonic() + 10
+                    while not job.qbt_hash and job.state == "waiting_for_qbt_hash" and time.monotonic() < deadline:
+                        time.sleep(0.1)
+                        application.service._resolve_hash_for_job(db, job)
+                    assert job.qbt_hash, (number, "hash resolution failed", job.state, job.last_error)
                     matches = client.torrents_info(torrent_hashes=job.qbt_hash)
                     assert len(matches) == 1
                     assert matches[0].save_path.rstrip("/") == str(root / "staging")

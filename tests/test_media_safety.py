@@ -81,6 +81,117 @@ class MediaSafetyTests(unittest.TestCase):
         self.scanner.settings.media_attachment_max_mib = 8
         self.assertNotEqual(current, self.scanner.policy_version())
 
+    def test_ttc_font_collections_with_generic_mime_are_admitted_for_scanning(self):
+        for filename in ("2024-01-27@16_13_58_5643_msmincho.ttc", "SUBTITLE.TTC"):
+            for mime in ("application/octet-stream", "font/collection", None):
+                with self.subTest(filename=filename, mime=mime):
+                    payload = {"format": {"format_name": "matroska,webm"}, "streams": [
+                        {"index": 0, "codec_type": "video"},
+                        {"index": 2, "codec_type": "attachment", "extradata_size": 1024,
+                         "tags": {"filename": filename, "mimetype": mime}},
+                    ]}
+                    probe = parse_large_media_probe(json.dumps(payload), "/downloads/episode.mkv")
+                    self.assertEqual(probe.attachments, (MediaAttachment(2, filename, 1024),))
+
+    def test_unknown_attachment_error_identifies_the_file_and_attachment(self):
+        attachment = {"index": 3, "codec_type": "attachment", "extradata_size": 2048,
+                      "codec_name": "unknown", "codec_tag_string": "[0][0][0][0]",
+                      "tags": {"filename": "unexpected.bin", "mimetype": "font/collection"}}
+        payload = {"format": {"format_name": "matroska,webm"}, "streams": [attachment]}
+        with self.assertRaises(ScannerPolicyError) as caught:
+            parse_large_media_probe(json.dumps(payload), "/downloads/Series/episode.mkv")
+        message = str(caught.exception)
+        for detail in ("unsupported attachment", 'path="/downloads/Series/episode.mkv"',
+                       'container="matroska,webm"', "stream_index=3", 'stream_type="attachment"',
+                       'codec="unknown"', 'codec_tag="[0][0][0][0]"', 'extension=".bin"',
+                       'attachment="unexpected.bin"', 'mime="font/collection"', "declared_bytes=2048"):
+            self.assertIn(detail, message)
+        self.assertNotIn("oversized", message)
+
+    def test_mp4_data_track_stays_blocked_and_reports_codec_tag(self):
+        payload = {"format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"}, "streams": [
+            {"index": 0, "codec_type": "video"},
+            {"index": 2, "codec_type": "data", "codec_name": "bin_data", "codec_tag_string": "tmcd",
+             "tags": {"handler_name": "TimeCodeHandler"}},
+        ]}
+        with self.assertRaises(ScannerPolicyError) as caught:
+            parse_large_media_probe(json.dumps(payload), "/downloads/episode.mp4")
+        message = str(caught.exception)
+        for detail in ("unsupported stream type", "stream_index=2", 'stream_type="data"',
+                       'codec="bin_data"', 'codec_tag="tmcd"', 'handler="TimeCodeHandler"',
+                       'path="/downloads/episode.mp4"', 'container="mov,mp4,m4a,3gp,3g2,mj2"'):
+            self.assertIn(detail, message)
+        self.assertNotIn("oversized", message)
+
+    def test_diagnostic_values_are_bounded_escaped_and_missing_fields_are_explicit(self):
+        attachment = {"codec_type": "attachment", "tags": {
+            "filename": "unexpected\n\x1b[31m.bin", "mimetype": "x" * 10000,
+            "unrelated_private_metadata": "must-not-be-logged",
+        }}
+        payload = {"format": {"format_name": "matroska"}, "streams": [attachment]}
+        with self.assertRaises(ScannerPolicyError) as caught:
+            parse_large_media_probe(json.dumps(payload), "/downloads/episode.mkv")
+        message = str(caught.exception)
+        for detail in ('stream_index="unknown"', 'codec="unknown"', 'declared_bytes="unknown"',
+                       "\\n", "\\u001b", "[truncated]"):
+            self.assertIn(detail, message)
+        for detail in ("\n", "\x1b", "must-not-be-logged"):
+            self.assertNotIn(detail, message)
+        self.assertLess(len(message), 1500)
+
+    def test_attachment_limit_errors_include_declared_size_and_actual_budget(self):
+        attachment = {"index": 2, "codec_type": "attachment", "extradata_size": 17,
+                      "tags": {"filename": "font.ttc", "mimetype": "application/octet-stream"}}
+        payload = {"format": {"format_name": "matroska"}, "streams": [attachment]}
+        with self.assertRaises(ScannerPolicyError) as caught:
+            parse_large_media_probe(json.dumps(payload), "episode.mkv", attachment_max_bytes=16)
+        self.assertIn("declared_bytes=17", str(caught.exception))
+        self.assertIn("max_attachment_bytes=16", str(caught.exception))
+        with self.assertRaises(ScannerPolicyError) as caught:
+            parse_large_media_probe(json.dumps(payload), "episode.mkv", attachment_max_bytes=32, attachment_total_bytes=16)
+        self.assertIn("reserved_bytes=17", str(caught.exception))
+        self.assertIn("max_total_bytes=16", str(caught.exception))
+
+    def test_probe_collects_diagnostic_fields_without_packet_or_payload_dump(self):
+        payload = {"format": {"format_name": "matroska"}, "streams": [{"codec_type": "video"}]}
+        with patch.object(self.scanner, "_run_media_tool", return_value=subprocess.CompletedProcess(
+            [], 0, json.dumps(payload).encode(), b"",
+        )) as tool:
+            self.scanner._probe_large_media_descriptor(0, "episode.mkv")
+        command = tool.call_args.args[0]
+        fields = command[command.index("-show_entries") + 1]
+        self.assertIn("codec_tag_string", fields)
+        self.assertIn("handler_name", fields)
+        self.assertNotIn("-show_packets", command)
+        self.assertNotIn("-show_data", command)
+
+    def test_ttc_attachment_is_fully_scanned_and_threat_or_limit_still_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "episode.mkv"
+            path.write_bytes(b"\x1aE\xdf\xa3test")
+            probe = parse_large_media_probe(json.dumps({"format": {"format_name": "matroska"}, "streams": [
+                {"codec_type": "video"}, {"index": 1, "codec_type": "attachment", "extradata_size": 4,
+                "tags": {"filename": "font.ttc", "mimetype": "application/octet-stream"}},
+            ]}), str(path))
+            for reply in (b"stream: OK", b"stream: Test.EICAR FOUND", b"stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND"):
+                with (
+                    self.subTest(reply=reply),
+                    patch.object(self.scanner, "_probe_large_media_descriptor", return_value=probe),
+                    patch.object(self.scanner, "_run_media_tool", return_value=subprocess.CompletedProcess([], 0, b"data", b"")),
+                    patch.object(self.scanner, "_scan_descriptor_window", side_effect=[b"stream: OK", reply]) as scan,
+                    patch.object(self.scanner, "_scan_large_media_descriptor") as fallback,
+                ):
+                    if b"Limits.Exceeded" in reply:
+                        with self.assertRaises(ScannerPolicyError):
+                            self.scanner.scan_path(str(path), identity=self.identity)
+                    else:
+                        result = self.scanner.scan_path(str(path), identity=self.identity)
+                        self.assertEqual(result.infected, b"FOUND" in reply)
+                        self.assertEqual(result.clean, reply == b"stream: OK")
+                    self.assertEqual(scan.call_count, 2)  # whole container, then whole attachment
+                    self.assertEqual(scan.call_args.kwargs["length"], 4)
+                    fallback.assert_not_called()
+
     def test_attachment_budgets_and_indices_are_validated_before_extraction(self):
         attachment = {"index": 1, "codec_type": "attachment", "extradata_size": 12,
                       "tags": {"filename": "font.ttf"}}
