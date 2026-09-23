@@ -132,16 +132,48 @@ These details appear in the existing job error; no debug logging or new setting
 is needed. Notifications retain their existing message-length bound.
 
 For example, an MP4 rejection may report `stream_type="data"; codec="bin_data";
-codec_tag="tmcd"`. All `data` tracks remain blocked in the media-fallback route,
-including timecode tracks. Extra diagnostics do not grant an exception or change
-native scan routing. Increasing size limits will not fix an unsupported-type
-error. Share the diagnostic context (redacting private path names) for review.
+codec_tag="tmcd"`. Generic `data` tracks remain blocked in the media-fallback route,
+including timecode tracks. The narrowly validated MP4 chapter-text exception is
+described below; a handler label alone never grants an exception. Increasing size
+limits will not fix an unsupported-type error. Share the diagnostic context
+(redacting private path names) for review.
 
 After updating the application image, use **Retry selected failed** for previously
-blocked `.ttc` jobs. Stored error text is refreshed on the next attempt, not when
-an image is pulled. No variables, mounts or database migrations are required.
+blocked `.ttc` or MP4 chapter-text jobs. Stored error text is refreshed on the next
+attempt, not when an image is pulled. No variables, mounts or database migrations are required.
 This additive compatibility fix does not reset existing clean checkpoints; normal
 file-identity, definition and policy checks still apply.
+
+### MP4 chapter-text tracks
+
+QuickTime-style MP4 chapter names can be reported as `data / bin_data / text`,
+often with the misleading handler name `SubtitleHandler`. The media route admits
+only this specific MOV/MP4 combination for additional validation; it does not
+trust the handler name, accept arbitrary data streams or strip tracks from files.
+
+A second, bounded FFprobe call disables chapter reinterpretation with
+`-ignore_chapters 1`, so the original text samples are available rather than
+silently discarded. **This does not skip the chapter scan.** The selected track
+must resolve to `subtitle / mov_text / text`. Its sample count must be present,
+between 1 and 4096, and match the complete packet list. Packet offsets, sizes,
+corruption flags and text-length prefixes are checked before acceptance. Unknown,
+overlapping, out-of-file, empty, truncated or excessive output holds the torrent.
+
+The application reads those bounded sample ranges from the already-open source
+descriptor, preserves **all raw sample bytes**, including length prefixes and
+trailing boxes, and scans the concatenated track as one complete ClamAV object.
+It does not scan just the exported chapter titles. The existing full-coverage
+video-window scan still runs. Nothing is transcoded and no second movie copy is
+created; the track payload alone uses a temporary file. Structural checks are
+not proof that content is harmless, and antivirus detection is not a guarantee.
+
+Chapter tracks share the existing per-attachment/total byte budgets and 64-object
+count limit with fonts and cover art. Each chapter track reserves the full
+per-object allowance. Helper processes retain their existing memory, output,
+timeout and cancellation bounds; the extra packet list selects only the chapter
+track and does not request decoded video frames.
+Native scans that finish successfully are unchanged. Both oversized-media and
+native-limit fallback scans use this additional chapter validation.
 
 ### Complete attachment scans
 
@@ -164,8 +196,8 @@ limit/error cannot enter the media fallback or be subdivided.
 Defaults are `TI_MEDIA_ATTACHMENT_MAX_MIB=16` per attachment and
 `TI_MEDIA_ATTACHMENT_TOTAL_MIB=64` per media file, with at most 64 attachments.
 The configurable hard ceilings are 64 MiB per attachment and 256 MiB total.
-Unknown-size cover images reserve their per-attachment maximum against the total
-budget. Empty, oversized, missing, or incomplete output holds the torrent.
+Unknown-size cover images and chapter tracks reserve their per-attachment maximum
+against the total budget. Empty, oversized, missing, or incomplete output holds the torrent.
 There is no extra persistent volume or database. The application's existing
 256 MiB `/tmp` tmpfs covers the default bounded temporary files; streamed movie
 windows still use the separate ClamD tmpfs.
@@ -796,7 +828,8 @@ ClamD scans them over a private Unix socket with a tiny EICAR test signature
 database. It checks clean files, embedded EICAR, an overlapping-window boundary,
 native and large-media attachment scans (including synthetic TTC-named objects
 with generic MIME labels), diagnostic rejection of a real MP4 timecode track,
-cover images, a hash-only attachment
+clean/infected MP4 chapter tracks, complete-track hash detection and malformed
+chapter samples, cover images, a hash-only attachment
 signature missed by the opaque whole-container scan, encrypted-archive holding,
 and malformed-media rejection. Window sizes are reduced for these small tests;
 this is not a multi-gigabyte throughput test or a full signature-database test.

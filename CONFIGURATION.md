@@ -175,8 +175,8 @@ The tables below show built-in defaults, not overrides from your deployment.
 | `TI_LARGE_MEDIA_SCAN_TIMEOUT_SECONDS` | `172800` | Total deadline for one large media file (two days), not the torrent's lifetime. |
 | `TI_FFPROBE_BINARY` | `/usr/bin/ffprobe` | Image-provided media inspector; normally leave unchanged. |
 | `TI_FFMPEG_BINARY` | `/usr/bin/ffmpeg` | Image-provided bounded attachment extractor; normally leave unchanged. |
-| `TI_MEDIA_ATTACHMENT_MAX_MIB` | `16` | Per-attachment extraction budget, hard maximum 64. |
-| `TI_MEDIA_ATTACHMENT_TOTAL_MIB` | `64` | All extracted attachments in one media file, hard maximum 256. |
+| `TI_MEDIA_ATTACHMENT_MAX_MIB` | `16` | Per-object extraction budget (attachments, cover art, validated MP4 chapter-text tracks), hard maximum 64. |
+| `TI_MEDIA_ATTACHMENT_TOTAL_MIB` | `64` | Combined extracted-object budget in one media file, hard maximum 256. Unknown-size cover art/chapter tracks reserve the full per-object allowance. |
 
 App definition-age checks use the loaded daemon's reported timestamp. Sidecar
 startup/health checks inspect database files on disk. They are independent checks,

@@ -50,6 +50,7 @@ LARGE_VIDEO_FORMATS = frozenset(
 LARGE_TRUEHD_FORMAT = "truehd"
 LARGE_TRUEHD_SUFFIXES = frozenset({".thd", ".truehd"})
 LARGE_MEDIA_STREAM_TYPES = frozenset({"audio", "attachment", "subtitle", "video"})
+MAX_CHAPTER_SAMPLES = 4096
 KODI_METADATA_FILENAMES = frozenset({"kodi-metadata", "kodi-override-metadata"})
 KODI_METADATA_MIMETYPES = frozenset({"application/xml", "text/xml", "text/plain"})
 SAFE_ATTACHMENT_SUFFIXES = frozenset(
@@ -134,6 +135,8 @@ class MediaAttachment:
     filename: str
     size_bytes: int | None
     is_picture: bool = False
+    # MP4 chapter text is stored in packets, not attachment extradata.
+    chapter_samples: int | None = None
 
 
 @dataclass(frozen=True)
@@ -389,10 +392,16 @@ def parse_large_media_probe(
         if not isinstance(stream, dict):
             raise rejected("media has a malformed stream entry", stream_position=position)
         stream_type = str(stream.get("codec_type") or "").casefold()
-        if stream_type not in LARGE_MEDIA_STREAM_TYPES:
+        is_chapter_text = (
+            bool(approved_video_formats & {"mov", "mp4"})
+            and stream_type == "data"
+            and stream.get("codec_name") == "bin_data"
+            and stream.get("codec_tag_string") == "text"
+        )
+        if stream_type not in LARGE_MEDIA_STREAM_TYPES and not is_chapter_text:
             raise rejected(
                 "media contains unsupported stream type "
-                "(only video, audio, subtitle and attachment are supported)", stream,
+                "(only video, audio, subtitle, attachment and validated MP4 chapter text are supported)", stream,
             )
         disposition = stream.get("disposition")
         is_picture = isinstance(disposition, dict) and disposition.get("attached_pic") == 1
@@ -400,7 +409,7 @@ def parse_large_media_probe(
             raise rejected("media has an invalid attached-picture stream", stream)
         if stream_type == "video" and not is_picture:
             video_streams += 1
-        if stream_type == "attachment" or is_picture:
+        if stream_type == "attachment" or is_picture or is_chapter_text:
             if len(attachments) >= 64:
                 raise rejected(
                     "media contains too many attachments", stream,
@@ -416,7 +425,7 @@ def parse_large_media_probe(
                 and str(mimetype or "").split(";", 1)[0].strip().casefold()
                 in KODI_METADATA_MIMETYPES
             )
-            if suffix not in SAFE_ATTACHMENT_SUFFIXES and not is_kodi_metadata:
+            if not is_chapter_text and suffix not in SAFE_ATTACHMENT_SUFFIXES and not is_kodi_metadata:
                 raise rejected(
                     "unsupported attachment: expected a recognized font, image, subtitle, "
                     "text file, or named Kodi text/XML metadata", stream,
@@ -426,9 +435,21 @@ def parse_large_media_probe(
                 raise rejected("media attachment has an invalid or duplicate stream index", stream)
             attachment_indices.add(index)
             size = stream.get("extradata_size")
-            if is_picture:
-                # Cover art is an attached packet, not codec extradata. Reserve
-                # its full per-attachment allowance before starting extraction.
+            chapter_samples = None
+            if is_chapter_text:
+                try:
+                    chapter_samples = _media_integer(stream.get("nb_frames"))
+                except ValueError:
+                    chapter_samples = 0
+                if not 0 < chapter_samples <= MAX_CHAPTER_SAMPLES:
+                    raise rejected(
+                        "MP4 chapter track has a missing or excessive sample count", stream,
+                        declared_samples=stream.get("nb_frames"), max_samples=MAX_CHAPTER_SAMPLES,
+                    )
+                filename = f"chapter-track-{index}.text"
+            if is_picture or is_chapter_text:
+                # Unknown-size packet payloads reserve the full per-object
+                # allowance before starting extraction. Never trust a title/MIME.
                 size = None
                 reserved_attachment_bytes += attachment_max_bytes
             else:
@@ -443,10 +464,19 @@ def parse_large_media_probe(
                     "media attachments exceed the total extraction budget", stream,
                     reserved_bytes=reserved_attachment_bytes, max_total_bytes=attachment_total_bytes,
                 )
-            attachments.append(MediaAttachment(index, str(filename), size, is_picture))
+            attachments.append(MediaAttachment(index, str(filename), size, is_picture, chapter_samples))
     if require_video and video_streams == 0:
         raise rejected("container does not contain a video stream")
     return MediaProbe(",".join(sorted(approved_video_formats)), tuple(attachments))
+
+
+def _media_integer(value) -> int:
+    """FFprobe uses JSON integers and decimal strings; reject coercible junk."""
+    if type(value) is int and value >= 0:
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 20:
+        return int(value)
+    raise ValueError("expected a non-negative integer")
 
 
 class ScannerService:
@@ -999,7 +1029,7 @@ class ScannerService:
             "file,pipe",
             "-format_whitelist", ",".join(sorted(LARGE_VIDEO_FORMATS | {LARGE_TRUEHD_FORMAT})),
             "-show_entries",
-            "format=format_name:stream=index,codec_type,codec_name,codec_tag_string,extradata_size:"
+            "format=format_name:stream=index,codec_type,codec_name,codec_tag_string,extradata_size,nb_frames:"
             "stream_tags=filename,mimetype,handler_name:stream_disposition=attached_pic",
             "-of",
             "json",
@@ -1076,30 +1106,36 @@ class ScannerService:
                     stream_index=attachment.index, attachment=attachment.filename,
                     extracted_bytes=total_bytes, max_total_bytes=self.settings.media_attachment_total_mib * 1024 * 1024,
                 )
-            command = [
-                self.settings.ffmpeg_binary, "-v", "error", "-nostdin", "-n",
-                "-max_alloc", str(MAX_SINGLE_ALLOCATION_BYTES),
-                "-protocol_whitelist", "file,pipe",
-                "-format_whitelist", ",".join(sorted(LARGE_VIDEO_FORMATS | {LARGE_TRUEHD_FORMAT})),
-                "-threads", "1",
-            ]
-            if not attachment.is_picture:
-                command += [f"-dump_attachment:{attachment.index}", "pipe:1"]
-            command += ["-i", f"/proc/self/fd/{descriptor}"]
-            if attachment.is_picture:
-                command += [
-                    "-map", f"0:{attachment.index}", "-c", "copy", "-frames:v", "1",
-                    "-f", "image2pipe", "pipe:1",
-                ]
+            if attachment.chapter_samples is not None:
+                content = self._read_mp4_chapter_track(
+                    descriptor, path, expected, attachment, maximum=maximum,
+                    deadline=deadline, heartbeat=heartbeat, should_stop=should_stop,
+                )
             else:
-                # Complete header/attachment extraction without decoding a movie.
-                command += ["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-t", "0", "-f", "null", "-"]
-            completed = self._run_media_tool(
-                command, descriptor, path, deadline=deadline, heartbeat=heartbeat,
-                should_stop=should_stop, max_stdout_bytes=maximum,
-            )
+                command = [
+                    self.settings.ffmpeg_binary, "-v", "error", "-nostdin", "-n",
+                    "-max_alloc", str(MAX_SINGLE_ALLOCATION_BYTES),
+                    "-protocol_whitelist", "file,pipe",
+                    "-format_whitelist", ",".join(sorted(LARGE_VIDEO_FORMATS | {LARGE_TRUEHD_FORMAT})),
+                    "-threads", "1",
+                ]
+                if not attachment.is_picture:
+                    command += [f"-dump_attachment:{attachment.index}", "pipe:1"]
+                command += ["-i", f"/proc/self/fd/{descriptor}"]
+                if attachment.is_picture:
+                    command += [
+                        "-map", f"0:{attachment.index}", "-c", "copy", "-frames:v", "1",
+                        "-f", "image2pipe", "pipe:1",
+                    ]
+                else:
+                    # Complete header/attachment extraction without decoding a movie.
+                    command += ["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-t", "0", "-f", "null", "-"]
+                content = self._run_media_tool(
+                    command, descriptor, path, deadline=deadline, heartbeat=heartbeat,
+                    should_stop=should_stop, max_stdout_bytes=maximum,
+                ).stdout
             self._verify_file_identity(descriptor, path, expected)
-            size = len(completed.stdout)
+            size = len(content)
             if not 0 < size <= maximum or (attachment.size_bytes is not None and size != attachment.size_bytes):
                 raise _media_policy_error(
                     "media attachment extraction was incomplete", path, container=probe.format_name,
@@ -1110,7 +1146,7 @@ class ScannerService:
             # Only one bounded, application-named temporary file exists at a
             # time. Embedded filenames are never passed to filesystem APIs.
             with tempfile.NamedTemporaryFile(prefix="ti-attachment-") as target:
-                target.write(completed.stdout)
+                target.write(content)
                 target.flush()
                 info = os.fstat(target.fileno())
                 # Never subdivide an attachment or send it to media fallback.
@@ -1122,6 +1158,93 @@ class ScannerService:
                 if infected:
                     return True, threat, f"attachment stream={attachment.index} threat={threat}"
         return False, None, f"attachments={len(probe.attachments)} attachment_bytes={total_bytes}"
+
+    def _read_mp4_chapter_track(
+        self, descriptor: int, path: str, expected: FileIdentity, track: MediaAttachment, *,
+        maximum: int, deadline: float, heartbeat: Callable[[], bool] | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> bytes:
+        deadline = min(deadline, time.monotonic() + max(self.settings.large_media_probe_timeout_seconds, 1))
+
+        def rejected(reason: str, **details) -> ScannerPolicyError:
+            return _media_policy_error(
+                f"MP4 chapter track {reason}", path, container="mov/mp4", stream_index=track.index,
+                declared_samples=track.chapter_samples, max_bytes=maximum, **details,
+            )
+
+        # Normal MOV probing reclassifies chapter text as bin_data and discards
+        # its packets. Disable only that reinterpretation, NOT the content scan.
+        # Request offsets/sizes, never decoded titles or a large hex payload.
+        command = [
+            self.settings.ffprobe_binary, "-v", "error", "-threads", "1",
+            "-max_alloc", str(MAX_SINGLE_ALLOCATION_BYTES), "-protocol_whitelist", "file,pipe",
+            "-format_whitelist", "mov", "-ignore_chapters", "1",
+            "-select_streams", str(track.index), "-show_packets", "-show_entries",
+            "stream=index,codec_type,codec_name,codec_tag_string,nb_frames:packet=stream_index,pos,size,flags",
+            "-of", "json", f"/proc/self/fd/{descriptor}",
+        ]
+        try:
+            completed = self._run_media_tool(
+                command, descriptor, path, deadline=deadline, heartbeat=heartbeat, should_stop=should_stop,
+            )
+        except ScannerPolicyError as exc:
+            raise rejected("inspection failed", detail=str(exc)) from exc
+        self._verify_file_identity(descriptor, path, expected)
+        if completed.stderr.strip():
+            raise rejected("reported a demuxing error", detail=completed.stderr.decode("utf-8", "replace"))
+        try:
+            payload = json.loads(completed.stdout)
+            streams, packets = payload["streams"], payload["packets"]
+            if not isinstance(streams, list) or len(streams) != 1 or not isinstance(packets, list):
+                raise ValueError("invalid stream/packet list")
+            stream = streams[0]
+            if (_media_integer(stream["index"]) != track.index or stream["codec_type"] != "subtitle"
+                    or stream["codec_name"] != "mov_text" or stream["codec_tag_string"] != "text"):
+                raise ValueError("not a QuickTime text stream")
+            reported_samples = _media_integer(stream["nb_frames"])
+            if not 0 < len(packets) == reported_samples == track.chapter_samples <= MAX_CHAPTER_SAMPLES:
+                raise rejected(
+                    "has an empty, incomplete or inconsistent sample count",
+                    observed_samples=len(packets), reported_samples=reported_samples,
+                )
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise rejected("validation failed", detail=str(exc)) from exc
+
+        content = bytearray()
+        previous_end = 0
+        next_heartbeat = 0.0
+        for number, packet in enumerate(packets):
+            if should_stop and should_stop():
+                raise ScanInterrupted("scan interrupted during chapter extraction")
+            if time.monotonic() >= deadline:
+                raise rejected("extraction timed out")
+            if time.monotonic() >= next_heartbeat:
+                if heartbeat and not heartbeat():
+                    raise ScanInterrupted("scan lease was lost during chapter extraction")
+                next_heartbeat = time.monotonic() + 5
+            try:
+                position, size = _media_integer(packet["pos"]), _media_integer(packet["size"])
+                if (_media_integer(packet["stream_index"]) != track.index
+                        or not isinstance(packet["flags"], str) or "C" in packet["flags"]
+                        or size < 2 or position < previous_end or position + size > expected[2]
+                        or len(content) + size > maximum):
+                    raise ValueError("corrupt, overlapping, out-of-file or oversized packet")
+                data = os.pread(descriptor, size, position)
+                if len(data) != size or int.from_bytes(data[:2], "big") > size - 2:
+                    raise ValueError("truncated packet or invalid text length")
+            except (KeyError, TypeError, ValueError) as exc:
+                fields = packet if isinstance(packet, dict) else {}
+                raise rejected(
+                    "packet validation failed", packet=number, detail=str(exc),
+                    offset=fields.get("pos"), size=fields.get("size"), file_bytes=expected[2],
+                    extracted_bytes=len(content),
+                ) from exc
+            # Preserve the length prefix, raw text and ALL trailing bytes/boxes.
+            # Scanning only exported chapter titles would discard hidden payloads.
+            content.extend(data)
+            previous_end = position + size
+        self._verify_file_identity(descriptor, path, expected)
+        return bytes(content)
 
     def _scan_descriptor_window(
         self,

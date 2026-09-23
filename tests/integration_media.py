@@ -11,13 +11,20 @@ import time
 import zipfile
 from unittest.mock import PropertyMock, patch
 
-from app.scanner import ScannerIdentity, ScannerPolicyError, ScannerService, file_identity
+from app.scanner import ScannerIdentity, ScannerLimitError, ScannerPolicyError, ScannerService, file_identity
 
 
 ROOT = Path("/test")
 # The harmless, standard antivirus test string, not malware.
 EICAR = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 HASH_ONLY_ATTACHMENT = b"\0\xffSynthetic attachment hash test; not malware.\0" * 32
+CHAPTER_HASH_TITLES = ("Synthetic chapter hash marker one", "Synthetic chapter hash marker two")
+# FFmpeg's QuickTime chapter sample: 16-bit text length, text, encoding box.
+# Signing the concatenation proves the separate complete-track scan is used.
+CHAPTER_HASH_PAYLOAD = b"".join(
+    len(title.encode()).to_bytes(2, "big") + title.encode() + b"\0\0\0\x0cencd\0\0\x01\0"
+    for title in CHAPTER_HASH_TITLES
+)
 
 
 def prepare() -> None:
@@ -26,6 +33,7 @@ def prepare() -> None:
     (definitions / "test.ndb").write_text(f"Test.EICAR:0:*:{EICAR.hex()}\n")
     (definitions / "test.hdb").write_text(
         f"{hashlib.md5(HASH_ONLY_ATTACHMENT).hexdigest()}:{len(HASH_ONLY_ATTACHMENT)}:Test.AttachmentHash\n"
+        f"{hashlib.md5(CHAPTER_HASH_PAYLOAD).hexdigest()}:{len(CHAPTER_HASH_PAYLOAD)}:Test.ChapterHash\n"
     )
     benchmark = os.environ.get("TI_TEST_BENCHMARK_WINDOWS") == "1"
     if benchmark:
@@ -57,6 +65,22 @@ def make_video(name: str, container: str, *, attachment: str | None = None,
             "-metadata:s:t", f"mimetype={mimetype}",
         ]
     subprocess.run(command + ["-f", container, str(path)], check=True, timeout=30)
+    return path
+
+
+def make_chapter_video(name: str, titles: tuple[str, ...]) -> Path:
+    metadata = ";FFMETADATA1\n"
+    for number, title in enumerate(titles):
+        for character in ("\\", "=", ";", "#"):
+            title = title.replace(character, "\\" + character)
+        metadata += (f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={number * 1000}\n"
+                     f"END={(number + 1) * 1000}\ntitle={title}\n")
+    path = ROOT / name
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i", "color=size=32x32:rate=1",
+        "-f", "ffmetadata", "-i", "pipe:0", "-map", "0:v:0", "-map_chapters", "1",
+        "-t", str(len(titles)), "-threads", "1", "-c:v", "mpeg4", str(path),
+    ], input=metadata.encode(), check=True, timeout=30)
     return path
 
 
@@ -109,6 +133,14 @@ def run() -> None:
     subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
                     "color=size=32x32:rate=25", "-t", "1", "-threads", "1", "-c:v", "mpeg4",
                     "-timecode", "00:00:00:00", str(timed_mp4)], check=True, timeout=30)
+    chapter_clean = make_chapter_video("chapter-clean.mp4", ("Opening chapter", "Ending chapter"))
+    chapter_eicar = make_chapter_video("chapter-eicar.mp4", ("Opening chapter", EICAR.decode()))
+    chapter_hash = make_chapter_video("chapter-hash.mp4", CHAPTER_HASH_TITLES)
+    chapter_broken = ROOT / "chapter-broken.mp4"
+    broken = bytearray(chapter_clean.read_bytes())
+    start = broken.index(b"Opening chapter") - 2
+    broken[start:start + 2] = b"\xff\xff"  # Length claims more text than the sample contains.
+    chapter_broken.write_bytes(broken)
     infected_asf = ROOT / "asf-eicar.avi"
     asf_bytes = clean_asf.read_bytes()
     # Put EICAR across a test-window boundary, beyond the original media data.
@@ -150,6 +182,32 @@ def run() -> None:
     check(hash_mkv, infected=True, method="clamd_native_with_attachments", threat="AttachmentHash")
     check(ttc_hash, infected=True, method="clamd_native_with_attachments", threat="AttachmentHash")
 
+    descriptor = os.open(chapter_hash, os.O_RDONLY)
+    try:
+        expected = file_identity(os.fstat(descriptor))
+        probe = scanner._probe_large_media_descriptor(descriptor, str(chapter_hash))
+        assert len(probe.attachments) == 1 and probe.attachments[0].chapter_samples == 2
+        raw = scanner._read_mp4_chapter_track(
+            descriptor, str(chapter_hash), expected, probe.attachments[0], maximum=8192,
+            deadline=time.monotonic() + 30, heartbeat=None, should_stop=None,
+        )
+        assert raw == CHAPTER_HASH_PAYLOAD, "all chapter samples and trailing boxes must be preserved"
+        native = scanner._scan_descriptor(descriptor, str(chapter_hash), expected, heartbeat=None, should_stop=None)
+        assert not native[0], "fixture must distinguish whole-container and complete chapter scans"
+    finally:
+        os.close(descriptor)
+
+    # A native limit below 2000 MiB must use the same verified chapter path.
+    original_scan = scanner._scan_descriptor
+
+    def native_limit(descriptor, path, *args, **kwargs):
+        if path == str(chapter_clean):
+            raise ScannerLimitError("synthetic native MaxScanSize limit", limit_name="maxscansize")
+        return original_scan(descriptor, path, *args, **kwargs)
+
+    with patch.object(scanner, "_scan_descriptor", side_effect=native_limit):
+        check(chapter_clean, infected=False, method="media_windows_and_attachments")
+
     # Scale only routing/window sizes for tiny fixtures. Real ffprobe, opened
     # descriptors, parallel INSTREAM requests, ClamD and replies remain unmocked.
     settings_type = type(scanner.settings)
@@ -160,18 +218,28 @@ def run() -> None:
         patch.object(settings_type, "large_media_overlap_bytes", new_callable=PropertyMock, return_value=128),
     ):
         for path in (clean_asf, clean_mkv, infected_mkv, infected_asf, hash_mkv, picture_mkv,
-                     ttc_clean, ttc_eicar, ttc_hash, timed_mp4):
+                     ttc_clean, ttc_eicar, ttc_hash, timed_mp4,
+                     chapter_clean, chapter_eicar, chapter_hash, chapter_broken):
             if path.stat().st_size <= 8192:
                 with path.open("ab") as output:
                     output.write(b"\0" * (8193 - path.stat().st_size))
         for path, infected in (
             (clean_asf, False), (clean_mkv, False),
             (infected_asf, True), (infected_mkv, True), (ttc_clean, False), (ttc_eicar, True),
+            (chapter_clean, False), (chapter_eicar, True),
         ):
             check(path, infected=infected, method="media_windows_and_attachments")
         check(hash_mkv, infected=True, method="media_windows_and_attachments", threat="AttachmentHash")
         check(ttc_hash, infected=True, method="media_windows_and_attachments", threat="AttachmentHash")
         check(picture_mkv, infected=False, method="media_windows_and_attachments")
+        check(chapter_hash, infected=True, method="media_windows_and_attachments", threat="ChapterHash")
+        try:
+            scanner.scan_path(str(chapter_broken), identity=identity)
+        except ScannerPolicyError as error:
+            assert "chapter" in str(error), error
+            print(f"PASS malformed chapter sample stays blocked: {error}", flush=True)
+        else:
+            raise AssertionError("malformed chapter sample was admitted")
 
         try:
             scanner.scan_path(str(timed_mp4), identity=identity)
