@@ -49,6 +49,8 @@ class HookClaim:
     attempt: int
     kind: str = "script"
     destination: str | None = None
+    copy_source_root: str | None = None
+    copy_relative_path: str | None = None
 
     @property
     def argv(self) -> list[str]:
@@ -56,6 +58,10 @@ class HookClaim:
             if not self.destination:
                 raise RuntimeError("Built-in copy claim has no destination")
             command = [sys.executable, "-m", "app.copy_action", "--destination", self.destination]
+            if self.copy_source_root is not None or self.copy_relative_path is not None:
+                if not self.copy_source_root or not self.copy_relative_path:
+                    raise RuntimeError("Mapped copy claim has incomplete pinned routing")
+                command += ["--source-root", self.copy_source_root, "--relative-path=" + self.copy_relative_path]
         elif self.kind == "script" and self.script:
             command = [self.script]
         else:
@@ -66,6 +72,14 @@ class HookClaim:
             "--torrent-name=" + self.torrent_name,
             "--job-id", self.job_id,
         ]
+
+
+def matching_copy_rule(final_parent: str, settings):
+    """Most-specific enabled component ancestor wins; unmatched jobs are skipped."""
+    parent = Path(final_parent)
+    rules = (rule for rule in getattr(settings, "post_promotion_copy_rules", ())
+             if rule.enabled and parent.is_relative_to(rule.source))
+    return max(rules, key=lambda rule: len(Path(rule.source).parts), default=None)
 
 
 def queue_promotion_hook(job: Job, settings) -> bool:
@@ -79,16 +93,27 @@ def queue_promotion_hook(job: Job, settings) -> bool:
     # A new default applies only to newly promoted jobs, never existing work.
     kind = job.hook_kind or ("script" if job.hook_script else None) or ("copy" if copy_enabled else "script")
     if kind == "copy":
-        destination = job.hook_destination or getattr(settings, "post_promotion_copy_destination", None)
-        if not copy_enabled or not destination:
+        if not copy_enabled:
             return False
-        job.hook_destination = destination
+        if not job.hook_destination:
+            rule = matching_copy_rule(job.final_parent, settings)
+            if rule is None or not job.content_path:
+                return False
+            source, root = Path(job.content_path), Path(rule.source)
+            if (not source.is_absolute() or ".." in source.parts
+                    or source == root or not source.is_relative_to(root)):
+                return False
+            job.hook_destination = rule.destination
+            job.hook_copy_source_root = rule.source
+            job.hook_copy_relative_path = source.relative_to(root).as_posix()
         job.hook_script = None
     elif kind == "script":
         if not getattr(settings, "post_promotion_enabled", False) or not settings.post_promotion_script:
             return False
         job.hook_script = settings.post_promotion_script
         job.hook_destination = None
+        job.hook_copy_source_root = None
+        job.hook_copy_relative_path = None
     else:
         return False
     job.hook_status = "pending"
@@ -189,6 +214,16 @@ class PostPromotionRunner:
             source = Path(job.content_path)
             if source.is_relative_to(destination) or destination.is_relative_to(source):
                 raise RuntimeError("Copy source and destination must not be identical or nested")
+            if job.hook_copy_source_root is not None or job.hook_copy_relative_path is not None:
+                if not job.hook_copy_source_root or not job.hook_copy_relative_path:
+                    raise RuntimeError("Mapped copy has incomplete pinned routing")
+                root = Path(canonical_final_parent(job.hook_copy_source_root, self.settings))
+                relative = Path(job.hook_copy_relative_path)
+                if (str(root) != job.hook_copy_source_root or relative.is_absolute()
+                        or ".." in relative.parts or relative == Path(".")
+                        or not Path(job.final_parent).is_relative_to(root)
+                        or root / relative != source):
+                    raise RuntimeError("Promoted content no longer matches the saved copy route")
         elif kind == "script":
             if not job.hook_script or job.hook_script != self.settings.post_promotion_script:
                 raise RuntimeError("queued hook does not match the current deployment script; review and explicitly retry")
@@ -273,7 +308,8 @@ class PostPromotionRunner:
                     return None
                 attempt = (job.hook_attempts or 0) + 1
                 claim = HookClaim(job.id, script, source, job.qbt_hash, job.torrent_name or "", attempt,
-                                  job.hook_kind or "script", job.hook_destination)
+                                  job.hook_kind or "script", job.hook_destination,
+                                  job.hook_copy_source_root, job.hook_copy_relative_path)
                 result = db.execute(update(Job).where(Job.id == job.id, Job.hook_status == "pending").values(
                     hook_status="running", hook_started_at=datetime.utcnow(), hook_finished_at=None,
                     hook_attempts=attempt, hook_error=None, hook_output=None, hook_exit_code=None,

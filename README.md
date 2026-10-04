@@ -475,31 +475,55 @@ mount markers. Docker mounts/permissions still need separate deployment recovery
 
 ### Optional post-promotion copy
 
-The built-in **Copy after completion** action is **off by default**. No script,
-`/hooks` mount, or application environment variable is required. Configure its
-enable switch and destination in **Settings & Help → Downloads/storage**, after
-unlocking advanced settings. Review, pause/save, restart in Portainer, then verify
-and resume. A trusted custom script remains a separate advanced alternative;
-only one of the two actions may be enabled at a time.
+The built-in **Copy after successful promotion** action is **off by default**.
+No script, `/hooks` mount, or application environment variable is required.
+In **Settings & Help → Downloads and storage**, unlock advanced fields and add
+copy rules pairing a **source final root** with a **copy destination root**.
+Enable copying, review, pause/save, restart in Portainer, then verify and resume.
+A trusted custom script remains a separate, mutually exclusive alternative.
+
+For example:
+
+| Source final root | Copy destination root | Result |
+| --- | --- | --- |
+| `/downloads/movies` | `/copy-target/movies` | A promoted `/downloads/movies/Action/Film/` copies to `/copy-target/movies/Action/Film/`. |
+| `/downloads/music` | `/copy-target/music` | A promoted `/downloads/music/Artist/Album/` copies to `/copy-target/music/Artist/Album/`. |
+
+Rules match the job's final parent path, including subdirectories. Matching is
+case-sensitive and respects directory boundaries: `/downloads/movies-old` does
+not match `/downloads/movies`. The most specific **enabled** matching source
+wins, so each job gets at most one copy. Disabled rules are ignored, not exclusion
+rules. **No match means no copy**; there is no automatic all-torrents fallback.
+Removing all rules therefore stops new copies even if the master switch is on.
+Rules select already mounted paths, not qBittorrent categories or remote servers.
+
+Only the torrent's verified content is copied, including its own enclosing folder
+when it has one, plus its path relative to the matching source root. A single-file
+torrent stays a single file. There is **no `intake-job-*` payload wrapper** for
+new routed copies. This preserves the payload layout, but is **not a full folder
+mirror**: unrelated/old files, later edits, renames and deletions are not synced.
 
 The sequence is:
 
 1. Scan successfully and promote through qBittorrent as usual.
 2. Confirm qBittorrent has finished moving into the final location.
-3. Queue a durable copy request with its destination saved for this job.
-4. Wait five seconds by default, then recheck qBittorrent and final content.
-5. Copy only this promoted file/folder into a new exclusive per-job directory.
-6. Record copy success separately from the already successful promotion.
+3. Match a rule; if none matches, finish normally without copying.
+4. Queue a durable copy request with its source root, destination root and relative
+   content path saved for this job.
+5. Wait five seconds by default, then recheck qBittorrent and final content.
+6. Copy only this promoted file/folder without overwriting existing content.
+7. Record copy success separately from the already successful promotion.
 
-Changing the configured destination does not redirect previously queued copies.
+Changing rules does not redirect previously queued copies.
 There is one copy worker, so copies do not start an unbounded number of `rsync`
 processes. Existing completed jobs are not automatically copied when enabled.
 The delay is not a substitute for checking that the move actually finished.
 
 #### One-time deployment preparation
 
-Mount an existing, writable copy destination **only into Intake**, at
-`/copy-target`. qBittorrent and ClamD do not need that mount. For example, after
+Mount existing, writable copy storage **only into Intake**, at `/copy-target`
+or individual directories below it. qBittorrent and ClamD do not need these
+mounts. For example, after
 mounting your chosen export at `/mnt/nfs/intake-copies` in the Docker VM:
 
 ```yaml
@@ -518,33 +542,40 @@ prove that NFS is mounted. Verify the export and writable permissions first:
 findmnt -T /mnt/nfs/intake-copies -o TARGET,SOURCE,FSTYPE,OPTIONS
 ```
 
-After confirming the intended export, provision a dedicated `intake-copies`
-directory inside it, writable by Intake's UID/GID. Create an empty regular file
-named `.intake-copy-mount` **inside that directory on the export**. Do not put the
+After confirming the intended export, provision `movies` and/or `music`
+destination directories inside it, writable by Intake's UID/GID. Create an empty
+regular file named `.intake-copy-mount` **inside each rule's destination directory
+on the export**. Do not put the
 marker in the local directory underneath an unmounted share. If creating these
 through the VM is denied by NFS permissions, provision them in TrueNAS with the
 correct ACL instead of enabling root access or broad `777` permissions.
 
-In the UI, choose `/copy-target/intake-copies` as the copy destination and enable
-**Copy after completion**. The destination must already exist, be at or below
-`/copy-target`, and contain its `.intake-copy-mount` marker. Intake does not mount
-NAS exports or create this marker for you. Keep the marker and destination stable
-while a copy is in progress. Omit explicit `TI_POST_PROMOTION_COPY_*` environment
-overrides if you want these fields editable in the UI.
+Add the above rule pairs in the UI, using container paths rather than VM host
+paths. Each destination root must already exist, be at or below `/copy-target`,
+and contain its `.intake-copy-mount` marker. Relative subdirectories beneath it
+are created as needed. Intake does not mount NAS exports or create markers for
+you. Keep the marker and destination stable while a copy is in progress. Omit
+explicit `TI_POST_PROMOTION_COPY_*` environment overrides if you want these fields
+editable in the UI. A target mounted on the VM as `/mnt/nfs/movie-copies` can be
+bound to `/copy-target/movies`; it does not have to use that name on the host.
 
 The resulting layout is:
 
 ```text
-/copy-target/intake-copies/
+/copy-target/movies/
 ├── .intake-copy-mount
-└── intake-job-<job-id>/
-    ├── Original torrent file or folder
-    └── .intake-copy-complete.json
+├── .intake-copy-state/         private action records, outside the payload
+└── Action/
+    └── Film/
+        ├── Film.mkv
+        └── subtitles.srt
 ```
 
 The action uses image-provided `rsync`, not SSH or another container. It does not
-delete the original, merge into existing library folders, overwrite existing job
-copies, or copy your entire library. It requires real additional destination
+delete the original, merge into an existing torrent target, overwrite existing
+files, or copy your entire library. Existing category/relative parent directories
+may be reused, but an occupied final torrent file/folder is a collision and fails
+safely unless it is a verified completed copy of this same job. It requires real additional destination
 space and reads/writes the whole payload: copying between two NAS shares through
 the VM adds network and disk I/O. It is not a replacement for ZFS replication or
 a snapshot-based backup system. See [the storage layout guide](docs/STORAGE_LAYOUT.md).
@@ -560,29 +591,38 @@ have been copied. Disabling an action leaves already queued work pending; it is
 not cancellation. Queued/running work prevents **Clear completed** from forgetting
 its job.
 
-Each per-job directory is reserved exclusively with mode `0700`. Consumers must
-require `.intake-copy-complete.json`; a visible folder alone does not mean a copy
-finished. The marker is published after `rsync --fsync` succeeds, the source
-identity remains stable, and copied paths/sizes match. Per-file flushes avoid an
-extra payload-reading pass but can add storage latency; they are not a guarantee
-against NAS power loss or a substitute for snapshots. Hard-link support is required for
-atomic no-replace publication of that marker. Symlinks and special files are
-rejected. Do not let another program modify the source or reserved destination
-while copying. These checks are not a cryptographic recheck of scanned bytes or
-a sandbox against hostile concurrent writers; unchanged size/metadata is not a
-malware guarantee.
+Directory targets are reserved exclusively and populated in place for NFS
+compatibility. **They can be visible before copying finishes**; consumers must
+wait for the job's successful copy status/private completion record. Single files
+are copied privately and published using an exclusive hard link; hard-link
+support is required. No `renameat2` support is required. Private action records
+live under the destination root's `.intake-copy-state/<job-id>/`, never inside
+the copied torrent; `complete.json` is the successful completion record.
+Source identity and copied paths/sizes are checked after `rsync --fsync`.
+The checks do not reread the whole payload for a cryptographic comparison and
+cannot replace snapshots or protect against hostile concurrent writers. Keep the
+source and target unchanged during copying. Symlinks and special files are rejected.
 
-For a failed/interrupted copy, inspect its exact per-job folder and reported
-error. An incomplete folder is never silently resumed, overwritten, or deleted.
-Move only that folder aside after review, retaining it for recovery, then unlock
-administration and pause/drain Intake to retry the post-promotion action. Resume
-after queuing the retry. A completed, unchanged matching copy is a no-op on retry.
-The ordinary failed-scan retry is not needed to repeat a copy.
+For a failed/interrupted copy, inspect the reported target and private action
+record. Partial content is never silently resumed, overwritten or deleted.
+Preserve/move aside only the affected partial content and action record after
+review, then unlock administration and pause/drain Intake to retry the action.
+Resume after queuing the retry. A completed, unchanged matching copy is a no-op
+on retry. The ordinary failed-scan retry is not needed to repeat a copy.
 
-Copy settings, pinned destinations and action status are included in Intake's
-encrypted backup. **Copied media, NAS mounts, permissions and mount markers are
-not**; restore those separately before running pending work. With the built-in
-action there is no operator script file to back up.
+Copy rules, pinned paths and action status are included in Intake's encrypted
+backup. **Copied media, destination-side private action records, NAS mounts,
+permissions and mount markers are not**; preserve/restore those separately.
+With the built-in action there is no operator script file to back up.
+
+#### Upgrading from the single copy destination
+
+The old `post_promotion_copy_destination` value remains readable for compatibility
+but does not apply to newly promoted jobs. Add explicit rules in the UI; without
+them new promotions are skipped for copying. Already queued/retried legacy copies
+keep their saved destination and old `intake-job-<id>` layout. Existing copies
+are not moved, restructured or deleted by this update. New routed jobs save their
+rule and relative target at promotion, so later rule edits cannot redirect them.
 
 #### Advanced alternative: custom script
 
@@ -648,7 +688,8 @@ written without the `TI_` prefix in `settings.json`:
 | `TI_NAS_STAGING_LOCATIONS` | `[]` | named NAS staging records (`id`, `label`, `path`, optional `mount_marker`) |
 | `TI_DEFAULT_NAS_STAGING_ID` | unset | default named location; per-job selections remain pinned |
 | `TI_POST_PROMOTION_COPY_ENABLED` | `false` | built-in copy after verified clean promotion; editable in UI |
-| `TI_POST_PROMOTION_COPY_DESTINATION` | unset; example `/copy-target/intake-copies` | existing marked destination at/below `/copy-target`; editable in UI |
+| `TI_POST_PROMOTION_COPY_RULES` | `[]` | UI-editable pairs of source final root, destination root and enabled switch; longest matching enabled rule wins; unmatched jobs are not copied |
+| `TI_POST_PROMOTION_COPY_DESTINATION` | unset | legacy compatibility value only; configure rules for new jobs |
 | `TI_POST_PROMOTION_ENABLED` | `false` | alternative trusted custom-script action; mutually exclusive with built-in copy |
 | `TI_POST_PROMOTION_SCRIPT` | unset; example `/hooks/after-promotion-copy.py` | trusted deployment-only executable under read-only `/hooks` |
 | `TI_POST_PROMOTION_DELAY_SECONDS` | `5` | delay before copy/script readiness checks |

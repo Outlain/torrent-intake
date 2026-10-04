@@ -68,6 +68,9 @@ class AdditiveMigrationTests(unittest.TestCase):
                 self.assertEqual(connection.execute(text(
                     "SELECT hook_kind,hook_destination FROM jobs WHERE id='legacy-job'"
                 )).one(), (None, None))
+                self.assertEqual(connection.execute(text(
+                    "SELECT hook_copy_source_root,hook_copy_relative_path FROM jobs WHERE id='legacy-job'"
+                )).one(), (None, None))
             with engine.begin() as connection:
                 self.assertEqual(connection.execute(text(
                     "SELECT torrent_file_name,torrent_file_data FROM jobs WHERE id = 'legacy-job'"

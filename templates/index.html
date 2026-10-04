@@ -1873,7 +1873,7 @@
                 <td class="cell-stage">{{ job.staging_actual or job.staging_preference }}{% if job.nas_staging_id %}<small>{{ 'NAS' if (job.staging_actual or job.staging_preference) == 'nas' else 'NAS fallback' }}: {{ job.nas_staging_label or job.nas_staging_id }} · {{ job.nas_staging_path or '' }}</small>{% endif %}</td>
                 <td class="mono cell-hash">{{ job.qbt_hash or '-' }}</td>
                 <td class="cell-last-error{% if job.last_error %} activity-error{% endif %}">{{ job.last_error or job.activity_summary or '-' }}
-                  {% if job.hook_status %}<details class="job-hook-result" data-job-id="{{ job.id }}"><summary>{{ 'Copy' if job.hook_kind == 'copy' else 'Script' }} status: {{ job.hook_status }}</summary>{% if job.hook_kind == 'copy' and job.hook_destination %}<p>Copy destination: {{ job.hook_destination }}</p>{% endif %}{% if job.hook_error %}<p>{{ job.hook_error }}</p>{% endif %}{% if job.hook_exit_code is not none %}<p>Exit code: {{ job.hook_exit_code }}</p>{% endif %}{% if job.hook_output %}<p>{{ 'Copy' if job.hook_kind == 'copy' else 'Script' }} output:</p><pre>{{ job.hook_output }}</pre>{% endif %}</details>{% endif %}
+                  {% if job.hook_status %}<details class="job-hook-result" data-job-id="{{ job.id }}"><summary>{{ 'Copy' if job.hook_kind == 'copy' else 'Script' }} status: {{ job.hook_status }}</summary>{% if job.hook_kind == 'copy' and job.hook_destination %}<p>Copy destination: {{ job.hook_destination.rstrip('/') }}{% if job.hook_copy_relative_path %}/{{ job.hook_copy_relative_path }}{% endif %}</p>{% if job.hook_copy_source_root %}<p>Saved copy rule: {{ job.hook_copy_source_root }} → {{ job.hook_destination }}</p>{% endif %}{% endif %}{% if job.hook_error %}<p>{{ job.hook_error }}</p>{% endif %}{% if job.hook_exit_code is not none %}<p>Exit code: {{ job.hook_exit_code }}</p>{% endif %}{% if job.hook_output %}<p>{{ 'Copy' if job.hook_kind == 'copy' else 'Script' }} output:</p><pre>{{ job.hook_output }}</pre>{% endif %}</details>{% endif %}
                 </td>
               </tr>
               {% endfor %}
@@ -2853,8 +2853,14 @@
       const summary = document.createElement('summary'); summary.textContent = `${actionName} status: ${job.hook_status}`;
       details.append(summary);
       if (isCopy && job.hook_destination) {
-        const destination = document.createElement('p'); destination.textContent = `Copy destination: ${job.hook_destination}`;
+        const target = job.hook_copy_relative_path
+          ? `${job.hook_destination.replace(/\/+$/, '')}/${job.hook_copy_relative_path}` : job.hook_destination;
+        const destination = document.createElement('p'); destination.textContent = `Copy destination: ${target}`;
         details.append(destination);
+        if (job.hook_copy_source_root) {
+          const rule = document.createElement('p'); rule.textContent = `Saved copy rule: ${job.hook_copy_source_root} → ${job.hook_destination}`;
+          details.append(rule);
+        }
       }
       const result = document.createElement('p');
       result.textContent = [job.hook_error, job.hook_exit_code !== null && job.hook_exit_code !== undefined ? `Exit code: ${job.hook_exit_code}` : ''].filter(Boolean).join(' · ') || `${actionName} status is separate from the clean scan and final promotion result.`;

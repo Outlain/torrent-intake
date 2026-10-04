@@ -6,6 +6,8 @@ window.TISettings = (() => {
   const nasEditor = el('nas-location-editor');
   const nasInput = el('edit-nas_staging_locations');
   const nasDefaultInput = el('edit-default_nas_staging_id');
+  const copyRuleEditor = el('copy-rule-editor');
+  const copyRulesInput = el('edit-post_promotion_copy_rules');
   const initialNasLocations = [...document.querySelectorAll('#nas-staging-select option')].map(option => ({
     id: option.value, label: option.dataset.label, path: option.dataset.path, mount_marker: option.dataset.mountMarker || null,
   }));
@@ -76,6 +78,42 @@ window.TISettings = (() => {
     });
   }
 
+  function syncCopyRulesDraft() {
+    if (!copyRulesInput) return;
+    copyRulesInput.value = JSON.stringify([...copyRuleEditor.querySelectorAll('.copy-rule-row')].map(row => ({
+      source: row.querySelector('.copy-rule-source').value,
+      destination: row.querySelector('.copy-rule-destination').value,
+      enabled: row.querySelector('.copy-rule-enabled').checked,
+    })));
+    invalidateReview();
+  }
+  function renderCopyRules() {
+    if (!copyRuleEditor) return;
+    const rules = JSON.parse(copyRulesInput?.value || copyRuleEditor.dataset.rules || '[]');
+    copyRuleEditor.replaceChildren();
+    rules.forEach((rule, index) => {
+      const row = document.createElement('fieldset'); row.className = 'copy-rule-row';
+      const legend = document.createElement('legend'); legend.textContent = `Copy rule ${index + 1}`; row.append(legend);
+      for (const [key, title, placeholder] of [
+        ['source', 'From final-library root (container path)', '/downloads/Movies'],
+        ['destination', 'To copy destination (container path)', '/copy-target/Movies'],
+      ]) {
+        const label = document.createElement('label'); label.textContent = title;
+        const input = document.createElement('input'); input.type = 'text'; input.className = `copy-rule-${key}`;
+        input.value = rule[key] || ''; input.placeholder = placeholder; input.autocomplete = 'off'; input.spellcheck = false; input.maxLength = 4096;
+        input.addEventListener('input', syncCopyRulesDraft); label.append(input); row.append(label);
+      }
+      const enabledLabel = document.createElement('label'); enabledLabel.className = 'settings-check';
+      const enabled = document.createElement('input'); enabled.type = 'checkbox'; enabled.className = 'copy-rule-enabled';
+      enabled.checked = rule.enabled !== false; enabled.addEventListener('change', syncCopyRulesDraft);
+      enabledLabel.append(enabled, document.createTextNode('Enabled — consider this rule for new copies')); row.append(enabledLabel);
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button-secondary copy-rule-remove';
+      remove.textContent = 'Remove rule'; remove.setAttribute('aria-label', `Remove copy rule ${index + 1}`);
+      remove.addEventListener('click', () => { row.remove(); syncCopyRulesDraft(); renderCopyRules(); updateControls(); });
+      row.append(remove); copyRuleEditor.append(row);
+    });
+  }
+
   function filter() {
     const query = el('settings-search').value.trim().toLowerCase();
     const selected = el('settings-section').value;
@@ -118,6 +156,17 @@ window.TISettings = (() => {
         row.querySelector('.nas-remove').disabled = !nasInput || nasInput.disabled || rows.length < 2 || (radio.checked && (!nasDefaultInput || nasDefaultInput.disabled));
       });
       el('nas-location-add').disabled = !nasInput || nasInput.disabled;
+    }
+    if (copyRuleEditor) {
+      const rows = [...copyRuleEditor.querySelectorAll('.copy-rule-row')];
+      rows.forEach(row => row.querySelectorAll('input,button').forEach(input => { input.disabled = !copyRulesInput || copyRulesInput.disabled; }));
+      el('copy-rule-add').disabled = !copyRulesInput || copyRulesInput.disabled || rows.length >= 32;
+      const enabled = el('edit-post_promotion_copy_enabled')?.value === 'true'
+        || (!el('edit-post_promotion_copy_enabled') && copyRuleEditor.dataset.copyEnabled === 'true');
+      const noRules = !rows.some(row => row.querySelector('.copy-rule-enabled').checked
+        && row.querySelector('.copy-rule-source').value.trim() && row.querySelector('.copy-rule-destination').value.trim());
+      el('copy-rules-warning').hidden = !enabled || !noRules;
+      el('copy-rules-warning').textContent = 'Copying is enabled but there are no enabled complete rules. Newly promoted torrents will not be copied. Add an explicit source-to-destination rule; the legacy global destination is not used.';
     }
     el('advanced-unlock').disabled = locked;
     el('admin-controls').hidden = !token;
@@ -220,7 +269,7 @@ window.TISettings = (() => {
         baselines.set(setting.name, input.value);
       }
     }
-    renderNasEditor();
+    renderNasEditor(); renderCopyRules();
     clears.forEach(box => { box.checked = false; });
     const size = state.backup.database_bytes;
     el('backup-database-size').textContent = `${size === null ? 'Database size unavailable' : `Database: ${(size / 1048576).toFixed(2)} MiB`}. Portable backup limit: ${state.backup.database_limit_bytes / 1048576} MiB; this is not a torrent-size limit.`;
@@ -263,13 +312,21 @@ window.TISettings = (() => {
     nasInput.value = JSON.stringify(locations); renderNasEditor(); invalidateReview();
     nasEditor.lastElementChild.querySelector('.nas-label').focus();
   });
+  el('copy-rule-add')?.addEventListener('click', () => {
+    if (!copyRulesInput || copyRulesInput.disabled) return;
+    const rules = JSON.parse(copyRulesInput.value || '[]');
+    if (rules.length >= 32) return;
+    rules.push({source: '', destination: '', enabled: true});
+    copyRulesInput.value = JSON.stringify(rules); renderCopyRules(); invalidateReview();
+    copyRuleEditor.lastElementChild.querySelector('.copy-rule-source').focus();
+  });
   clears.forEach(input => input.addEventListener('change', invalidateReview));
   el('advanced-unlock').addEventListener('change', updateControls);
   el('advanced-confirm').addEventListener('change', updateControls);
   el('settings-section').addEventListener('change', () => { el('settings-search').value = ''; filter(); });
   el('settings-discard').addEventListener('click', () => {
     fields.forEach(input => { input.value = baselines.get(input.dataset.localSetting); });
-    renderNasEditor();
+    renderNasEditor(); renderCopyRules();
     clears.forEach(box => { box.checked = false; });
     clearErrors(); invalidateReview(); el('admin-result').textContent = 'Draft discarded. No saved settings were changed.';
   });
@@ -357,7 +414,7 @@ window.TISettings = (() => {
     if (Object.keys(draft()).length || busy) { event.preventDefault(); event.returnValue = ''; }
   });
   setInterval(() => { if (!el('settings-dialog').hidden && !busy) refreshStatus().catch(showError); }, 5000);
-  renderNasEditor(); updateControls();
+  renderNasEditor(); renderCopyRules(); updateControls();
   return {filter, onOpen: () => refreshStatus().catch(showError),
     canRetryHook: () => Boolean(token) && !busy && controller.paused && controller.drained && !controller.restart_required,
     isAdmin: () => Boolean(token),

@@ -118,14 +118,17 @@ def main() -> None:
             service.qbt._with_client = lambda operation: operation(client)
             runner = PostPromotionRunner(settings=settings, qbt=service.qbt, session_factory=sessions)
 
-            for location in locations:
-                identifier = location["id"]
+            for number, location in enumerate([locations[0], locations[1], locations[1]]):
+                identifier = ("one", "two", "unmatched")[number]
                 if identifier == "two":
                     target = Path(copy_temporary)
                     (target / ".intake-copy-mount").touch()
                     settings = Settings(**{**settings.model_dump(), "post_promotion_enabled": False,
                                           "post_promotion_script": None, "post_promotion_copy_enabled": True,
-                                          "post_promotion_copy_destination": str(target)})
+                                          "post_promotion_copy_rules": [{
+                                              "source": str(library / "edited-two"),
+                                              "destination": str(target), "enabled": True,
+                                          }]})
                     service.settings = runner.settings = settings
                 name = f"payload {identifier} $(ignored); 'quoted'.txt"
                 staged_source = Path(location["path"]) / name
@@ -135,9 +138,9 @@ def main() -> None:
                     job = service.submit_job(
                         db, torrent_file_data=torrent(v1_info(name=name.encode())),
                         torrent_file_name=f"{identifier}.torrent", final_parent=str(final_parent),
-                        final_category=None, staging_preference="nas", nas_staging_id=identifier,
+                        final_category=None, staging_preference="nas", nas_staging_id=location["id"],
                     )
-                    assert job.nas_staging_id == identifier
+                    assert job.nas_staging_id == location["id"]
                     assert job.staging_root_initial == location["path"]
                     assert job.nas_mount_marker == location["mount_marker"]
 
@@ -155,7 +158,7 @@ def main() -> None:
                         expected_final_parent=original_parent,
                     )
                     assert job.final_parent == str(final_parent)
-                    assert job.nas_staging_id == identifier and job.staging_root_actual == location["path"]
+                    assert job.nas_staging_id == location["id"] and job.staging_root_actual == location["path"]
                     assert not final_parent.exists(), "Editing the plan must not create or move any content"
                     assert Path(service.qbt.get_torrent(torrent_hash).save_path) == Path(location["path"])
 
@@ -207,11 +210,17 @@ def main() -> None:
                     db.refresh(job)
                     source = final_parent / name
                     assert job.state == "done" and job.is_terminal
-                    assert job.hook_status == "pending"
+                    assert job.hook_status == (None if identifier == "unmatched" else "pending")
                     assert job.content_path == str(source)
                     assert source.read_bytes() == b"test data"
                     assert not staged_source.exists()
                     assert (recorded.read_text().splitlines() if recorded.exists() else []) == before
+                    if identifier == "unmatched":
+                        assert runner.claim_next() is None, "Unmatched final locations must not be copied"
+                        assert not (target / name).exists()
+                        assert not (target / "nested" / name).exists()
+                        assert source.read_bytes() == b"test data"
+                        continue
                     claim = wait_for(runner.claim_next, f"{identifier} final hook readiness")
                     assert claim.job_id == job.id and claim.source == str(source)
                     asyncio.run(runner.run_claim(claim, asyncio.Event()))
@@ -227,9 +236,10 @@ def main() -> None:
                     else:
                         assert job.hook_kind == "copy" and job.hook_script is None
                         assert job.hook_destination == str(target)
-                        copy_folder = target / f"intake-job-{job.id}"
-                        assert (copy_folder / name).read_bytes() == source.read_bytes()
-                        assert (copy_folder / ".intake-copy-complete.json").is_file()
+                        assert job.hook_copy_source_root == str(library / "edited-two")
+                        assert job.hook_copy_relative_path == str(Path("nested") / name)
+                        assert (target / "nested" / name).read_bytes() == source.read_bytes()
+                        assert not (target / f"intake-job-{job.id}").exists(), "Mapped copies must not add a job wrapper"
                         assert recorded.read_text().splitlines() == before, "Built-in copying must not execute an operator script"
                     assert runner.claim_next() is None, "Finished hooks must never replay automatically"
                     assert source.read_bytes() == b"test data", "The hook must retain the seeding source"
@@ -240,7 +250,7 @@ def main() -> None:
             print(
                 f"PASS real qBittorrent {version}: two pinned NAS locations, complete/paused local payloads, "
                 "edited download destinations used for real moves into absent final subdirectories, no early hooks, literal path/name arguments, "
-                "exactly one script/copy per job, built-in rsync without script configuration, retained seeding originals"
+                "one script and one routed copy with preserved nested paths, unmatched final location skipped, retained seeding originals"
             )
         finally:
             process.terminate()

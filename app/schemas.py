@@ -82,6 +82,8 @@ class JobOut(BaseModel):
     hook_status: str | None = None
     hook_kind: str | None = None
     hook_destination: str | None = None
+    hook_copy_source_root: str | None = None
+    hook_copy_relative_path: str | None = None
     hook_error: str | None = None
     hook_output: str | None = None
     hook_exit_code: int | None = None

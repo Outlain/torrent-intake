@@ -20,6 +20,7 @@ let container, browser;
         {id: 'archive', label: 'Archive NAS', path: '/nas/archive/intake'},
       ])}`, '-e', 'TI_DEFAULT_NAS_STAGING_ID=main',
       '-e', 'TI_POST_PROMOTION_COPY_ENABLED=false', '-e', 'TI_POST_PROMOTION_COPY_DESTINATION=/copy-target/fixed',
+      '-e', `TI_POST_PROMOTION_COPY_RULES=${JSON.stringify([{source: '/downloads/<img src=x onerror=alert(1)>', destination: '/copy-target/fixed', enabled: true}])}`,
       '-v', `${name}:/app/data`, '-p', '127.0.0.1::8000',
       process.env.TI_UI_TEST_IMAGE || 'torrent-intake:test');
     const origin = `http://127.0.0.1:${docker('port', container, '8000/tcp').split(':').pop()}`;
@@ -43,7 +44,8 @@ let container, browser;
       nas_staging_label: 'Archive NAS', nas_staging_path: '/nas/archive/intake', hook_status: 'failed',
       hook_error: 'Test hook failure', hook_exit_code: 7, hook_output: '<img src=x onerror=alert(1)> safe text'};
     const copiedJob = {...hookedJob, id: 'copy-test', hook_kind: 'copy', hook_status: 'interrupted',
-      hook_error: 'Copy interrupted; inspect partial data before retrying', hook_destination: '/copy-target/intake-copies'};
+      hook_error: 'Copy interrupted; inspect partial data before retrying', hook_destination: '/copy-target/Movies',
+      hook_copy_source_root: '/downloads/Movies', hook_copy_relative_path: 'Action/Film'};
     const scanningJob = {...queuedJob, id: 'scanning-test', state: 'scanning', can_edit_final_destination: false};
     let finalDestinationPaused = false, knownPathRequests = 0;
     let failOnce = true, inFlight = 0, peak = 0;
@@ -89,10 +91,9 @@ let container, browser;
     const fill = (selector, value) => page.$eval(selector, (node, value) => {
       node.value = value; node.dispatchEvent(new Event('input', {bubbles: true}));
     }, value);
-    const click = async selector => {
-      await page.$eval(selector, node => node.scrollIntoView({block: 'center'}));
-      await page.click(selector);
-    };
+    // Job rows are replaced by the normal refresh. Re-resolve detached nodes
+    // while waiting for a visible, enabled click target instead of holding one.
+    const click = selector => page.locator(selector).click();
     const choose = names => page.$eval('#torrent-file-input', (node, names) => {
       const selection = new DataTransfer();
       for (const name of names) selection.items.add(new File(['test metadata'], name, {type: 'application/x-bittorrent'}));
@@ -166,7 +167,7 @@ let container, browser;
       assert.equal(await page.$eval('.job-hook-result pre', node => node.textContent), hookedJob.hook_output);
       assert.equal(await page.$('.job-hook-result img'), null, 'hook output must be text, never HTML');
       assert.match(await page.$eval('.job-hook-result[data-job-id="hook-test"] summary', node => node.textContent), /Script status: failed/);
-      assert.match(await page.$eval('.job-hook-result[data-job-id="copy-test"]', node => node.textContent), /Copy status: interrupted.*Copy destination: \/copy-target\/intake-copies.*Copy output:.*Retry copy/s);
+      assert.match(await page.$eval('.job-hook-result[data-job-id="copy-test"]', node => node.textContent), /Copy status: interrupted.*Copy destination: \/copy-target\/Movies\/Action\/Film.*Saved copy rule: \/downloads\/Movies → \/copy-target\/Movies.*Copy output:.*Retry copy/s);
       assert.equal(await page.$('.job-hook-result[data-job-id="copy-test"] img'), null, 'copy output must also be text, never HTML');
       assert(await page.$eval('[data-retry-hook]', node => node.hidden), 'hook retry must be administration-only');
       assert.equal(await page.$eval('[data-state="waiting_for_nas"]', node => node.textContent), 'Waiting for NAS mount');
@@ -262,6 +263,11 @@ let container, browser;
     assert.equal(await page.$('#edit-default_nas_staging_id'), null);
     assert.equal(await page.$('#edit-post_promotion_copy_enabled'), null, 'copy environment overrides must remain read-only');
     assert.equal(await page.$('#edit-post_promotion_copy_destination'), null);
+    assert.equal(await page.$('#edit-post_promotion_copy_rules'), null);
+    assert(await page.$$eval('.copy-rule-row input', inputs => inputs.every(input => input.disabled)), 'rule environment overrides stay read-only');
+    assert(await page.$eval('#copy-rule-add', node => node.disabled));
+    assert.equal(await page.$('#copy-rule-editor img'), null, 'rule paths must never render HTML');
+    assert.equal(await page.$eval('.copy-rule-source', node => node.value), '/downloads/<img src=x onerror=alert(1)>');
     assert(await page.$$eval('.nas-location-row input', inputs => inputs.every(input => input.disabled)));
     assert(!(await page.$eval('[data-retry-hook]', node => node.hidden)));
     const controllerState = await (await fetch(`${origin}/controller/status`)).json();

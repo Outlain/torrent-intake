@@ -33,12 +33,14 @@ NAS_LOCATIONS = [
 HOOK_SCRIPT = "/hooks/portable-post-promotion.sh"
 COPY_DESTINATION = "/copy-target/portable-copies"
 PINNED_COPY_DESTINATION = "/copy-target/previous-copies"
+COPY_RULES = [{"source": "/downloads/Movies", "destination": COPY_DESTINATION, "enabled": True}]
 JOB_SNAPSHOT_FIELDS = (
     "id", "state", "is_terminal", "staging_preference", "staging_actual",
     "staging_root_initial", "staging_root_actual", "nas_staging_id", "nas_staging_label",
     "nas_staging_path", "nas_mount_marker", "scan_completed_at", "promoted_at",
     "hook_status", "hook_due_at", "hook_started_at", "hook_finished_at", "hook_error",
     "hook_output", "hook_script", "hook_attempts", "hook_exit_code", "hook_kind", "hook_destination",
+    "hook_copy_source_root", "hook_copy_relative_path",
 )
 
 
@@ -117,6 +119,8 @@ def seed(directory, identifier, *, local_fallback=False, hook_kind="script"):
             job.hook_output = f"Portable test {hook_kind} output"
             job.hook_script = HOOK_SCRIPT if hook_kind == "script" else None
             job.hook_destination = PINNED_COPY_DESTINATION if hook_kind == "copy" else None
+            job.hook_copy_source_root = "/downloads/Movies" if hook_kind == "copy" else None
+            job.hook_copy_relative_path = "Archive/movie.mkv" if hook_kind == "copy" else None
             job.hook_attempts = 2
             job.hook_exit_code = 7
         db.add(job)
@@ -170,7 +174,7 @@ def main():
             assert request(18000, "/admin/settings", token=token, payload={"confirm_advanced": True, "settings": {
                 "ui_title": "Portable title", "qbt_password": QBT_PASSWORD, "polling_interval_seconds": 60,
                 "nas_staging_locations": NAS_LOCATIONS, "default_nas_staging_id": "archive",
-                "post_promotion_copy_enabled": True, "post_promotion_copy_destination": COPY_DESTINATION,
+                "post_promotion_copy_enabled": True, "post_promotion_copy_rules": COPY_RULES,
                 "post_promotion_delay_seconds": 17,
                 "post_promotion_timeout_seconds": 900,
             }})[0] == 200
@@ -184,7 +188,7 @@ def main():
             assert config["qbt_password"] == QBT_PASSWORD
             assert config["nas_staging_locations"] == NAS_LOCATIONS
             assert config["default_nas_staging_id"] == "archive"
-            assert config["post_promotion_copy_enabled"] and config["post_promotion_copy_destination"] == COPY_DESTINATION
+            assert config["post_promotion_copy_enabled"] and config["post_promotion_copy_rules"] == COPY_RULES
             assert not config["post_promotion_enabled"] and config["post_promotion_script"] is None
             seed(source, "original")
             seed(source, "copied-original", hook_kind="copy")
@@ -225,7 +229,8 @@ def main():
             restored_jobs = {job["id"]: job for job in json.loads(body)}
             for identifier, expected in expected_job_snapshots.items():
                 for name in ("staging_actual", "nas_staging_id", "nas_staging_label", "nas_staging_path",
-                             "hook_status", "hook_error", "hook_output", "hook_exit_code", "hook_kind", "hook_destination"):
+                             "hook_status", "hook_error", "hook_output", "hook_exit_code", "hook_kind", "hook_destination",
+                             "hook_copy_source_root", "hook_copy_relative_path"):
                     assert restored_jobs[identifier][name] == expected[name], f"restored job API changed {name}"
             with sqlite3.connect(destination / "torrent_intake.db") as db:
                 assert db.execute("SELECT torrent_file_name,torrent_file_data FROM jobs WHERE id='original'").fetchone() == ("example.torrent", torrent())
@@ -237,10 +242,10 @@ def main():
             assert values["qbt_password"] == QBT_PASSWORD
             assert values["nas_staging_locations"] == NAS_LOCATIONS
             assert values["default_nas_staging_id"] == "primary", "receiving environment wins without retargeting existing jobs"
-            assert values["post_promotion_copy_enabled"] and values["post_promotion_copy_destination"] == COPY_DESTINATION
+            assert values["post_promotion_copy_enabled"] and values["post_promotion_copy_rules"] == COPY_RULES
             assert not values["post_promotion_enabled"] and values["post_promotion_script"] is None
             assert restored_jobs["copied-original"]["hook_destination"] == PINNED_COPY_DESTINATION
-            assert restored_jobs["copied-original"]["hook_destination"] != values["post_promotion_copy_destination"], "changing the default must not retarget a saved copy"
+            assert restored_jobs["copied-original"]["hook_destination"] != values["post_promotion_copy_rules"][0]["destination"], "changing rules must not retarget a saved copy"
             assert values["post_promotion_delay_seconds"] == 17
             assert values["post_promotion_timeout_seconds"] == 900
             assert not Path(HOOK_SCRIPT).exists(), "script executables must not be included in portable backups"

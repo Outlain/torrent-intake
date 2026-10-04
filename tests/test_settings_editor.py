@@ -62,31 +62,52 @@ class SettingsEditorTests(unittest.TestCase):
             self.assertNotIn("never-expose", repr(raised.exception.fields))
 
     def test_builtin_copy_can_be_configured_without_script_environment(self):
+        rules = [{"source": "/downloads/Movies", "destination": "/copy-target/Movies", "enabled": True}]
         candidate, changes = validate_draft(self.settings, {
             "post_promotion_copy_enabled": True,
-            "post_promotion_copy_destination": "/copy-target/intake-copies",
+            "post_promotion_copy_rules": rules,
         })
         self.assertTrue(candidate.post_promotion_copy_enabled)
         self.assertIsNone(candidate.post_promotion_script)
         self.assertTrue(all(change["advanced"] for change in changes))
         persist_settings(candidate)
-        self.assertEqual(Settings().post_promotion_copy_destination, "/copy-target/intake-copies")
+        self.assertEqual(Settings().model_dump()["post_promotion_copy_rules"], rules)
 
     def test_builtin_copy_rejects_unsafe_paths_and_conflicting_modes(self):
         for destination in ("/app/data", "/downloads/Movies", "/copy-target/../app", "relative", "/copy-target-bad", "/copy-target/x\n"):
             with self.subTest(destination=destination), self.assertRaises(SettingsEditError):
                 validate_draft(self.settings, {
                     "post_promotion_copy_enabled": True,
-                    "post_promotion_copy_destination": destination,
+                    "post_promotion_copy_rules": [{"source": "/downloads/Movies", "destination": destination}],
                 })
-        with self.assertRaises(SettingsEditError):
-            validate_draft(self.settings, {"post_promotion_copy_enabled": True})
+        candidate, _ = validate_draft(self.settings, {"post_promotion_copy_enabled": True})
+        self.assertEqual(candidate.post_promotion_copy_rules, [])  # Explicit opt-in rules; no implicit destination.
         scripted = self.settings.model_copy(update={"post_promotion_script": "/hooks/test.py"})
         persist_settings(scripted)
         with self.assertRaisesRegex(SettingsEditError, "Check"):
             validate_draft(scripted, {"post_promotion_copy_enabled": True,
                                       "post_promotion_enabled": True,
-                                      "post_promotion_copy_destination": "/copy-target"})
+                                      "post_promotion_copy_rules": [{"source": "/downloads", "destination": "/copy-target"}]})
+
+    def test_copy_rules_reject_invalid_sources_duplicates_and_environment_edits(self):
+        rule = {"source": "/downloads/Movies", "destination": "/copy-target/Movies", "enabled": True}
+        for rules in ([{**rule, "source": "/elsewhere"}], [rule, rule], [rule] * 33):
+            with self.subTest(rules=rules), self.assertRaises(SettingsEditError):
+                validate_draft(self.settings, {"post_promotion_copy_rules": rules})
+        with self.assertRaises(SettingsEditError) as raised:
+            validate_draft(self.settings, {"post_promotion_copy_destination": "/copy-target"})
+        self.assertEqual(raised.exception.status, 409)
+        with patch.dict(os.environ, {"TI_POST_PROMOTION_COPY_RULES": "[]"}):
+            with self.assertRaises(SettingsEditError) as raised:
+                validate_draft(self.settings, {"post_promotion_copy_rules": [rule]})
+            self.assertEqual(raised.exception.status, 409)
+
+    def test_copy_rule_disabled_state_survives_persistence(self):
+        candidate, _ = validate_draft(self.settings, {"post_promotion_copy_rules": [
+            {"source": "/downloads/TV", "destination": "/copy-target/TV", "enabled": False},
+        ]})
+        persist_settings(candidate)
+        self.assertFalse(Settings().post_promotion_copy_rules[0].enabled)
 
     def test_secret_replacements_clear_and_redacted_review(self):
         candidate, changes = validate_draft(self.settings, {"qbt_password": ""})
@@ -211,8 +232,9 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(not check["ok"] for check in main._storage_checks()))
 
     async def test_copy_unavailable_is_an_optional_setup_warning(self):
-        main.settings = self.settings.model_copy(update={
-            "post_promotion_copy_enabled": True, "post_promotion_copy_destination": "/copy-target/library",
+        main.settings = Settings(**{**self.settings.model_dump(),
+            "post_promotion_copy_enabled": True,
+            "post_promotion_copy_rules": [{"source": "/downloads", "destination": "/copy-target/library"}],
         })
         with patch.object(main, "validate_copy_destination", side_effect=FileNotFoundError("copy mount offline")):
             check = next(item for item in main._storage_checks() if item["name"].startswith("Copy destination:"))

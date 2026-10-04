@@ -15,8 +15,9 @@ services:
     # environment:
     #   TI_QBT_HOST: ${TI_QBT_HOST}
     #   TI_INFECTED_ACTION: ${TI_INFECTED_ACTION}
-    # Built-in Copy after completion is configured in the UI; no script/env needed.
-    # Mount /copy-target below and provision its marker before enabling in Settings.
+    # Built-in copy rules are configured in the UI; no script/env needed.
+    # Mount /copy-target below; each rule destination needs .intake-copy-mount.
+    # Example rule: /downloads/movies -> /copy-target/movies. Unmatched jobs skip copying.
     # Advanced custom-script alternative only (mutually exclusive with built-in copy):
     #   TI_POST_PROMOTION_SCRIPT: /hooks/after-promotion-copy.py
     volumes:
@@ -35,7 +36,7 @@ services:
       #   bind:
       #     create_host_path: false
       # Optional ALREADY MOUNTED copy target: Intake only, not qB or ClamD.
-      # Set /copy-target or a subdirectory in the UI; that directory needs
+      # Pair a final source root with /copy-target or a subdirectory in the UI; each target needs
       # a pre-existing .intake-copy-mount marker on the intended filesystem.
       # create_host_path:false checks existence, not that NFS is mounted.
       # - type: bind

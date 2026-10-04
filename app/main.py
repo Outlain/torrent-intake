@@ -238,14 +238,19 @@ def _storage_checks() -> list[dict]:
         checks.append({"name": f"NAS: {location.label} ({location.path})", "ok": available,
                        "required": False, "message": message + " Jobs needing this location wait when it is unavailable."})
     if settings.post_promotion_copy_enabled:
-        try:
-            validate_copy_destination(Path(settings.post_promotion_copy_destination))
-            message, available = "Copy destination and its mount marker are accessible.", True
-        except (OSError, RuntimeError, ValueError) as exc:
-            message, available = str(exc), False
-        checks.append({"name": f"Copy destination: {settings.post_promotion_copy_destination}",
-                       "ok": available, "required": False,
-                       "message": message + " Copies wait if the target is unavailable; normal Intake work can continue."})
+        destinations = dict.fromkeys(rule.destination for rule in settings.post_promotion_copy_rules if rule.enabled)
+        if not destinations:
+            checks.append({"name": "Copy rules", "ok": False, "required": False,
+                           "message": "No enabled copy rules. Newly promoted torrents will not be copied; configure source-to-destination rules in Settings."})
+        for destination in destinations:
+            try:
+                validate_copy_destination(Path(destination))
+                message, available = "Copy destination and its mount marker are accessible.", True
+            except (OSError, RuntimeError, ValueError) as exc:
+                message, available = str(exc), False
+            checks.append({"name": f"Copy destination: {destination}",
+                           "ok": available, "required": False,
+                           "message": message + " Copies wait if the target is unavailable; normal Intake work can continue."})
     return checks
 
 

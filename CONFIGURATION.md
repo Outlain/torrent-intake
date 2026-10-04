@@ -196,26 +196,57 @@ With an empty list, old `TI_NAS_STAGING_ROOT` deployments continue unchanged.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `TI_POST_PROMOTION_COPY_ENABLED` | `false` | Built-in copy after a new verified clean promotion. Editable after the UI's advanced unlock; no script needed. Existing done jobs are not replayed automatically. |
-| `TI_POST_PROMOTION_COPY_DESTINATION` | unset | Existing absolute directory at/below `/copy-target`, with a regular `.intake-copy-mount` sentinel. Advanced UI editable; queued jobs keep their saved destination. |
+| `TI_POST_PROMOTION_COPY_RULES` | `[]` | Up to 32 `{source, destination, enabled}` rules. Match final parent by path boundary; longest enabled source wins. No match means no copy. Advanced UI editable. |
+| `TI_POST_PROMOTION_COPY_DESTINATION` | unset | Legacy compatibility value, ignored for new jobs. Previously queued copies retain their pinned destination and legacy layout. |
 | `TI_POST_PROMOTION_ENABLED` | `false` | Alternative custom-script action. Cannot be enabled together with built-in copying. |
 | `TI_POST_PROMOTION_SCRIPT` | unset | Deployment-only absolute executable path under read-only `/hooks`, for example `/hooks/after-promotion-copy.py`. No shell command or arbitrary UI command field. |
 | `TI_POST_PROMOTION_DELAY_SECONDS` | `5` | Wait after promotion before copy/script readiness checks. Not a substitute for verifying movement finished. |
 | `TI_POST_PROMOTION_TIMEOUT_SECONDS` | `7200` | Whole copy/script attempt deadline in seconds; process and normal process-group children are stopped on timeout. Increase deliberately for slow or large copies. |
 
-For ordinary copying, mount the destination once and use **Settings & Help →
-Downloads/storage** to set the destination and enable **Copy after completion**.
+For ordinary copying, mount destination storage at/below `/copy-target` and use
+**Settings & Help → Downloads and storage** to add paired source/destination rules
+and enable **Copy after successful promotion**.
 Review, pause/save, restart in Portainer, then verify/resume. Do not add explicit
 `TI_POST_PROMOTION_COPY_*` environment overrides unless you intentionally want
 deployment-managed, UI-locked values. `/hooks` and `TI_POST_PROMOTION_SCRIPT` are
 unnecessary for built-in copying.
 
-The built-in action reserves `intake-job-<id>/` under the selected destination,
-copies only the promoted content without deleting the original or overwriting
-existing copies, then publishes `.intake-copy-complete.json`. The target/marker
-must exist before enabling it; Intake never provisions mounts or sentinels. It
-requires additional disk space and I/O and is not dataset replication. A failed
-or partial copy is retained for operator inspection. Copy settings, pinned
-destinations and status are backed up; copied media/mounts/permissions are not.
+Example local settings (no environment variable is needed when using the UI):
+
+```json
+{
+  "post_promotion_copy_enabled": true,
+  "post_promotion_copy_rules": [
+    {"source": "/downloads/movies", "destination": "/copy-target/movies", "enabled": true},
+    {"source": "/downloads/music", "destination": "/copy-target/music", "enabled": true}
+  ]
+}
+```
+
+Each source must be within the configured allowed final roots, outside staging
+and operational paths. Each destination must be at/below `/copy-target`, already
+exist and contain a readable regular `.intake-copy-mount` marker. Duplicate source
+roots and source/destination overlap are rejected. Case-sensitive matching is by
+whole directory components, not text prefix. Disabled rules are ignored; the most
+specific enabled match wins. No rule means no copy, including when upgrading an
+old single-destination configuration; add explicit rules to enable new copies.
+
+The relative path below the source root is preserved without an `intake-job-*`
+wrapper. `/downloads/movies/Action/Film/` becomes `/copy-target/movies/Action/Film/`.
+Only that promoted torrent is copied, not siblings or the entire category. This
+is not ongoing synchronization: later edits/deletions and historical jobs are not
+mirrored. Existing target torrent files/folders are not merged or overwritten.
+Queued jobs keep their source root, destination root and relative target even
+when rules are changed. Legacy queued copies keep their old wrapper layout.
+
+Private action records live in `.intake-copy-state` under each destination root,
+outside the payload. Partial directories can be visible during copying; rely on
+the job's copy success/private completion record before consuming them. Single
+files are privately staged and published with a no-overwrite hard link. No
+`renameat2` support is required. Failed/partial content is retained for inspection.
+Copying requires additional disk space and I/O, and is not dataset replication.
+Copy rules, pinned paths and status are backed up; copied media, destination-side
+records, mounts, markers and permissions are not.
 
 For the advanced custom-script alternative, the script receives an argument list,
 without a shell:

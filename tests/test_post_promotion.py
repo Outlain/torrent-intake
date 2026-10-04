@@ -43,6 +43,7 @@ class PostPromotionTests(unittest.IsolatedAsyncioTestCase):
             post_promotion_script=str(self.script),
             post_promotion_copy_enabled=False,
             post_promotion_copy_destination=None,
+            post_promotion_copy_rules=[],
             post_promotion_delay_seconds=5,
             post_promotion_timeout_seconds=5,
             completion_grace_seconds=15,
@@ -123,6 +124,9 @@ class PostPromotionTests(unittest.IsolatedAsyncioTestCase):
         self.settings.post_promotion_script = None
         self.settings.post_promotion_copy_enabled = True
         self.settings.post_promotion_copy_destination = str(destination)
+        self.settings.post_promotion_copy_rules = [
+            SimpleNamespace(source=str(self.final), destination=str(destination), enabled=True),
+        ]
         copy_root_patch = patch("app.copy_action.COPY_ROOT", destination)
         copy_root_patch.start()
         self.addCleanup(copy_root_patch.stop)
@@ -132,6 +136,7 @@ class PostPromotionTests(unittest.IsolatedAsyncioTestCase):
         destination = self.enable_copy()
         self.job()
         self.settings.post_promotion_copy_destination = str(destination / "new-default")
+        self.settings.post_promotion_copy_rules[0].destination = str(destination / "new-default")
         claim = self.runner.claim_next()
         self.assertEqual(claim.kind, "copy")
         self.assertEqual(claim.destination, str(destination))
@@ -140,17 +145,23 @@ class PostPromotionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--torrent-name=" + self.record().torrent_name, claim.argv)
         self.assertEqual(self.record().hook_kind, "copy")
         self.assertEqual(self.record().hook_destination, str(destination))
+        self.assertEqual(claim.copy_source_root, str(self.final))
+        self.assertEqual(claim.copy_relative_path, self.source.name)
+        self.assertEqual(claim.argv[5:8], ["--source-root", str(self.final), "--relative-path=" + self.source.name])
 
     def test_copy_retry_preserves_target_and_cannot_change_to_script(self) -> None:
         destination = self.enable_copy()
         self.job()
         self.settings.post_promotion_copy_destination = str(destination / "new-default")
+        self.settings.post_promotion_copy_rules = []
         with self.sessions() as db:
             job = db.get(Job, "hook-job")
             job.hook_status = None
             job.hook_attempts = 1
             self.assertTrue(queue_promotion_hook(job, self.settings))
             self.assertEqual(job.hook_destination, str(destination))
+            self.assertEqual(job.hook_copy_source_root, str(self.final))
+            self.assertEqual(job.hook_copy_relative_path, self.source.name)
             self.assertEqual(job.hook_attempts, 1)
             job.hook_status = None
             self.settings.post_promotion_copy_enabled = False
@@ -200,6 +211,40 @@ class PostPromotionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("manifest", self.record().hook_error)
         self.assertEqual(list(destination.iterdir()), [destination / ".intake-copy-mount"])
 
+    def test_mapped_copy_rejects_tampered_relative_path(self) -> None:
+        self.enable_copy()
+        self.job()
+        self.update(hook_copy_relative_path="../escaped")
+        self.assertIsNone(self.runner.claim_next())
+        self.assertEqual(self.record().hook_status, "failed")
+        self.assertIn("saved copy route", self.record().hook_error)
+
+    def test_partial_mapped_copy_fields_fail_before_execution(self) -> None:
+        self.enable_copy()
+        self.job()
+        self.update(hook_copy_source_root=None)
+        self.assertIsNone(self.runner.claim_next())
+        self.assertEqual(self.record().hook_status, "failed")
+        self.assertIn("incomplete pinned routing", self.record().hook_error)
+        self.assertEqual(self.record().hook_attempts, 0)
+
+    def test_legacy_pending_copy_retains_old_layout_on_claim_and_retry(self) -> None:
+        destination = self.enable_copy()
+        self.job()
+        self.update(hook_copy_source_root=None, hook_copy_relative_path=None)
+        self.settings.post_promotion_copy_rules = []
+        claim = self.runner.claim_next()
+        self.assertIsNone(claim.copy_source_root)
+        self.assertIsNone(claim.copy_relative_path)
+        self.assertNotIn("--source-root", claim.argv)
+        with self.sessions() as db:
+            job = db.get(Job, "hook-job")
+            job.hook_status = None
+            self.assertTrue(queue_promotion_hook(job, self.settings))
+            self.assertEqual(job.hook_destination, str(destination))
+            self.assertIsNone(job.hook_copy_source_root)
+            self.assertIsNone(job.hook_copy_relative_path)
+
     def test_switching_action_mode_does_not_execute_old_pending_work(self) -> None:
         self.job()
         self.enable_copy()
@@ -213,10 +258,14 @@ class PostPromotionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claim.kind, "script")
         self.assertEqual(claim.script, str(self.script))
 
-    async def test_builtin_copy_executes_without_executable_hook_mount(self) -> None:
+    async def test_builtin_copy_executes_without_hook_mount_and_supports_leading_dash(self) -> None:
         target_root = Path("/copy-target")
         if not target_root.is_dir() or not os.access(target_root, os.W_OK | os.X_OK):
             self.skipTest("/copy-target writable test mount is required for subprocess integration")
+        renamed = self.source.with_name("-" + self.source.name)
+        self.source.rename(renamed)
+        self.source = renamed
+        self.torrent.content_path = str(renamed)
         with tempfile.TemporaryDirectory(prefix="ti-copy-test-", dir=target_root) as name:
             destination = Path(name)
             (destination / ".intake-copy-mount").touch()
@@ -224,6 +273,9 @@ class PostPromotionTests(unittest.IsolatedAsyncioTestCase):
             self.settings.post_promotion_script = None
             self.settings.post_promotion_copy_enabled = True
             self.settings.post_promotion_copy_destination = name
+            self.settings.post_promotion_copy_rules = [
+                SimpleNamespace(source=str(self.final), destination=name, enabled=True),
+            ]
             self.job()
             self.script.unlink()
             claim = self.runner.claim_next()
@@ -231,10 +283,9 @@ class PostPromotionTests(unittest.IsolatedAsyncioTestCase):
             await self.runner.run_claim(claim, asyncio.Event())
             job = self.record()
             self.assertEqual(job.hook_status, "succeeded", job.hook_output)
-            copied = destination / "intake-job-hook-job" / self.source.name / "video.mkv"
+            copied = destination / self.source.name / "video.mkv"
             self.assertEqual(copied.read_bytes(), b"clean media")
             self.assertTrue((self.source / "video.mkv").exists())
-            self.assertTrue((copied.parent.parent / ".intake-copy-complete.json").is_file())
     def test_disabled_runner_preserves_existing_pending_work_until_enabled(self) -> None:
         self.job()
         self.settings.post_promotion_enabled = False

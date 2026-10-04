@@ -140,12 +140,18 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     ),
     "post_promotion_copy_enabled": SettingSpec(
         "Storage and placement", "Copy after successful promotion",
-        "Copy the verified promoted torrent to a second mounted location. No script is required. Originals are retained; existing destinations are not overwritten. Choose built-in copying OR a custom script. Applies to newly promoted jobs, not old completed jobs.",
+        "Enable one-time copies for newly promoted torrents whose final parent matches an enabled copy rule. No match means no copy. Originals are retained and collisions are protected. Choose built-in copying OR a custom script; neither is a continuous folder sync.",
+        safety_critical=True,
+    ),
+    "post_promotion_copy_rules": SettingSpec(
+        "Storage and placement", "Copy destination rules",
+        "Map final-library source roots to existing destinations under /copy-target. The most specific enabled source containing the job's final parent wins; unmatched jobs are not copied. Disabled rules are ignored, so a broader enabled rule can still match. Relative folders are preserved, without a per-job wrapper. Queued jobs retain their saved rule. Maximum 32 rules.",
         safety_critical=True,
     ),
     "post_promotion_copy_destination": SettingSpec(
-        "Storage and placement", "Copy destination folder",
-        "Existing container path at or below /copy-target, for example /copy-target/intake-copies. Mount this separately in Portainer and create .intake-copy-mount inside the selected folder on the intended filesystem. Queued copies retain their original destination when this setting changes.",
+        "Storage and placement", "Legacy copy destination (compatibility only)",
+        "Retained for older settings and backups. This global destination is ignored for newly promoted jobs: configure Copy destination rules instead. Previously queued copies keep their pinned destination and layout.",
+        change_hint="Do not configure this for new copies. Add explicit source-to-destination rules in Downloads and storage instead.",
         safety_critical=True,
     ),
     "post_promotion_script": SettingSpec(
@@ -443,7 +449,7 @@ ADVANCED_SETTINGS = frozenset({
     "media_attachment_total_mib", "clamd_max_inflight_requests", "max_scan_slots",
     "pause_confirmation_timeout_seconds",
     "nas_staging_locations", "post_promotion_enabled",
-    "post_promotion_copy_enabled", "post_promotion_copy_destination",
+    "post_promotion_copy_enabled", "post_promotion_copy_rules",
 })
 
 # Shared by the form controls and the settings API.
@@ -483,6 +489,8 @@ def build_settings_catalog(settings: Settings, pending: Settings | None = None) 
                 lock_reason = "Requires an offline migration. Changing this path does not move your database or its records. Configure the matching Docker mount in Portainer."
             elif name == "infected_action":
                 lock_reason = "Destructive-action policy is intentionally not editable here. Change it in Portainer or settings.json while Intake is stopped."
+            elif name == "post_promotion_copy_destination":
+                lock_reason = "Compatibility value only; no automatic fallback. Use Copy destination rules for newly promoted jobs."
         elif name in overrides:
             permission = "environment"
             lock_reason = f"Controlled by Portainer/environment through TI_{name.upper()}. Remove that mapping completely (do not leave it blank) and redeploy to edit here. The saved value is retained."

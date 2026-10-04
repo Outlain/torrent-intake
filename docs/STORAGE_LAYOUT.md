@@ -48,6 +48,17 @@ Mount each share directly **inside the Linux VM running Docker**:
 | Local SSD staging | `/data/docker/torrent-intake/staging` | `/staging-local` |
 | `NAS:/mnt/hdd/intake-copies` | `/mnt/nfs/intake-copies` | Intake only: `/copy-target` |
 
+For optional routed copies, create `movies`, `tv`, etc. inside the copy storage,
+each with `.intake-copy-mount`. In Intake settings pair `/downloads/Movies` with
+`/copy-target/movies`, `/downloads/TV` with `/copy-target/tv`, and so on. Only jobs
+whose final parent matches an enabled source rule are copied. Relative payload
+paths remain the same without a job-ID wrapper; the category is not continually
+synchronized and unrelated existing library content is not backfilled. Private
+copy records stay outside payloads in each copy root's `.intake-copy-state`.
+You may instead mount independent copy exports at `/copy-target/movies`, etc.;
+only Intake needs those binds. Do not point copy rules back at the original data
+through an alias mount.
+
 **Preserve the exact spelling/case already recorded by your jobs and qBittorrent.**
 If the current library is `/downloads/movies` rather than `/downloads/Movies`,
 keep the lowercase spelling. A host directory may have a different name because

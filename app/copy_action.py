@@ -1,8 +1,11 @@
 """Built-in copy action for verified promoted content; never run through a shell.
 
-Consumers must require .intake-copy-complete.json inside each intake-job-* folder.
-An incomplete folder is deliberately never resumed, overwritten, or removed.
-Review it and move it aside before explicitly retrying the hook in Intake.
+Legacy copies use an intake-job-* wrapper and its completion marker. Routed
+copies preserve the relative payload path and keep records separately under
+.intake-copy-state. A reserved directory can be visible before copying finishes;
+consumers must wait for successful copy status. Incomplete copies are never
+resumed, overwritten, or removed; review and move them and their state aside
+before explicitly retrying the action in Intake.
 This is not a backup engine or a sandbox against concurrent hostile filesystem
 writers. Keep the source and private destination unchanged during the copy.
 """
@@ -23,6 +26,7 @@ DESTINATION_ROOT = COPY_ROOT / "intake-copies"
 MOUNT_MARKER = ".intake-copy-mount"  # Provision manually on the intended export.
 COMPLETE_MARKER = ".intake-copy-complete.json"
 PENDING_MARKER = ".intake-copy-complete.pending"
+STATE_DIRECTORY = ".intake-copy-state"
 RSYNC = "/usr/bin/rsync"
 
 
@@ -91,13 +95,145 @@ def read_completion(path: Path) -> dict:
     return record
 
 
-def copy_promoted(source: Path, torrent_hash: str, torrent_name: str, job_id: str, *, destination: Path | None = None) -> Path:
+def _write_record(path: Path, record: dict) -> None:
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(record, stream, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _ensure_directory(path: Path) -> os.stat_result:
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = checked_path(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"Expected a directory, not an existing file: {path}")
+    return info
+
+
+def _copy_routed(source: Path, torrent_hash: str, torrent_name: str, job_id: str, *,
+                 destination: Path, source_root: Path, relative_path: Path) -> Path:
+    """Copy one payload to its mapped relative path without merging or replacing."""
+    validate_destination(destination)
+    if (relative_path.is_absolute() or not relative_path.parts
+            or ".." in relative_path.parts
+            or relative_path.parts[0] in {STATE_DIRECTORY, MOUNT_MARKER}):
+        raise RuntimeError("Copy relative path must be nonempty, relative and traversal-free")
+    root_info = checked_path(source_root)
+    if not stat.S_ISDIR(root_info.st_mode) or source != source_root / relative_path:
+        raise RuntimeError("Source must exactly match the configured source root and relative path")
+    if source.is_relative_to(destination) or destination.is_relative_to(source):
+        raise RuntimeError("Source and destination must not be identical or nested")
+    before = snapshot(source)
+    source_directories = {tuple(info[2:4]) for info in before.values() if info[0] == "directory"}
+    source_directories.add((root_info.st_dev, root_info.st_ino))
+
+    def reject_alias(info: os.stat_result) -> None:
+        if (info.st_dev, info.st_ino) in source_directories:
+            raise RuntimeError("Copy destination aliases the source or a directory inside it; choose a separate target")
+
+    reject_alias(checked_path(destination))
+    marker = destination / MOUNT_MARKER
+    marker_before = checked_path(marker)
+    copied = destination / relative_path
+    request = {
+        "source": str(source), "source_root": str(source_root),
+        "relative_path": str(relative_path), "destination": str(destination),
+        "torrent_hash": torrent_hash, "torrent_name": torrent_name, "job_id": job_id,
+    }
+    state_root = destination / STATE_DIRECTORY
+    reject_alias(_ensure_directory(state_root))
+    state = state_root / job_id
+    complete = state / "complete.json"
+    try:
+        state.mkdir(mode=0o700)  # Exclusive per-job reservation, not exist_ok.
+    except FileExistsError:
+        try:
+            record = read_completion(complete)
+            matches = (record.get("request") == request
+                       and record.get("source_snapshot") == before
+                       and record.get("destination_snapshot") == snapshot(copied))
+        except (OSError, ValueError, RuntimeError):
+            matches = False
+        if not matches:
+            raise RuntimeError(
+                f"Incomplete/colliding copy: inspect {copied} and {state}; move incomplete "
+                "data and its state aside before a manual retry. No files were changed."
+            ) from None
+        print(f"Already complete; no copy needed: {copied}", flush=True)
+        return copied
+
+    _write_record(state / "request.json", request)
+    # Existing category/subcategory parents are allowed, but the torrent itself
+    # is always an exclusive new name: never merge two torrents or clobber one.
+    parent = destination
+    for part in relative_path.parts[:-1]:
+        parent /= part
+        reject_alias(_ensure_directory(parent))
+    try:
+        checked_path(copied)
+    except FileNotFoundError:
+        pass
+    else:
+        raise RuntimeError(f"Destination collision; no files were changed: {copied}")
+
+    is_directory = before["."][0] == "directory"
+    if is_directory:
+        copied.mkdir(mode=0o700)  # Atomic no-replace reservation works on NFS too.
+        rsync_source, rsync_destination = str(source) + "/", str(copied) + "/"
+    else:
+        # Stage a single file privately, then hard-link it into the destination.
+        # A link is no-replace and stays on this filesystem; unlike renameat2 it
+        # works on NFS without requiring RENAME_NOREPLACE support.
+        work = state / "payload"
+        work.mkdir(mode=0o700)
+        rsync_source, rsync_destination = str(source), str(work) + "/"
+
+    print(f"Copy reservation: {copied}; wait for successful copy status before use", flush=True)
+    subprocess.run([
+        RSYNC, "--recursive", "--times", "--fsync", "--ignore-existing", "--no-links",
+        "--no-devices", "--no-specials", "--", rsync_source, rsync_destination,
+    ], check=True)
+    staged = copied if is_directory else work / source.name
+    after = snapshot(source)
+    target = snapshot(staged)
+    if before != after or layout(before) != layout(target):
+        raise RuntimeError(f"Source changed or copy is incomplete; inspect {copied} and {state}")
+    marker_after = checked_path(marker)
+    if (not stat.S_ISREG(marker_after.st_mode)
+            or (marker_before.st_dev, marker_before.st_ino, marker_before.st_ctime_ns)
+            != (marker_after.st_dev, marker_after.st_ino, marker_after.st_ctime_ns)):
+        raise RuntimeError("Destination mount marker changed during copy")
+    if not is_directory:
+        os.link(staged, copied, follow_symlinks=False)  # Raises if the name was taken.
+        staged.unlink()  # Only our private staging link; never the source payload.
+        target = snapshot(copied)
+    record = {"request": request, "source_snapshot": before, "destination_snapshot": target}
+    pending = state / "complete.pending"
+    _write_record(pending, record)
+    os.link(pending, complete, follow_symlinks=False)
+    pending.unlink()
+    print(f"Copy complete: {copied}", flush=True)
+    return copied
+
+
+def copy_promoted(source: Path, torrent_hash: str, torrent_name: str, job_id: str, *,
+                  destination: Path | None = None, source_root: Path | None = None,
+                  relative_path: Path | str | None = None) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", job_id):
         raise RuntimeError("Job ID is not a safe folder identifier")
     source_info = checked_path(source)
     if not (stat.S_ISDIR(source_info.st_mode) or stat.S_ISREG(source_info.st_mode)):
         raise RuntimeError("Source must be a regular file or directory")
     destination = DESTINATION_ROOT if destination is None else destination
+    if source_root is not None or relative_path is not None:
+        if source_root is None or relative_path is None:
+            raise RuntimeError("Routed copying requires both source root and relative path")
+        return _copy_routed(source, torrent_hash, torrent_name, job_id, destination=destination,
+                            source_root=source_root, relative_path=Path(relative_path))
     destination_info = checked_path(destination)
     if not stat.S_ISDIR(destination_info.st_mode):
         raise RuntimeError("Configured destination must already exist as a directory")
@@ -188,13 +324,16 @@ def main(*, destination: Path | None = None) -> int:
     parser.add_argument("--torrent-hash", required=True)
     parser.add_argument("--torrent-name", required=True)
     parser.add_argument("--job-id", required=True)
+    parser.add_argument("--source-root", type=Path)
+    parser.add_argument("--relative-path", type=Path)
     args = parser.parse_args()
     os.umask(0o077)
     try:
         target = destination if destination is not None else args.destination
         if destination is None:
             validate_destination(target)
-        copy_promoted(args.source, args.torrent_hash, args.torrent_name, args.job_id, destination=target)
+        copy_promoted(args.source, args.torrent_hash, args.torrent_name, args.job_id, destination=target,
+                      source_root=args.source_root, relative_path=args.relative_path)
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"Copy hook failed: {exc}. Source retained; no cleanup was performed.", file=sys.stderr)
         return 1

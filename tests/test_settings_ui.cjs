@@ -67,7 +67,9 @@ let browser, container;
     assert.equal(await page.$('#edit-post_promotion_script'), null, 'trusted executable must remain deployment-only');
     assert(await page.$eval('#edit-post_promotion_enabled', node => node.disabled));
     assert(await page.$eval('#edit-post_promotion_copy_enabled', node => node.disabled));
-    assert(await page.$eval('#edit-post_promotion_copy_destination', node => node.disabled));
+    assert(await page.$eval('#edit-post_promotion_copy_rules', node => node.disabled));
+    assert(await page.$eval('#copy-rule-add', node => node.disabled));
+    assert.equal(await page.$('#edit-post_promotion_copy_destination'), null, 'legacy destination must not be editable');
     assert(!(await page.$eval('#edit-post_promotion_timeout_seconds', node => node.disabled)));
 
     await page.select('#settings-section', 'storage');
@@ -80,7 +82,25 @@ let browser, container;
     await page.select('#edit-post_promotion_enabled', 'true');
     assert.equal(await page.$eval('#edit-post_promotion_copy_enabled', node => node.value), 'false', 'script selection switches off the built-in copy draft');
     await page.select('#edit-post_promotion_copy_enabled', 'true');
-    await fill('#edit-post_promotion_copy_destination', '/copy-target/intake-copies');
+    assert(!(await page.$eval('#copy-rules-warning', node => node.hidden)), 'enabled master without rules must warn that no new copies will run');
+    await click('#copy-rule-add');
+    await fill('.copy-rule-row:first-child .copy-rule-source', '/downloads/Movies');
+    await fill('.copy-rule-row:first-child .copy-rule-destination', '/app/data');
+    await click('#settings-review-button');
+    await finished();
+    assert.equal(await page.$eval('#edit-post_promotion_copy_rules', node => node.getAttribute('aria-invalid')), 'true');
+    await fill('.copy-rule-row:first-child .copy-rule-destination', '/copy-target/Movies');
+    assert(await page.$eval('#copy-rules-warning', node => node.hidden));
+    await click('#copy-rule-add');
+    await fill('.copy-rule-row:last-child .copy-rule-source', '/downloads/TV');
+    await fill('.copy-rule-row:last-child .copy-rule-destination', '/copy-target/TV');
+    await click('.copy-rule-row:last-child .copy-rule-enabled');
+    await click('.copy-rule-row:first-child .copy-rule-enabled');
+    assert(!(await page.$eval('#copy-rules-warning', node => node.hidden)), 'disabled rules are not matches');
+    await click('.copy-rule-row:first-child .copy-rule-enabled');
+    await click('#copy-rule-add');
+    await click('.copy-rule-row:last-child .copy-rule-remove');
+    assert.equal(await page.$$eval('.copy-rule-row', rows => rows.length), 2);
     await click('#nas-location-add');
     assert.equal(await page.$$eval('.nas-location-row', rows => rows.length), 2);
     await fill('.nas-location-row:last-child .nas-label', 'Archive NAS');
@@ -102,7 +122,7 @@ let browser, container;
       assert(dimensions.scroll <= dimensions.client + 1, `${section} overflows on mobile`);
     }
     await page.select('#settings-section', 'storage');
-    assert(!(await page.$eval('#edit-post_promotion_copy_destination', node => node.disabled)), 'mobile has the same editable copy settings');
+    assert(!(await page.$eval('.copy-rule-source', node => node.disabled)), 'mobile has the same editable copy rules');
     await fill('#settings-search', 'TI_DATABASE_URL');
     assert(await page.$eval('#setting-database_url', node => node.checkVisibility()));
     await page.select('#settings-section', 'connection');
@@ -144,7 +164,10 @@ let browser, container;
     assert.equal(saved.nas_staging_locations.length, 2);
     assert.deepEqual(saved.nas_staging_locations[1], {id: archiveId, label: 'Archive NAS', path: '/nas-extra/intake', mount_marker: '/nas-extra/.mounted'});
     assert.equal(saved.post_promotion_copy_enabled, true);
-    assert.equal(saved.post_promotion_copy_destination, '/copy-target/intake-copies');
+    assert.deepEqual(saved.post_promotion_copy_rules, [
+      {source: '/downloads/Movies', destination: '/copy-target/Movies', enabled: true},
+      {source: '/downloads/TV', destination: '/copy-target/TV', enabled: false},
+    ]);
     assert.equal(saved.post_promotion_enabled, false);
     assert.equal(saved.post_promotion_script, null, 'built-in copy needs no executable path');
 
@@ -162,7 +185,9 @@ let browser, container;
     assert.equal(await page.$eval('#nas-staging-select', node => node.value), archiveId);
     assert.equal(await page.$$eval('.nas-location-row input[type=radio]:checked', rows => rows.length), 1);
     assert.equal(await page.$eval('#edit-post_promotion_copy_enabled', node => node.value), 'true');
-    assert.equal(await page.$eval('#edit-post_promotion_copy_destination', node => node.value), '/copy-target/intake-copies');
+    assert.equal(await page.$eval('.copy-rule-row:first-child .copy-rule-source', node => node.value), '/downloads/Movies');
+    assert.equal(await page.$eval('.copy-rule-row:first-child .copy-rule-destination', node => node.value), '/copy-target/Movies');
+    assert(!(await page.$eval('.copy-rule-row:last-child .copy-rule-enabled', node => node.checked)));
     await click('#controller-resume');
     await finished();
     assert.match(await page.$eval('#admin-result', node => node.textContent), /Resume checks failed/);
@@ -170,7 +195,7 @@ let browser, container;
     const state = await (await fetch(`${origin}/controller/status`)).json();
     assert(state.paused && state.drained && !state.restart_required);
     assert.deepEqual(errors, []);
-    console.log('PASS desktop/mobile editor, named NAS/default/marker persistence, built-in copy editing/mode exclusion/persistence, field errors, locks, private connection test, advanced confirmation, save/restart, pending values and fail-closed resume');
+    console.log('PASS desktop/mobile editor, named NAS/default/marker persistence, routed copy editing/add/remove/disabled rules/empty-rule warnings/mode exclusion/persistence, field errors, locks, private connection test, advanced confirmation, save/restart, pending values and fail-closed resume');
   } catch (error) {
     if (container) console.error(docker('logs', '--tail', '20', container));
     throw error;

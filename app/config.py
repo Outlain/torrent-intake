@@ -7,6 +7,7 @@ from pydantic_settings import BaseSettings, DotEnvSettingsSource, EnvSettingsSou
 
 from .tags import normalize_managed_tag
 from .state_files import data_directory, read_private, write_json
+from .paths import canonical_final_parent
 
 
 def saved_settings() -> dict:
@@ -48,6 +49,44 @@ class NasStagingLocation(BaseModel):
         if not value.strip() or any(ord(c) < 32 for c in value):
             raise ValueError("Use a non-empty label without control characters")
         return value.strip()
+
+
+def copy_destination(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("Copy destination must not contain control characters")
+    value = value.strip()
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or not path.is_relative_to("/copy-target"):
+        raise ValueError("Copy destination must be /copy-target or a subdirectory of that mount")
+    return str(path)
+
+
+class PostPromotionCopyRule(BaseModel):
+    source: str = Field(min_length=1, max_length=4096)
+    destination: str = Field(min_length=1, max_length=4096)
+    enabled: bool = True
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("source")
+    @classmethod
+    def validate_source(cls, value: str) -> str:
+        if (not Path(value).is_absolute() or ".." in Path(value).parts
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+            raise ValueError("Copy source must be an absolute container path without traversal or control characters")
+        return str(Path(value))
+
+    @field_validator("destination")
+    @classmethod
+    def validate_destination(cls, value: str) -> str:
+        result = copy_destination(value)
+        if result is None:
+            raise ValueError("Configure a destination for each copy rule")
+        return result
 
 
 class Settings(BaseSettings):
@@ -123,6 +162,7 @@ class Settings(BaseSettings):
     post_promotion_script: str | None = None
     post_promotion_copy_enabled: bool = False
     post_promotion_copy_destination: str | None = None
+    post_promotion_copy_rules: list[PostPromotionCopyRule] = Field(default_factory=list, max_length=32)
     post_promotion_delay_seconds: int = Field(default=5, ge=0, le=3600)
     post_promotion_timeout_seconds: int = Field(default=7200, ge=1, le=604800)
 
@@ -149,18 +189,7 @@ class Settings(BaseSettings):
     @field_validator("post_promotion_copy_destination")
     @classmethod
     def validate_copy_destination(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if any(ord(char) < 32 or ord(char) == 127 for char in value):
-            raise ValueError("Copy destination must not contain control characters")
-        value = value.strip()
-        if not value:
-            return None
-        path = Path(value)
-        if (not path.is_absolute() or ".." in path.parts
-                or not path.is_relative_to("/copy-target")):
-            raise ValueError("Copy destination must be /copy-target or a subdirectory of that mount")
-        return str(path)
+        return copy_destination(value)
 
     @model_validator(mode="after")
     def validate_locations_and_hook(self):
@@ -195,8 +224,29 @@ class Settings(BaseSettings):
             raise ValueError("Configure TI_POST_PROMOTION_SCRIPT before enabling the hook")
         if self.post_promotion_copy_enabled and self.post_promotion_enabled:
             raise ValueError("Choose either built-in copying or a custom script, not both")
-        if self.post_promotion_copy_enabled and not self.post_promotion_copy_destination:
-            raise ValueError("Set the copy destination before enabling built-in copying")
+        seen_sources = set()
+        for rule in self.post_promotion_copy_rules:
+            rule.source = canonical_final_parent(rule.source, self)
+            if rule.source in seen_sources:
+                raise ValueError("Copy rules must have unique source folders, including disabled rules")
+            seen_sources.add(rule.source)
+            source = Path(rule.source)
+            if any(source.is_relative_to(path) for path in operational):
+                raise ValueError("Copy source cannot use an operational directory")
+            try:
+                destination, copy_root = Path(rule.destination).resolve(), Path("/copy-target").resolve()
+            except (OSError, RuntimeError) as exc:
+                raise ValueError("Copy destination could not be resolved safely") from exc
+            if not destination.is_relative_to(copy_root):
+                raise ValueError("Copy destination must stay inside the dedicated /copy-target mount")
+            if source.is_relative_to(destination) or destination.is_relative_to(source):
+                raise ValueError("Copy source and destination must not be identical or nested")
+            try:
+                aliases_source = source.samefile(destination)
+            except OSError:
+                aliases_source = False  # An offline mount is handled by the runner, not settings validation.
+            if aliases_source:
+                raise ValueError("Copy destination aliases its source; choose separate storage")
         return self
 
     @property

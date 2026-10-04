@@ -66,6 +66,8 @@ class Job(Base):
     hook_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     hook_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
     hook_destination: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hook_copy_source_root: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hook_copy_relative_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     hook_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     hook_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     hook_finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

@@ -276,5 +276,253 @@ class CopyHookRsyncTests(CopyHookBase):
         self.assertEqual(self.source.read_bytes(), b"scanned payload")
 
 
+class RoutedCopyBase(CopyHookBase):
+    def setUp(self):
+        super().setUp()
+        self.library = self.root / "Movies"
+        self.library.mkdir()
+        self.source = self.library / "movie.mkv"
+        self.source.write_bytes(b"scanned payload")
+        self.copy_root_patch = patch.object(hook, "COPY_ROOT", self.destination)
+        self.copy_root_patch.start()
+        self.addCleanup(self.copy_root_patch.stop)
+        self.state = self.destination / hook.STATE_DIRECTORY / "safe-job"
+
+    def copy_routed(self, source=None, *, relative_path=None, source_root=None, job_id="safe-job"):
+        source = source or self.source
+        source_root = source_root or self.library
+        return hook.copy_promoted(
+            source, "a" * 40, "Movie", job_id, destination=self.destination,
+            source_root=source_root,
+            relative_path=source.relative_to(source_root) if relative_path is None else relative_path,
+        )
+
+
+class RoutedCopySafetyTests(RoutedCopyBase):
+    def test_requires_complete_routing_and_exact_relative_path(self):
+        with self.assertRaisesRegex(RuntimeError, "both source root"):
+            hook.copy_promoted(self.source, "a" * 40, "Movie", "safe-job", source_root=self.library)
+        for relative in ("", ".", "../movie.mkv", "/movie.mkv", hook.STATE_DIRECTORY, hook.MOUNT_MARKER):
+            with self.subTest(relative=relative), self.assertRaisesRegex(RuntimeError, "relative path"):
+                self.copy_routed(relative_path=relative)
+        with self.assertRaisesRegex(RuntimeError, "exactly match"):
+            self.copy_routed(relative_path="another.mkv")
+
+    def test_destination_requires_existing_marker_before_reservation(self):
+        (self.destination / hook.MOUNT_MARKER).unlink()
+        with patch.object(hook.subprocess, "run") as run, self.assertRaises(FileNotFoundError):
+            self.copy_routed()
+        run.assert_not_called()
+        self.assertFalse(self.state.exists())
+
+    def test_mapped_parent_and_state_directory_must_not_be_symlinks(self):
+        genre = self.library / "Genre"
+        genre.mkdir()
+        source = genre / "movie.mkv"
+        source.write_bytes(b"video")
+        (self.destination / "Genre").symlink_to(self.root, target_is_directory=True)
+        with patch.object(hook.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "Symbolic links"):
+            self.copy_routed(source)
+        run.assert_not_called()
+        state_link = self.destination / hook.STATE_DIRECTORY / "other-job"
+        state_link.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "manual retry"):
+            self.copy_routed(job_id="other-job")
+
+    def test_source_tree_symlinks_and_special_files_are_rejected(self):
+        source = self.library / "Series"
+        source.mkdir()
+        link = source / "link"
+        link.symlink_to(self.source)
+        with self.assertRaisesRegex(RuntimeError, "Symbolic links"):
+            self.copy_routed(source)
+        link.unlink()
+        os.mkfifo(source / "pipe")
+        with self.assertRaisesRegex(RuntimeError, "Only regular files"):
+            self.copy_routed(source)
+        self.assertFalse(self.state.exists())
+
+    def test_bind_alias_of_source_directory_is_rejected(self):
+        source = self.library / "Series"
+        source.mkdir()
+        real_checked_path = hook.checked_path
+        with patch.object(hook, "checked_path", side_effect=lambda path: real_checked_path(source if path == self.destination else path)):
+            with self.assertRaisesRegex(RuntimeError, "aliases the source"):
+                self.copy_routed(source)
+        self.assertFalse(self.state.exists())
+
+    def test_existing_target_is_never_merged_or_overwritten(self):
+        target = self.destination / self.source.name
+        target.write_bytes(b"keep existing")
+        with patch.object(hook.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "Destination collision"):
+            self.copy_routed()
+        run.assert_not_called()
+        self.assertEqual(target.read_bytes(), b"keep existing")
+        self.assertTrue((self.state / "request.json").exists())
+        self.assertFalse((self.state / "complete.json").exists())
+
+    def test_existing_directory_is_not_merged_even_when_empty(self):
+        source = self.library / "Series"
+        source.mkdir()
+        (source / "episode.mkv").write_bytes(b"video")
+        target = self.destination / "Series"
+        target.mkdir()
+        with patch.object(hook.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "Destination collision"):
+            self.copy_routed(source)
+        run.assert_not_called()
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_failed_directory_copy_leaves_partial_and_journal_for_manual_review(self):
+        source = self.library / "Series"
+        source.mkdir()
+        (source / "episode.mkv").write_bytes(b"full video")
+
+        def fail_copy(argv, **kwargs):
+            (Path(argv[-1]) / "episode.mkv").write_bytes(b"partial")
+            raise subprocess.CalledProcessError(23, argv)
+
+        with patch.object(hook.subprocess, "run", side_effect=fail_copy), self.assertRaises(subprocess.CalledProcessError):
+            self.copy_routed(source)
+        self.assertEqual((self.destination / "Series" / "episode.mkv").read_bytes(), b"partial")
+        self.assertEqual((source / "episode.mkv").read_bytes(), b"full video")
+        self.assertFalse((self.state / "complete.json").exists())
+        with patch.object(hook.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "manual retry"):
+            self.copy_routed(source)
+        run.assert_not_called()
+
+    def test_fixed_local_rsync_argv_for_directory_contents(self):
+        source = self.library / "-title; $(not-a-command)"
+        source.mkdir()
+        with patch.object(hook.subprocess, "run", side_effect=RuntimeError("stop")) as run:
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                self.copy_routed(source)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[-3:], ["--", str(source) + "/", str(self.destination / source.name) + "/"])
+        for forbidden in ("--delete", "--remove-source-files", "--links", "--copy-links", "-a", "-e"):
+            self.assertNotIn(forbidden, argv)
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_cli_passes_optional_routing_arguments(self):
+        argv = ["copy_action.py", "--source", str(self.source), "--torrent-hash", "a" * 40,
+                "--torrent-name", "Movie", "--job-id", "safe-job", "--destination", str(self.destination),
+                "--source-root", str(self.library), "--relative-path", "movie.mkv"]
+        with patch.object(sys, "argv", argv), patch.object(hook.os, "umask"), patch.object(hook, "copy_promoted") as copy:
+            self.assertEqual(hook.main(), 0)
+        copy.assert_called_once_with(self.source, "a" * 40, "Movie", "safe-job", destination=self.destination,
+                                     source_root=self.library, relative_path=Path("movie.mkv"))
+
+
+@unittest.skipUnless(shutil.which("rsync"), "rsync is not installed; real-copy integration checks skipped")
+class RoutedCopyRsyncTests(RoutedCopyBase):
+    def setUp(self):
+        super().setUp()
+        self.rsync_patch = patch.object(hook, "RSYNC", shutil.which("rsync"))
+        self.rsync_patch.start()
+        self.addCleanup(self.rsync_patch.stop)
+
+    def test_directory_preserves_nested_structure_without_job_wrapper_or_payload_marker(self):
+        source = self.library / "Genre" / "Example Film"
+        source.mkdir(parents=True)
+        (source / "disc").mkdir()
+        (source / "empty").mkdir()
+        (source / "disc" / "film.mkv").write_bytes(b"video")
+        # In particular, successful copying must not depend on NFS supporting
+        # the renameat2(RENAME_NOREPLACE) operation that failed in older movers.
+        with patch.object(hook.os, "rename", side_effect=OSError(95, "unsupported")), \
+                patch.object(hook.os, "replace", side_effect=OSError(95, "unsupported")):
+            copied = self.copy_routed(source)
+        self.assertEqual(copied, self.destination / "Genre" / "Example Film")
+        self.assertEqual((copied / "disc" / "film.mkv").read_bytes(), b"video")
+        self.assertEqual(hook.layout(hook.snapshot(source)), hook.layout(hook.snapshot(copied)))
+        self.assertFalse((self.destination / "intake-job-safe-job").exists())
+        self.assertFalse((copied / hook.COMPLETE_MARKER).exists())
+        self.assertFalse((self.destination / self.source.name).exists())
+        self.assertTrue((self.state / "complete.json").is_file())
+        with patch.object(hook.subprocess, "run") as run:
+            self.assertEqual(self.copy_routed(source), copied)
+        run.assert_not_called()
+
+    def test_single_file_preserves_nested_path_and_completed_retry_is_noop(self):
+        source = self.library / "Genre" / "literal: title $(not-a-command).mkv"
+        source.parent.mkdir()
+        source.write_bytes(b"video")
+        copied = self.copy_routed(source)
+        self.assertEqual(copied, self.destination / source.relative_to(self.library))
+        self.assertEqual(copied.read_bytes(), b"video")
+        self.assertEqual(list((self.state / "payload").iterdir()), [])
+        self.assertTrue(source.exists())
+        with patch.object(hook.subprocess, "run") as run:
+            self.assertEqual(self.copy_routed(source), copied)
+        run.assert_not_called()
+
+    def test_completed_copy_mutation_fails_instead_of_overwrite(self):
+        copied = self.copy_routed()
+        copied.write_bytes(b"modified")
+        with patch.object(hook.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "manual retry"):
+            self.copy_routed()
+        run.assert_not_called()
+        self.assertEqual(copied.read_bytes(), b"modified")
+
+    def test_source_change_prevents_single_file_publication(self):
+        real_run = hook.subprocess.run
+
+        def copy_then_change(*args, **kwargs):
+            result = real_run(*args, **kwargs)
+            self.source.write_bytes(b"changed")
+            return result
+
+        with patch.object(hook.subprocess, "run", side_effect=copy_then_change):
+            with self.assertRaisesRegex(RuntimeError, "Source changed"):
+                self.copy_routed()
+        self.assertFalse((self.destination / self.source.name).exists())
+        self.assertFalse((self.state / "complete.json").exists())
+
+    def test_marker_change_prevents_completion(self):
+        real_run = hook.subprocess.run
+
+        def copy_then_change(*args, **kwargs):
+            result = real_run(*args, **kwargs)
+            (self.destination / hook.MOUNT_MARKER).write_text("replaced")
+            return result
+
+        with patch.object(hook.subprocess, "run", side_effect=copy_then_change):
+            with self.assertRaisesRegex(RuntimeError, "marker changed"):
+                self.copy_routed()
+        self.assertFalse((self.state / "complete.json").exists())
+
+    def test_file_publication_collision_never_overwrites_new_destination(self):
+        real_run = hook.subprocess.run
+        copied = self.destination / self.source.name
+
+        def copy_then_collide(*args, **kwargs):
+            result = real_run(*args, **kwargs)
+            copied.write_bytes(b"another writer")
+            return result
+
+        with patch.object(hook.subprocess, "run", side_effect=copy_then_collide), self.assertRaises(FileExistsError):
+            self.copy_routed()
+        self.assertEqual(copied.read_bytes(), b"another writer")
+        self.assertFalse((self.state / "complete.json").exists())
+
+    def test_unsupported_hardlink_publication_retains_source_and_private_copy(self):
+        with patch.object(hook.os, "link", side_effect=OSError("hard links unsupported")):
+            with self.assertRaisesRegex(OSError, "hard links unsupported"):
+                self.copy_routed()
+        self.assertFalse((self.destination / self.source.name).exists())
+        self.assertFalse((self.state / "complete.json").exists())
+        self.assertEqual((self.state / "payload" / self.source.name).read_bytes(), self.source.read_bytes())
+
+    def test_manual_retry_after_both_partial_payload_and_state_are_moved_aside(self):
+        copied = self.destination / self.source.name
+        copied.write_bytes(b"partial")
+        self.state.mkdir(parents=True)
+        (self.state / "request.json").write_text("{}")
+        copied.rename(self.destination / "operator-held-partial")
+        self.state.rename(self.state.parent / "operator-held-state")
+        self.assertEqual(self.copy_routed(), copied)
+        self.assertEqual(copied.read_bytes(), b"scanned payload")
+        self.assertEqual((self.destination / "operator-held-partial").read_bytes(), b"partial")
+
+
 if __name__ == "__main__":
     unittest.main()

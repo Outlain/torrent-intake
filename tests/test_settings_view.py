@@ -63,17 +63,23 @@ class SettingsViewTests(unittest.TestCase):
 
     def test_builtin_copy_fields_are_advanced_and_scripts_remain_deployment_only(self) -> None:
         items = catalog_items(build_settings_catalog(Settings()))
-        for name in ("post_promotion_copy_enabled", "post_promotion_copy_destination"):
+        for name in ("post_promotion_copy_enabled", "post_promotion_copy_rules"):
             self.assertTrue(items[name]["editable"])
             self.assertTrue(items[name]["advanced"])
             self.assertEqual(items[name]["permission"], "advanced")
         self.assertFalse(items["post_promotion_script"]["editable"])
         self.assertEqual(items["post_promotion_script"]["permission"], "deployment")
+        self.assertFalse(items["post_promotion_copy_destination"]["editable"])
+        self.assertIn("ignored", items["post_promotion_copy_destination"]["description"])
 
         with patch.dict("os.environ", {"TI_POST_PROMOTION_COPY_ENABLED": "false"}):
             overridden = catalog_items(build_settings_catalog(Settings()))
             self.assertFalse(overridden["post_promotion_copy_enabled"]["editable"])
             self.assertEqual(overridden["post_promotion_copy_enabled"]["permission"], "environment")
+        with patch.dict("os.environ", {"TI_POST_PROMOTION_COPY_RULES": '[]'}):
+            overridden = catalog_items(build_settings_catalog(Settings()))
+            self.assertFalse(overridden["post_promotion_copy_rules"]["editable"])
+            self.assertEqual(overridden["post_promotion_copy_rules"]["permission"], "environment")
 
     def test_template_renders_settings_panel_without_secret_values(self) -> None:
         settings = Settings(
@@ -101,7 +107,10 @@ class SettingsViewTests(unittest.TestCase):
         self.assertIn(".intake-copy-mount", html)
         self.assertIn("No custom script", html)
         self.assertIn('id="edit-post_promotion_copy_enabled"', html)
-        self.assertIn('id="edit-post_promotion_copy_destination"', html)
+        self.assertIn('id="edit-post_promotion_copy_rules"', html)
+        self.assertIn('id="copy-rule-editor"', html)
+        self.assertIn('id="copy-rules-warning"', html)
+        self.assertNotIn('id="edit-post_promotion_copy_destination"', html)
         self.assertNotIn('id="edit-post_promotion_script"', html)
         self.assertIn("TI_INFECTED_ACTION", html)
         self.assertIn("<code data-active-value>delete</code>", html)

@@ -62,6 +62,8 @@ SCHEMA_ADDITIONS: dict[str, dict[str, str]] = {
         "hook_status": "VARCHAR(32)",
         "hook_kind": "VARCHAR(16)",
         "hook_destination": "TEXT",
+        "hook_copy_source_root": "TEXT",
+        "hook_copy_relative_path": "TEXT",
         "hook_due_at": "DATETIME",
         "hook_started_at": "DATETIME",
         "hook_finished_at": "DATETIME",
