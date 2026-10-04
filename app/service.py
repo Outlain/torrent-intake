@@ -5,17 +5,23 @@ import os
 from pathlib import Path
 import shutil
 from uuid import uuid4
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .config import get_settings
 from .event_writer import emit_event
-from .models import Job, ScanRun
+from .models import FINAL_DESTINATION_EDITABLE_STATES, FINAL_DESTINATION_LOCK_MARKERS, Job, ScanRun
 from .metainfo import parse_torrent
 from .paths import canonical_final_parent, path_is_within
+from .storage import StorageUnavailable, ensure_nas_choice, pin_nas_choice, require_storage, require_final_storage
+from .post_promotion import queue_promotion_hook
 from .qbt import QbtService, TorrentAlreadyExistsError
 from .scan_coordinator import SCAN_ACTION_STATES, SCAN_QUEUE_STATES, ScanCoordinator
 from .tags import encode_custom_tags, filter_selectable_custom_tags, normalize_custom_tags
+
+
+class FinalDestinationConflict(ValueError):
+    """The job or its destination changed since the editor was opened."""
 
 
 class JobService:
@@ -49,6 +55,41 @@ class JobService:
         self.scan_coordinator = ScanCoordinator()
         self.logger = logging.getLogger(__name__)
 
+    def update_final_destination(
+        self, db: Session, *, job_id: str, final_parent: str, expected_final_parent: str,
+    ) -> Job:
+        """Change the promotion plan only; never move or touch downloading files."""
+        destination = canonical_final_parent(final_parent, self.settings)
+        result = db.execute(
+            update(Job)
+            .where(
+                Job.id == job_id,
+                Job.final_parent == expected_final_parent,
+                Job.state.in_(FINAL_DESTINATION_EDITABLE_STATES),
+                Job.is_terminal.is_(False),
+                *(getattr(Job, name).is_(None) for name in FINAL_DESTINATION_LOCK_MARKERS),
+                ~select(ScanRun.job_id).where(ScanRun.job_id == Job.id).exists(),
+            )
+            .values(final_parent=destination, updated_at=datetime.utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            db.rollback()
+            job = db.get(Job, job_id, populate_existing=True)
+            if job is None:
+                raise LookupError("Job not found")
+            raise FinalDestinationConflict(
+                "The destination changed or this job is no longer awaiting download completion. "
+                "Refresh the job; final destinations cannot be edited after completion or scan queueing."
+            )
+        db.commit()
+        job = db.get(Job, job_id, populate_existing=True)
+        if job is None:
+            raise LookupError("Job was removed after its destination was updated")
+        has_scan_run = db.get(ScanRun, job_id) is not None
+        job.can_edit_final_destination = job.final_destination_is_editable(has_scan_run=has_scan_run)
+        return job
+
     def submit_job(
         self,
         db: Session,
@@ -57,6 +98,7 @@ class JobService:
         final_parent: str,
         final_category: str | None,
         staging_preference: str,
+        nas_staging_id: str | None = None,
         custom_tags: list[str] | None = None,
         torrent_file_data: bytes | None = None,
         torrent_file_name: str | None = None,
@@ -90,7 +132,8 @@ class JobService:
                 )
             )
 
-        staging_root = self._root_for_preference(staging_preference)
+        location = self.settings.nas_location(nas_staging_id)
+        staging_root = self.settings.local_staging_root if staging_preference == "local" else location.path
         job = self._create_job_record(
             db,
             magnet_uri=magnet_uri,
@@ -98,15 +141,19 @@ class JobService:
             final_category=final_category,
             staging_preference=staging_preference,
             staging_root=staging_root,
+            nas_location=location,
             custom_tags=custom_tags,
             torrent_file_data=torrent_file_data,
             torrent_file_name=torrent_file_name,
         )
-
         try:
             self._add_job_to_qbt(job, staging_root)
             self._resolve_hash_for_job(db, job)
             self._evaluate_staging_now(db, job)
+        except StorageUnavailable as exc:
+            self._mark(job, "waiting_for_nas", error=str(exc))
+            db.add(job)
+            db.commit()
         except TorrentAlreadyExistsError as exc:
             error_text = self._duplicate_torrent_message(
                 db,
@@ -139,6 +186,7 @@ class JobService:
         custom_tags: list[str],
         torrent_file_data: bytes | None = None,
         torrent_file_name: str | None = None,
+        nas_location=None,
     ) -> Job:
         last_exc: Exception | None = None
         for _ in range(5):
@@ -159,6 +207,8 @@ class JobService:
                 state="adding_to_qbt",
                 updated_at=datetime.utcnow(),
             )
+            if nas_location is not None:
+                pin_nas_choice(job, nas_location)
             db.add(job)
             try:
                 db.commit()
@@ -264,13 +314,18 @@ class JobService:
             self._sync_job_from_torrent(job, torrent)
             self._raise_for_qbt_error_state(torrent)
             self._apply_local_staging_policy(db, job, torrent)
-            if job.state != "waiting_for_local_space":
+            if job.state not in {"waiting_for_local_space", "waiting_for_nas"}:
                 job.state = self._state_for_retry(job, torrent)
             job.is_terminal = False
             db.add(job)
             db.commit()
             db.refresh(job)
             self._queue_completed_retry(db, job)
+            return job
+        except StorageUnavailable as exc:
+            self._mark(job, "waiting_for_nas", error=str(exc))
+            db.add(job)
+            db.commit()
             return job
         except TorrentAlreadyExistsError as exc:
             message = self._duplicate_torrent_message(
@@ -287,7 +342,7 @@ class JobService:
                 self._sync_job_from_torrent(job, existing_torrent)
                 self._raise_for_qbt_error_state(existing_torrent)
                 self._apply_local_staging_policy(db, job, existing_torrent)
-                if job.state != "waiting_for_local_space":
+                if job.state not in {"waiting_for_local_space", "waiting_for_nas"}:
                     job.state = self._state_for_retry(job, existing_torrent)
                 job.is_terminal = False
                 db.add(job)
@@ -316,6 +371,9 @@ class JobService:
             raise RuntimeError(f"Failed to retry job: {error_text}") from exc
 
     def _add_job_to_qbt(self, job: Job, staging_root: str) -> None:
+        if job.staging_actual == "nas":
+            ensure_nas_choice(job, self.settings)
+            require_storage(staging_root, job.nas_mount_marker)
         source = {}
         if job.torrent_file_name is not None:
             metadata = parse_torrent(job.torrent_file_data)
@@ -335,8 +393,15 @@ class JobService:
         if not job:
             raise LookupError("Job not found")
         # Intake-only removal. Never delete, pause, or modify the qBittorrent torrent here.
+        # The predicate also protects against a hook claim racing a stale UI/session.
+        result = db.execute(delete(Job).where(
+            Job.id == job_id,
+            or_(Job.hook_status.is_(None), Job.hook_status.not_in(("pending", "running"))),
+        ))
+        if result.rowcount != 1:
+            db.rollback()
+            raise ValueError("Cannot remove a job with a queued or running post-promotion copy/script. Wait for it to finish; pause Intake to interrupt a running action.")
         self.scan_coordinator.delete_scan_data(db, job.id)
-        db.delete(job)
         db.commit()
 
     def retry_jobs(self, db: Session, *, job_ids: list[str]) -> dict[str, object]:
@@ -345,8 +410,8 @@ class JobService:
     def delete_jobs(self, db: Session, *, job_ids: list[str]) -> dict[str, object]:
         return self._bulk_apply(job_ids, lambda selected_id: self.delete_job(db, job_id=selected_id))
 
-    def move_waiting_jobs_to_nas(self, db: Session, *, job_ids: list[str]) -> dict[str, object]:
-        return self._bulk_apply(job_ids, lambda selected_id: self.move_waiting_job_to_nas(db, job_id=selected_id))
+    def move_waiting_jobs_to_nas(self, db: Session, *, job_ids: list[str], nas_staging_id: str | None = None) -> dict[str, object]:
+        return self._bulk_apply(job_ids, lambda selected_id: self.move_waiting_job_to_nas(db, job_id=selected_id, nas_staging_id=nas_staging_id))
 
     def delete_jobs_by_states(self, db: Session, *, states: set[str]) -> dict[str, object]:
         if not states:
@@ -354,16 +419,20 @@ class JobService:
         jobs = list(db.scalars(select(Job).where(Job.state.in_(tuple(states))).order_by(Job.created_at.desc())))
         return self.delete_jobs(db, job_ids=[job.id for job in jobs])
 
-    def move_waiting_job_to_nas(self, db: Session, *, job_id: str) -> Job:
+    def move_waiting_job_to_nas(self, db: Session, *, job_id: str, nas_staging_id: str | None = None) -> Job:
         job = db.get(Job, job_id)
         if not job:
             raise LookupError("Job not found")
-        if job.state != "waiting_for_local_space":
+        if job.state not in {"waiting_for_local_space", "waiting_for_nas"}:
             raise ValueError("Only jobs waiting for local space can use NAS staging")
         if job.staging_preference != "local" or job.staging_actual != "local":
             raise ValueError("Only queued local-staging jobs can switch to NAS staging")
         if not job.qbt_hash:
             raise ValueError("Queued job is not linked to a qBittorrent hash yet")
+        if nas_staging_id is not None:
+            pin_nas_choice(job, self.settings.nas_location(nas_staging_id))
+        else:
+            ensure_nas_choice(job, self.settings)
 
         free_bytes, safe_free_bytes, reserved_before_current, current_remaining_bytes = self._local_capacity_snapshot(
             db,
@@ -548,7 +617,7 @@ class JobService:
         return jobs
 
     def _root_for_preference(self, preference: str) -> str:
-        return self.settings.local_staging_root if preference == "local" else self.settings.nas_staging_root
+        return self.settings.local_staging_root if preference == "local" else self.settings.default_nas_location.path
 
     def _find_job_by_hash(self, db: Session, *, torrent_hash: str | None, exclude_job_id: str | None) -> Job | None:
         if not torrent_hash:
@@ -756,6 +825,14 @@ class JobService:
                 torrent_name,
             )
             return None
+        # Completion callbacks are download hints, not authoritative placement.
+        # A delayed callback must not overwrite a scan/promotion or hook source.
+        if job.is_terminal or job.state in SCAN_QUEUE_STATES or job.state in SCAN_ACTION_STATES:
+            return job
+        values = {
+            "completion_event_received_at": datetime.utcnow() - timedelta(seconds=self.settings.completion_grace_seconds),
+            "state": "completion_event_received", "updated_at": datetime.utcnow(),
+        }
         if qbt_hash and job.qbt_hash != qbt_hash:
             self.logger.warning(
                 "Rebinding job %s from completion event old_hash=%s new_hash=%s unique_tag=%s",
@@ -764,20 +841,20 @@ class JobService:
                 qbt_hash,
                 unique_tag or job.unique_tag,
             )
-            job.qbt_hash = qbt_hash
+            values["qbt_hash"] = qbt_hash
 
-        # Backdate by grace seconds so an event-triggered processing pass can act immediately.
-        job.completion_event_received_at = datetime.utcnow() - timedelta(seconds=self.settings.completion_grace_seconds)
         if torrent_name:
-            job.torrent_name = torrent_name
+            values["torrent_name"] = torrent_name
         event_path = content_path or root_path or save_path
         if event_path:
-            job.content_path = event_path
+            values["content_path"] = event_path
         if isinstance(size_bytes, int) and size_bytes > 0:
-            job.size_bytes = size_bytes
-        if not job.is_terminal and job.state not in SCAN_QUEUE_STATES and job.state not in SCAN_ACTION_STATES:
-            self._mark(job, "completion_event_received")
-        db.add(job)
+            values["size_bytes"] = size_bytes
+        # Also guard the write if promotion advanced while this request ran.
+        db.execute(update(Job).where(
+            Job.id == job.id, Job.is_terminal == False,
+            Job.state.not_in(tuple(SCAN_QUEUE_STATES | SCAN_ACTION_STATES)),
+        ).values(**values))
         db.commit()
         db.refresh(job)
         return job
@@ -896,6 +973,7 @@ class JobService:
             self.scan_coordinator.guard.validate_staging(
                 db, job, torrent, require_paused=True
             )
+            require_final_storage(self.settings, job.final_parent)
             self.logger.info("Starting promotion for job %s to %s", job.id, job.final_parent)
             self.qbt.set_location(job.qbt_hash, job.final_parent)
             job.last_error = None
@@ -924,6 +1002,7 @@ class JobService:
         self.qbt.resume(job.qbt_hash)
         job.promoted_at = job.promoted_at or datetime.utcnow()
         self._mark(job, "done")
+        queue_promotion_hook(job, self.settings)
         db.add(job)
         db.commit()
         self.logger.info("Job %s promotion verified; torrent resumed for seeding", job.id)
@@ -1109,6 +1188,19 @@ class JobService:
     def _process_one(self, db: Session, job: Job, *, ignore_event_grace: bool) -> None:
         if job.state in SCAN_QUEUE_STATES or job.state in SCAN_ACTION_STATES:
             return
+        ensure_nas_choice(job, self.settings)
+        if job.state == "waiting_for_nas" and not job.qbt_hash:
+            try:
+                require_storage(job.nas_staging_path, job.nas_mount_marker)
+            except StorageUnavailable as exc:
+                job.last_error = str(exc)
+                db.add(job)
+                db.commit()
+                return
+            self._add_job_to_qbt(job, job.nas_staging_path)
+            self._resolve_hash_for_job(db, job)
+            db.commit()
+            return
         if not job.qbt_hash:
             self._resolve_hash_for_job(db, job)
             return
@@ -1130,9 +1222,30 @@ class JobService:
         self._ensure_job_can_track_torrent(db, job, torrent)
 
         self._sync_job_from_torrent(job, torrent)
+        if job.staging_actual == "nas":
+            try:
+                require_storage(job.nas_staging_path, job.nas_mount_marker)
+            except StorageUnavailable as exc:
+                self.qbt.pause(job.qbt_hash)
+                self._mark(job, "waiting_for_nas", error=str(exc))
+                db.add(job)
+                db.commit()
+                return
+            if job.state == "waiting_for_nas":
+                self.qbt.resume(job.qbt_hash)
+                self._mark(job, "downloading")
+                db.add(job)
+                db.commit()
+                # The pre-resume snapshot may still say missingFiles/error.
+                # Recheck qBittorrent on the next cycle before scheduling a scan.
+                return
         self._raise_for_qbt_error_state(torrent)
 
         self._apply_local_staging_policy(db, job, torrent)
+        if job.state == "waiting_for_nas":
+            db.add(job)
+            db.commit()
+            return
 
         is_complete = self._is_torrent_complete(torrent)
         if is_complete and not job.download_complete_at:
@@ -1322,6 +1435,11 @@ class JobService:
 
         for local_job in local_jobs:
             torrent = torrents_by_hash.get(local_job.qbt_hash)
+            if (local_job.state == "waiting_for_nas"
+                    and str(getattr(torrent, "state", "")) in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP"}):
+                # Already-downloaded bytes are in disk_usage. A confirmed paused
+                # NAS-bound job needs no reservation for future local downloads.
+                continue
             remaining_bytes = self._remaining_bytes_for_torrent(torrent, fallback_size_bytes=local_job.size_bytes)
             if remaining_bytes is None or remaining_bytes <= 0:
                 continue
@@ -1344,10 +1462,17 @@ class JobService:
             current_remaining_bytes,
         )
         self.qbt.pause(job.qbt_hash)
-        self.qbt.set_save_path(job.qbt_hash, self.settings.nas_staging_root)
+        ensure_nas_choice(job, self.settings)
+        try:
+            require_storage(job.nas_staging_path, job.nas_mount_marker)
+        except StorageUnavailable as exc:
+            job.override_reason = reason
+            self._mark(job, "waiting_for_nas", error=str(exc))
+            return
+        self.qbt.set_save_path(job.qbt_hash, job.nas_staging_path)
         self.qbt.resume(job.qbt_hash)
         job.staging_actual = "nas"
-        job.staging_root_actual = self.settings.nas_staging_root
+        job.staging_root_actual = job.nas_staging_path
         job.staging_overridden = True
         job.override_reason = reason
         self._mark(job, "downloading")
@@ -1379,6 +1504,11 @@ class JobService:
         if job.staging_preference != "local":
             return
         if job.staging_actual != "local":
+            return
+        if job.state == "waiting_for_nas":
+            self._move_local_job_to_nas(job, reason=job.override_reason or "waiting_for_nas",
+                                      free_bytes=0, safe_free_bytes=0, reserved_before_current=0,
+                                      current_remaining_bytes=job.size_bytes or 0)
             return
         qbt_state = str(getattr(torrent, "state", "") or "")
         if job.size_bytes is not None and job.size_bytes > self.settings.local_max_bytes:

@@ -11,6 +11,7 @@ from sqlalchemy import select
 from .config import get_settings
 from .db import SessionLocal
 from .models import Job
+from .post_promotion import PostPromotionRunner
 from .scan_coordinator import ScanClaim
 from .service import JobService
 
@@ -96,12 +97,17 @@ async def worker_loop(stop_event: asyncio.Event, scanner_stop_event: threading.E
     loop = asyncio.get_running_loop()
     next_management_cycle = 0.0
     next_qbt_hash_retry_cycle = 0.0
+    hook_task: asyncio.Task[None] | None = None
 
     try:
         try:
             await asyncio.to_thread(_recover_scan_state, service)
         except Exception:
             logger.exception("Scan restart recovery failed")
+
+        # Hooks are independent of scan/management polling; one slow external
+        # program must not hold up promotion or other torrents' scans.
+        hook_task = asyncio.create_task(PostPromotionRunner(settings=settings).run(stop_event))
 
         while not stop_event.is_set():
             _reap_scan_tasks(scan_tasks)
@@ -147,7 +153,15 @@ async def worker_loop(stop_event: asyncio.Event, scanner_stop_event: threading.E
             except asyncio.TimeoutError:
                 pass
     finally:
+        stop_event.set()
         scanner_stop_event.set()
+        if hook_task is not None:
+            try:
+                await hook_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Post-promotion hook runner failed while shutting down")
         if scan_tasks:
             results = await asyncio.gather(*scan_tasks.values(), return_exceptions=True)
             for job_id, result in zip(scan_tasks, results):

@@ -5,6 +5,15 @@ from .db import Base
 from .tags import decode_custom_tags, encode_custom_tags
 
 
+FINAL_DESTINATION_EDITABLE_STATES = (
+    "downloading", "waiting_for_local_space", "waiting_for_nas", "waiting_for_qbt_hash",
+)
+FINAL_DESTINATION_LOCK_MARKERS = (
+    "completion_event_received_at", "download_complete_at", "scan_completed_at",
+    "promoted_at", "deleted_at", "threat_name", "quarantine_path", "hook_status",
+)
+
+
 class Job(Base):
     __tablename__ = "jobs"
 
@@ -24,6 +33,10 @@ class Job(Base):
     staging_root_actual: Mapped[str | None] = mapped_column(Text, nullable=True)
     staging_overridden: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     override_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    nas_staging_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    nas_staging_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    nas_staging_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    nas_mount_marker: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     managed_tag: Mapped[str] = mapped_column(String(255), nullable=False)
     unique_tag: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
@@ -50,8 +63,28 @@ class Job(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     quarantine_path: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    hook_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    hook_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    hook_destination: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hook_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    hook_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    hook_finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    hook_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hook_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hook_script: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hook_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    hook_exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     threat_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    def final_destination_is_editable(self, *, has_scan_run: bool) -> bool:
+        return (
+            self.state in FINAL_DESTINATION_EDITABLE_STATES
+            and not self.is_terminal
+            and not has_scan_run
+            and all(getattr(self, name) is None for name in FINAL_DESTINATION_LOCK_MARKERS)
+        )
 
     @property
     def custom_tags(self) -> list[str]:

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from .models import Job
 from .paths import canonical_existing_path_within
+from .storage import require_storage
 
 
 class TorrentSafetyGuard:
@@ -91,6 +92,8 @@ class TorrentSafetyGuard:
         staging_root = job.staging_root_actual or job.staging_root_initial
         if not staging_root:
             raise RuntimeError("job has no expected staging root")
+        if job.staging_actual == "nas":
+            require_storage(staging_root, job.nas_mount_marker)
         save_path = getattr(torrent, "save_path", None)
         content_path = getattr(torrent, "content_path", None)
         if not save_path or not content_path:
@@ -98,8 +101,8 @@ class TorrentSafetyGuard:
         canonical_existing_path_within(str(save_path), staging_root, "torrent save_path")
         return canonical_existing_path_within(str(content_path), staging_root, "torrent content_path")
 
-    def validate_destination(self, db: Session, job: Job, torrent) -> Path:
-        self.validate_common(db, job, torrent, require_paused=True)
+    def validate_destination(self, db: Session, job: Job, torrent, *, require_paused: bool = True) -> Path:
+        self.validate_common(db, job, torrent, require_paused=require_paused)
         save_path = Path(str(getattr(torrent, "save_path", "") or "")).resolve(strict=False)
         expected = Path(job.final_parent).resolve(strict=False)
         if save_path != expected:

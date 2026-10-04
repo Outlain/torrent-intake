@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -120,8 +121,45 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "nas_staging_root": SettingSpec(
         "Storage and placement",
         "NAS staging root",
-        "Exact container path used for temporary NAS intake/download staging. This is separate from the final clean-library destination, and qBittorrent must use the same path.",
+        "Legacy single NAS path, used only while the named NAS list is empty. Existing job choices stay pinned. qBittorrent must see identical container paths.",
         safety_critical=True,
+    ),
+    "nas_staging_locations": SettingSpec(
+        "Storage and placement", "NAS staging locations",
+        "Named temporary download locations mounted at the same paths in Intake and qBittorrent. A marker is an existing file on the NAS (absolute container path); Intake never creates it. Existing job paths cannot be removed while in use.",
+        safety_critical=True,
+    ),
+    "default_nas_staging_id": SettingSpec(
+        "Storage and placement", "Automatic NAS default",
+        "Exactly one named NAS used for new jobs and local overflow. Existing jobs retain their saved fallback. This does not select the final library destination.",
+    ),
+    "post_promotion_enabled": SettingSpec(
+        "Storage and placement", "Run script after promotion",
+        "Run the deployment-configured trusted script only after clean scanning, completed final promotion, delay and revalidation. No scripts are queued for historical completed jobs. Scripts have Intake's permissions, not a separate sandbox.",
+        safety_critical=True,
+    ),
+    "post_promotion_copy_enabled": SettingSpec(
+        "Storage and placement", "Copy after successful promotion",
+        "Copy the verified promoted torrent to a second mounted location. No script is required. Originals are retained; existing destinations are not overwritten. Choose built-in copying OR a custom script. Applies to newly promoted jobs, not old completed jobs.",
+        safety_critical=True,
+    ),
+    "post_promotion_copy_destination": SettingSpec(
+        "Storage and placement", "Copy destination folder",
+        "Existing container path at or below /copy-target, for example /copy-target/intake-copies. Mount this separately in Portainer and create .intake-copy-mount inside the selected folder on the intended filesystem. Queued copies retain their original destination when this setting changes.",
+        safety_critical=True,
+    ),
+    "post_promotion_script": SettingSpec(
+        "Storage and placement", "Trusted post-promotion script",
+        "Absolute executable path under /hooks, mounted read-only. Configure in Portainer or settings.json while stopped. Script files are NOT included in portable backups. Never point this at downloaded content.",
+        safety_critical=True,
+    ),
+    "post_promotion_delay_seconds": SettingSpec(
+        "Storage and placement", "Post-promotion buffer",
+        "Minimum delay after verified promotion before checking again and copying or running the script; not a substitute for move verification.",
+    ),
+    "post_promotion_timeout_seconds": SettingSpec(
+        "Storage and placement", "Post-promotion action timeout",
+        "Maximum copy or script runtime, followed by a short shutdown grace period. A timeout does not rescan or move the promoted torrent again. Inspect partial copies before retrying.",
     ),
     "final_parent_prefix": SettingSpec(
         "Storage and placement",
@@ -393,6 +431,8 @@ def _display_value(spec: SettingSpec, value: Any, *, default: bool = False) -> s
         return "Not configured"
     if isinstance(value, bool):
         return "Enabled" if value else "Disabled"
+    if isinstance(value, list):
+        return json.dumps([item.model_dump() if hasattr(item, "model_dump") else item for item in value], ensure_ascii=False)
     return str(value)
 
 
@@ -402,6 +442,8 @@ ADVANCED_SETTINGS = frozenset({
     "large_media_min_chunk_mib", "large_media_overlap_kib", "media_attachment_max_mib",
     "media_attachment_total_mib", "clamd_max_inflight_requests", "max_scan_slots",
     "pause_confirmation_timeout_seconds",
+    "nas_staging_locations", "post_promotion_enabled",
+    "post_promotion_copy_enabled", "post_promotion_copy_destination",
 })
 
 # Shared by the form controls and the settings API.
@@ -410,6 +452,7 @@ NUMBER_LIMITS = {
     "large_media_overlap_kib": (0, None), "scanner_max_file_mib": (1, 2000),
     "per_job_scan_workers": (1, 4), "clamd_max_inflight_requests": (1, 4),
     "media_attachment_max_mib": (1, 64), "media_attachment_total_mib": (1, 256),
+    "post_promotion_delay_seconds": (0, 3600), "post_promotion_timeout_seconds": (1, 604800),
 }
 
 
@@ -452,6 +495,8 @@ def build_settings_catalog(settings: Settings, pending: Settings | None = None) 
         }.get(spec.category, "general")
         hidden_input = spec.sensitive or (spec.url_value and current_value and _safe_url(current_value) != current_value)
         input_type = "password" if hidden_input else "boolean" if isinstance(current_value, bool) else "number" if isinstance(current_value, int) else "text"
+        if name == "post_promotion_copy_destination":
+            input_type = "nullable"
         choices = ["queue", "nas"] if name == "local_overflow_policy" else []
         minimum, maximum = NUMBER_LIMITS.get(name, (1, None))
         unit = next((unit for suffix, unit in (("_seconds", "seconds"), ("_hours", "hours"), ("_mib", "MiB"), ("_kib", "KiB"), ("_gib", "GiB")) if name.endswith(suffix)), "")
@@ -481,7 +526,7 @@ def build_settings_catalog(settings: Settings, pending: Settings | None = None) 
                 "legacy": name == "app_name",
                 "advanced": name in ADVANCED_SETTINGS,
                 "input_type": input_type,
-                "input_value": None if hidden_input else current_value,
+                "input_value": None if hidden_input else settings.model_dump(mode="json")[name],
                 "choices": choices, "minimum": minimum, "maximum": maximum, "unit": unit,
                 "pending": ("Replacement saved (hidden)" if spec.sensitive else display_setting(name, getattr(pending, name))) if has_pending else None,
             }

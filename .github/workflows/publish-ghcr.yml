@@ -35,7 +35,7 @@ jobs:
         run: docker build --tag torrent-intake:test .
 
       - name: Run application tests in the built image
-        run: docker run --rm --read-only --network none --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python torrent-intake:test -m unittest discover -s /workspace/tests -v
+        run: docker run --rm --read-only --network none --tmpfs /tmp:rw,nosuid,nodev,noexec,size=128m --tmpfs /hooks:rw,nosuid,nodev,exec,size=32m,mode=1777 --tmpfs /copy-target:rw,nosuid,nodev,noexec,size=16m,mode=1777 --mount type=bind,src="${GITHUB_WORKSPACE}",dst=/workspace,readonly --entrypoint python torrent-intake:test -m unittest discover -s /workspace/tests -v
 
       - name: Verify application hardening compatibility
         run: |
@@ -50,6 +50,9 @@ jobs:
         run: |
           docker build --file tests/Dockerfile.qbt --tag torrent-intake:qbt-test .
           docker run --rm --read-only --network none --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m --mount type=bind,src="${GITHUB_WORKSPACE}/tests",dst=/tests,readonly --env PYTHONPATH=/app --entrypoint python torrent-intake:qbt-test /tests/integration_upload.py
+
+      - name: Test NAS selection and post-promotion hooks against isolated qBittorrent
+        run: docker run --rm --read-only --network none --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m --tmpfs /hooks:rw,nosuid,nodev,exec,size=32m,mode=1777 --tmpfs /copy-target:rw,nosuid,nodev,noexec,size=16m,mode=1777 --mount type=bind,src="${GITHUB_WORKSPACE}/tests",dst=/tests,readonly --env PYTHONPATH=/app --entrypoint python torrent-intake:qbt-test /tests/integration_locations.py
 
       - name: Test desktop and mobile UI
         if: matrix.runner == 'ubuntu-24.04'

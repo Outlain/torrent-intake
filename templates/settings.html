@@ -20,7 +20,7 @@
             <button id="setup-check" class="button-secondary" type="button">Check setup</button>
             <button id="admin-lock" class="button-secondary" type="button">Lock editing</button>
           </div>
-          <p>Pausing stops Intake's management and scan workers, not qBittorrent downloads or moves already requested. Wait for “drained” before saving or backing up.</p>
+          <p>Pausing stops Intake's management, scan and post-promotion workers, not qBittorrent downloads or moves already requested. A running copy or script becomes interrupted and needs review before an explicit retry. Wait for “drained” before saving or backing up.</p>
         </div>
         <div id="settings-restart-guide" class="settings-callout" hidden><strong>Saved, awaiting restart</strong><p>The running process still has its old settings. In Portainer, restart <code>torrent-intake</code>. Reopen this page, unlock administration, then choose <strong>Verify &amp; resume</strong>. No Docker socket or automatic restart is used.</p></div>
         <p id="admin-result" role="status" aria-live="polite"></p>
@@ -38,6 +38,7 @@
         <input id="settings-search" class="settings-search" type="search" placeholder="Search by name, variable or purpose" autocomplete="off">
       </div>
       <p id="settings-no-results" hidden>No settings match your search.</p>
+      <div class="settings-callout"><label class="settings-check"><input id="advanced-unlock" type="checkbox" disabled>Unlock advanced fields for this page</label><p>Advanced changes affect inspection limits, resource use, storage placement or post-promotion actions, and require a separate confirmation before saving.</p></div>
 
       <div class="settings-groups">
         {% for group in settings_catalog %}
@@ -46,7 +47,9 @@
           {% if group.id == 'connection' %}
           <div class="settings-inline"><button id="qbt-test" class="button-secondary" type="button" disabled>Test connection using these fields</button><span id="qbt-test-result" role="status"></span></div>
           {% elif group.id == 'scanner' %}
-          <div class="settings-callout"><label class="settings-check"><input id="advanced-unlock" type="checkbox" disabled>Unlock advanced scanner fields for this page</label><p>Limits affect inspection coverage and resource use. Changes are validated and require a separate confirmation before saving. Scan-policy changes can require files to be rescanned.</p><button id="settings-runtime-controls-button" class="button-secondary" type="button">Go to live scan-queue controls</button></div>
+          <div class="settings-callout"><p>Scan limits affect inspection coverage and resource use. Scan-policy changes can require files to be rescanned.</p><button id="settings-runtime-controls-button" class="button-secondary" type="button">Go to live scan-queue controls</button></div>
+          {% elif group.id == 'storage' %}
+          <div id="copy-after-promotion-help" class="settings-callout"><strong>Optional copy after successful promotion</strong><p>Intake first scans the torrent and verifies that its move to the final location is complete. After the buffer delay, it checks again, then copies that torrent's file or folder to your copy destination. Originals remain in their final location; copying does not delete them or overwrite an existing copy.</p><p>In Portainer, mount the copy storage into Intake at <code>/copy-target</code>. Create your chosen destination folder and its <code>.intake-copy-mount</code> marker on the mounted storage yourself. Then unlock advanced fields, enter the container destination below (for example <code>/copy-target/intake-copies</code>), enable copying, review/save, restart, and verify/resume. No custom script or <code>TI_POST_PROMOTION_SCRIPT</code> variable is needed.</p><p>Only one post-promotion action can be enabled: built-in copying or a custom script. Enabling one switches off the other in your draft when both fields are editable. Environment overrides must be removed in Portainer before they can be changed here. Changes apply to newly promoted jobs, not historical completed jobs.</p><p>Copies use a separate job folder. Only treat a copy as complete when its completion marker exists. If a copy fails or is interrupted by a pause/restart, inspect the partial copy before explicitly retrying it from the job details; promotion itself remains successful.</p></div>
           {% elif group.id == 'deployment' %}
           <div class="settings-callout"><strong>Docker deployment is separate from application settings.</strong><p>Host mount paths, ports, UID/GID, image tags and resource limits must be changed in Portainer. This app sees container paths, not the host mapping. Keep <code>/app/data</code> on local SSD storage.</p><p>The separate ClamD container controls <code>CLAMD_MAX_SCAN_SIZE_MIB</code>, its own definition-age limit and socket configuration. This UI cannot read or change those sidecar values. Application stream limits do not override them.</p><p>Retain your Compose/Portainer stack separately for disaster recovery. No YAML needs to be pasted here.</p></div>
           {% endif %}
@@ -57,7 +60,17 @@
               <p class="setting-description" id="help-{{ item.name }}">{{ item.description }}</p>
               <p class="setting-active">Active: <code data-active-value>{{ item.current }}</code></p>
               <p class="setting-pending" data-pending-value {% if item.pending is none %}hidden{% endif %}>Saved for next restart: {{ item.pending or '' }}</p>
+              {% if item.name == 'nas_staging_locations' %}
+              <p>Use the same mounted container paths in Intake and qBittorrent. An optional absolute marker-file path lets Intake reject an unavailable mount. These are temporary staging locations, not final library destinations.</p>
+              <div id="nas-location-editor" data-locations="{{ item.input_value | tojson | forceescape }}" aria-describedby="help-{{ item.name }} error-{{ item.name }}"></div>
+              <button id="nas-location-add" class="button-secondary" type="button" disabled>Add NAS location</button>
+              {% elif item.name == 'default_nas_staging_id' %}
+              <p id="nas-default-summary" data-default-nas-id="{{ item.input_value or '' }}">Choose one default using the radio buttons in NAS staging locations. Local jobs retain this default as their NAS fallback when submitted.</p>
+              {% endif %}
               {% if item.editable %}
+              {% if item.name in ['nas_staging_locations', 'default_nas_staging_id'] %}
+              <input id="edit-{{ item.name }}" data-local-setting="{{ item.name }}" data-advanced="{{ 'true' if item.advanced else 'false' }}" data-type="{{ 'json' if item.name == 'nas_staging_locations' else 'nullable' }}" type="hidden" value="{{ (item.input_value | tojson | forceescape) if item.name == 'nas_staging_locations' else (item.input_value or '') }}" disabled>
+              {% else %}
               <label for="edit-{{ item.name }}">{{ 'Replace value' if item.input_value is none else 'Value' }}{% if item.unit %} ({{ item.unit }}){% endif %}</label>
               {% if item.input_type == 'boolean' or item.choices %}
               <select id="edit-{{ item.name }}" data-local-setting="{{ item.name }}" data-advanced="{{ 'true' if item.advanced else 'false' }}" data-type="{{ item.input_type }}" aria-describedby="help-{{ item.name }} error-{{ item.name }}" disabled>
@@ -68,6 +81,7 @@
               <input id="edit-{{ item.name }}" data-local-setting="{{ item.name }}" data-advanced="{{ 'true' if item.advanced else 'false' }}" data-type="{{ item.input_type }}" type="{{ item.input_type }}" {% if item.input_type == 'number' %}min="{{ item.minimum }}" {% if item.maximum is not none %}max="{{ item.maximum }}"{% endif %} step="1"{% endif %} value="{{ item.input_value if item.input_value is not none else '' }}" autocomplete="off" spellcheck="false" placeholder="{{ 'Leave blank to keep the existing value' if item.input_value is none else '' }}" aria-describedby="help-{{ item.name }} error-{{ item.name }}" disabled>
               {% endif %}
               {% if item.name in ['qbt_web_url', 'completion_event_token'] %}<label class="settings-check"><input type="checkbox" data-clear-setting="{{ item.name }}" disabled>Clear this optional value</label>{% endif %}
+              {% endif %}
               {% endif %}
               <p class="setting-error" id="error-{{ item.name }}" data-field-error hidden></p>
               <p class="setting-lock-reason">{{ item.lock_reason }}</p>
@@ -94,7 +108,7 @@
 
       <section id="settings-review" class="settings-callout" tabindex="-1" hidden aria-labelledby="settings-review-title">
         <h3 id="settings-review-title">Review changes</h3><ul id="settings-review-list"></ul>
-        <label id="advanced-confirm-label" class="settings-check" hidden><input id="advanced-confirm" type="checkbox">I understand these advanced scanner changes affect inspection limits or resource use. Do not bypass incomplete scans; policy changes may require rescanning.</label>
+        <label id="advanced-confirm-label" class="settings-check" hidden><input id="advanced-confirm" type="checkbox">I understand these advanced changes affect inspection limits, resource use, storage placement or post-promotion actions. Do not bypass incomplete scans; policy changes may require rescanning.</label>
         <p>Pause and save stops Intake's workers safely. qBittorrent downloads continue. After saving, restart the container in Portainer, then verify and resume.</p>
         <button id="settings-save" class="button-primary" type="button">Pause and save</button><button id="settings-review-cancel" class="button-secondary" type="button">Back to editing</button>
       </section>

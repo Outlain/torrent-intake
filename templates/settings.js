@@ -3,6 +3,13 @@ window.TISettings = (() => {
   const fields = [...document.querySelectorAll('[data-local-setting]')];
   const clears = [...document.querySelectorAll('[data-clear-setting]')];
   const baselines = new Map(fields.map(input => [input.dataset.localSetting, input.value]));
+  const nasEditor = el('nas-location-editor');
+  const nasInput = el('edit-nas_staging_locations');
+  const nasDefaultInput = el('edit-default_nas_staging_id');
+  const initialNasLocations = [...document.querySelectorAll('#nas-staging-select option')].map(option => ({
+    id: option.value, label: option.dataset.label, path: option.dataset.path, mount_marker: option.dataset.mountMarker || null,
+  }));
+  const initialDefaultNasId = el('nas-staging-select')?.value;
   let token = '', revision = '', busy = false, reviewed = null;
   let controller = {paused: false, drained: false, restart_required: false};
 
@@ -13,9 +20,60 @@ window.TISettings = (() => {
       const clear = clears.find(box => box.dataset.clearSetting === name);
       if (clear?.checked) { values[name] = null; continue; }
       if (input.value === baselines.get(name) || (input.dataset.type === 'password' && !input.value)) continue;
-      values[name] = input.dataset.type === 'boolean' ? input.value === 'true' : input.value;
+      values[name] = input.dataset.type === 'boolean' ? input.value === 'true'
+        : input.dataset.type === 'json' ? JSON.parse(input.value)
+        : input.dataset.type === 'nullable' ? input.value || null : input.value;
     }
     return values;
+  }
+
+  function nasDefaultId() {
+    return nasDefaultInput?.value || el('nas-default-summary')?.dataset.defaultNasId
+      || initialDefaultNasId || initialNasLocations[0]?.id;
+  }
+  function syncNasDraft() {
+    if (!nasInput) return;
+    nasInput.value = JSON.stringify([...nasEditor.querySelectorAll('.nas-location-row')].map(row => ({
+      id: row.dataset.nasId, label: row.querySelector('.nas-label').value.trim(),
+      path: row.querySelector('.nas-path').value.trim(), mount_marker: row.querySelector('.nas-marker').value.trim() || null,
+    })));
+    invalidateReview();
+  }
+  function renderNasEditor() {
+    if (!nasEditor) return;
+    const saved = JSON.parse(nasInput?.value || nasEditor.dataset.locations || '[]');
+    const locations = saved.length ? saved : initialNasLocations;
+    nasEditor.replaceChildren();
+    locations.forEach(location => {
+      const row = document.createElement('fieldset');
+      row.className = 'nas-location-row'; row.dataset.nasId = location.id;
+      const legend = document.createElement('legend'); legend.textContent = `NAS location · ${location.id}`;
+      row.append(legend);
+      for (const [key, title, className, placeholder] of [
+        ['label', 'Display name', 'nas-label', 'Main NAS'],
+        ['path', 'Mounted container path', 'nas-path', '/nas/intake'],
+        ['mount_marker', 'Mount marker file (optional)', 'nas-marker', '/nas/.intake-mounted'],
+      ]) {
+        const label = document.createElement('label'); label.textContent = title;
+        const input = document.createElement('input'); input.type = 'text'; input.className = className;
+        input.value = location[key] || ''; input.placeholder = placeholder; input.autocomplete = 'off';
+        input.addEventListener('input', syncNasDraft); label.append(input); row.append(label);
+      }
+      const defaultLabel = document.createElement('label'); defaultLabel.className = 'settings-check';
+      const radio = document.createElement('input'); radio.type = 'radio'; radio.name = 'nas-default';
+      radio.value = location.id; radio.checked = location.id === nasDefaultId();
+      radio.addEventListener('change', () => {
+        if (nasDefaultInput && radio.checked) { nasDefaultInput.value = location.id; invalidateReview(); }
+      });
+      defaultLabel.append(radio, document.createTextNode('Default NAS and fallback for local jobs')); row.append(defaultLabel);
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'button-secondary nas-remove';
+      remove.textContent = 'Remove location'; remove.setAttribute('aria-label', `Remove NAS location ${location.label}`);
+      remove.addEventListener('click', () => {
+        if (radio.checked && nasDefaultInput) nasDefaultInput.value = [...nasEditor.querySelectorAll('.nas-location-row')].find(other => other !== row).dataset.nasId;
+        row.remove(); syncNasDraft(); renderNasEditor(); updateControls();
+      });
+      row.append(remove); nasEditor.append(row);
+    });
   }
 
   function filter() {
@@ -50,6 +108,17 @@ window.TISettings = (() => {
       if (advanced) card.querySelector('.setting-badge').textContent = input.disabled ? 'Advanced lock' : 'Advanced';
     });
     clears.forEach(box => { box.disabled = locked || el(`edit-${box.dataset.clearSetting}`).disabled; });
+    if (nasEditor) {
+      const rows = [...nasEditor.querySelectorAll('.nas-location-row')];
+      rows.forEach(row => {
+        row.querySelectorAll('input[type=text]').forEach(input => { input.disabled = !nasInput || nasInput.disabled; });
+        const radio = row.querySelector('input[type=radio]');
+        radio.disabled = !nasDefaultInput || nasDefaultInput.disabled;
+        radio.checked = row.dataset.nasId === nasDefaultId();
+        row.querySelector('.nas-remove').disabled = !nasInput || nasInput.disabled || rows.length < 2 || (radio.checked && (!nasDefaultInput || nasDefaultInput.disabled));
+      });
+      el('nas-location-add').disabled = !nasInput || nasInput.disabled;
+    }
     el('advanced-unlock').disabled = locked;
     el('admin-controls').hidden = !token;
     el('settings-unlock-fields').hidden = Boolean(token);
@@ -70,6 +139,7 @@ window.TISettings = (() => {
     el('controller-state').textContent = controller.paused
       ? `Intake paused · ${controller.drained ? 'drained, ready for maintenance' : 'waiting for workers to stop'}. ${controller.reason || ''}`
       : 'Intake is running. Editing fields does not change active settings until you save and restart.';
+    document.querySelectorAll('[data-retry-hook]').forEach(button => { button.hidden = !token; button.disabled = locked || !controller.paused || !controller.drained; });
   }
 
   function clearErrors() {
@@ -82,7 +152,7 @@ window.TISettings = (() => {
     el('setup-results').replaceChildren();
     for (const check of checks) {
       const item = document.createElement('li');
-      item.textContent = `${check.ok ? 'Passed' : 'Needs attention'} — ${check.name}: ${check.message}`;
+      item.textContent = `${check.ok ? 'Passed' : check.required === false ? 'Warning (optional location)' : 'Needs attention'} — ${check.name}: ${check.message}`;
       el('setup-results').append(item);
     }
   }
@@ -145,10 +215,12 @@ window.TISettings = (() => {
       pending.hidden = setting.pending === null;
       pending.textContent = setting.pending === null ? '' : `Saved for next restart: ${setting.pending}`;
       if (input) {
-        input.value = setting.input_type === 'boolean' ? String(setting.input_value) : setting.input_value ?? '';
+        input.value = input.dataset.type === 'json' ? JSON.stringify(setting.input_value || [])
+          : setting.input_type === 'boolean' ? String(setting.input_value) : setting.input_value ?? '';
         baselines.set(setting.name, input.value);
       }
     }
+    renderNasEditor();
     clears.forEach(box => { box.checked = false; });
     const size = state.backup.database_bytes;
     el('backup-database-size').textContent = `${size === null ? 'Database size unavailable' : `Database: ${(size / 1048576).toFixed(2)} MiB`}. Portable backup limit: ${state.backup.database_limit_bytes / 1048576} MiB; this is not a torrent-size limit.`;
@@ -169,12 +241,35 @@ window.TISettings = (() => {
     updateControls();
   }
   fields.forEach(input => input.addEventListener('input', invalidateReview));
+  for (const [name, otherName] of [
+    ['post_promotion_copy_enabled', 'post_promotion_enabled'],
+    ['post_promotion_enabled', 'post_promotion_copy_enabled'],
+  ]) {
+    el(`edit-${name}`)?.addEventListener('change', event => {
+      const other = el(`edit-${otherName}`);
+      if (event.target.value === 'true' && other && !other.disabled && other.value === 'true') {
+        other.value = 'false';
+        invalidateReview();
+      }
+    });
+  }
+  el('nas-location-add')?.addEventListener('click', () => {
+    if (!nasInput || nasInput.disabled) return;
+    syncNasDraft();
+    const locations = JSON.parse(nasInput.value);
+    const locationId = `nas-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    locations.push({id: locationId, label: 'New NAS', path: '', mount_marker: null});
+    if (nasDefaultInput && !nasDefaultInput.disabled && !nasDefaultInput.value) nasDefaultInput.value = nasDefaultId();
+    nasInput.value = JSON.stringify(locations); renderNasEditor(); invalidateReview();
+    nasEditor.lastElementChild.querySelector('.nas-label').focus();
+  });
   clears.forEach(input => input.addEventListener('change', invalidateReview));
   el('advanced-unlock').addEventListener('change', updateControls);
   el('advanced-confirm').addEventListener('change', updateControls);
   el('settings-section').addEventListener('change', () => { el('settings-search').value = ''; filter(); });
   el('settings-discard').addEventListener('click', () => {
     fields.forEach(input => { input.value = baselines.get(input.dataset.localSetting); });
+    renderNasEditor();
     clears.forEach(box => { box.checked = false; });
     clearErrors(); invalidateReview(); el('admin-result').textContent = 'Draft discarded. No saved settings were changed.';
   });
@@ -262,6 +357,13 @@ window.TISettings = (() => {
     if (Object.keys(draft()).length || busy) { event.preventDefault(); event.returnValue = ''; }
   });
   setInterval(() => { if (!el('settings-dialog').hidden && !busy) refreshStatus().catch(showError); }, 5000);
-  updateControls();
-  return {filter, onOpen: () => refreshStatus().catch(showError)};
+  renderNasEditor(); updateControls();
+  return {filter, onOpen: () => refreshStatus().catch(showError),
+    canRetryHook: () => Boolean(token) && !busy && controller.paused && controller.drained && !controller.restart_required,
+    isAdmin: () => Boolean(token),
+    retryHook: async jobId => {
+      if (!token) throw new Error('Unlock administration in Settings before retrying a post-promotion action.');
+      return post(`/admin/jobs/${encodeURIComponent(jobId)}/retry-hook`);
+    },
+  };
 })();

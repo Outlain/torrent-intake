@@ -20,6 +20,7 @@ from .event_writer import emit_event
 from .models import Job, ScanFile, ScanRun, ScannerControl
 from .qbt import QbtService
 from .torrent_guard import TorrentSafetyGuard
+from .storage import StorageUnavailable
 from .scanner import (
     ScanInterrupted,
     ScannerDefinitionsStale,
@@ -471,7 +472,7 @@ class ScanCoordinator:
                         db.add_all([job, run])
                         db.commit()
                         return
-            except (ScannerUnavailable, ScannerDefinitionsStale) as exc:
+            except (ScannerUnavailable, ScannerDefinitionsStale, StorageUnavailable) as exc:
                 self._defer_claim(db, claim, str(exc), retry_after_seconds=30)
             except ScannerPolicyError as exc:
                 self.logger.error("Scanner policy rejected job %s: %s", claim.job_id, exc)
@@ -576,6 +577,7 @@ class ScanCoordinator:
 
         for job in jobs:
             run = runs.get(job.id)
+            job.can_edit_final_destination = job.final_destination_is_editable(has_scan_run=run is not None)
             job.scan_priority = run.priority if run else 0
             job.scan_pause_requested = run.pause_requested if run else False
             job.scan_total_files = run.total_files if run else 0

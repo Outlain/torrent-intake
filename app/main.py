@@ -23,7 +23,10 @@ from .backup import MAX_BACKUP_BYTES, MAX_DATABASE_BYTES, create_backup, databas
 from .config import Settings, get_settings, persist_settings
 from .restore import stage_restore
 from .state_files import write_private
-from .db import Base, engine, get_db, upgrade_schema
+from .db import Base, engine, get_db, upgrade_schema, SessionLocal
+from .storage import pin_existing_jobs, validate_location_changes, require_storage, StorageUnavailable
+from .post_promotion import PostPromotionRunner, queue_promotion_hook
+from .copy_action import validate_destination as validate_copy_destination
 from .models import Job
 from .schemas import (
     CompletionEventIn,
@@ -31,12 +34,14 @@ from .schemas import (
     JobBatchCreateResult,
     JobBulkResult,
     JobCreate,
+    JobFinalDestinationUpdate,
     JobOut,
     JobSelectionIn,
+    NasJobSelectionIn,
     ScannerMaintenanceUpdate,
     ScannerSlotsUpdate,
 )
-from .service import JobService
+from .service import FinalDestinationConflict, JobService
 from .settings_view import build_settings_catalog
 from .settings_editor import SettingsEditError, pending_settings, revision, validate_draft
 from .qbt import QbtService
@@ -70,6 +75,9 @@ async def lifespan(app: FastAPI):
         fresh = False  # Non-SQLite deployments use their own database backup tooling.
     Base.metadata.create_all(bind=engine)
     upgrade_schema()
+    with SessionLocal() as db:
+        pin_existing_jobs(db, settings)
+    PostPromotionRunner(settings=settings).recover_interrupted()
     controller = Controller(settings, fresh=fresh)
     if not controller.paused:
         controller.start()
@@ -169,7 +177,12 @@ async def review_local_settings(request: Request):
     async with controller.operation_lock:
         if controller.status()["restart_required"]:
             raise HTTPException(status_code=409, detail="Restart to apply the saved changes before editing again.")
-        _, changes = _draft(payload)
+        candidate, changes = _draft(payload)
+        with SessionLocal() as db:
+            try:
+                validate_location_changes(db, settings, candidate)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"changes": changes, "revision": revision(settings)}
 
 
@@ -201,8 +214,7 @@ async def test_qbt_connection(request: Request):
 
 def _storage_checks() -> list[dict]:
     checks = []
-    paths = [settings.data_dir, settings.event_dir, settings.local_staging_root,
-             settings.nas_staging_root, settings.final_parent_prefix]
+    paths = [settings.data_dir, settings.event_dir, settings.local_staging_root, settings.final_parent_prefix]
     if settings.final_parent_prefixes:
         paths.extend(path.strip() for path in settings.final_parent_prefixes.split(",") if path.strip())
     if settings.infected_action == "quarantine":
@@ -213,7 +225,27 @@ def _storage_checks() -> list[dict]:
         except OSError:
             accessible = False
         checks.append({"name": f"Storage: {name}", "ok": accessible,
+                       "required": name in {settings.data_dir, settings.event_dir, settings.local_staging_root, settings.quarantine_root},
                        "message": "Directory is accessible. Also verify the intended host mount in Portainer." if accessible else "Directory is missing or not readable/writable/searchable. Check its host mount and UID/GID permissions."})
+    for location in settings.effective_nas_locations:
+        try:
+            require_storage(location.path, location.mount_marker)
+            message, available = "NAS staging is accessible.", True
+            if not location.mount_marker:
+                message += " No mount marker configured; directory permissions alone cannot prove the intended NAS is mounted."
+        except StorageUnavailable as exc:
+            message, available = str(exc), False
+        checks.append({"name": f"NAS: {location.label} ({location.path})", "ok": available,
+                       "required": False, "message": message + " Jobs needing this location wait when it is unavailable."})
+    if settings.post_promotion_copy_enabled:
+        try:
+            validate_copy_destination(Path(settings.post_promotion_copy_destination))
+            message, available = "Copy destination and its mount marker are accessible.", True
+        except (OSError, RuntimeError, ValueError) as exc:
+            message, available = str(exc), False
+        checks.append({"name": f"Copy destination: {settings.post_promotion_copy_destination}",
+                       "ok": available, "required": False,
+                       "message": message + " Copies wait if the target is unavailable; normal Intake work can continue."})
     return checks
 
 
@@ -249,7 +281,7 @@ async def resume_controller(request: Request):
         try:
             controller.require_drained()
             checks = await _readiness_checks()
-            if not all(check["ok"] for check in checks):
+            if not all(check["ok"] for check in checks if check.get("required", True)):
                 raise HTTPException(status_code=409, detail={"message": "Resume checks failed; the controller remains paused.", "checks": checks})
             return controller.resume()
         except HTTPException:
@@ -266,10 +298,12 @@ async def save_local_settings(request: Request):
         try:
             controller.require_drained()
             candidate, changes = _draft(payload)
+            with SessionLocal() as db:
+                validate_location_changes(db, settings, candidate)
             if not changes:
                 raise HTTPException(status_code=422, detail="No settings changed. Blank secret replacement fields preserve the current value.")
             if any(change["advanced"] for change in changes) and payload.get("confirm_advanced") is not True:
-                raise HTTPException(status_code=409, detail="Advanced scanner changes require explicit confirmation.")
+                raise HTTPException(status_code=409, detail="Advanced scanner, storage or script changes require explicit confirmation.")
             # Mark pending before the atomic replacement; a write error must not
             # allow the old process to resume with a different saved policy.
             write_private(Path(settings.data_dir) / "restart-required", b"settings changed\n")
@@ -279,6 +313,29 @@ async def save_local_settings(request: Request):
         except OSError:
             raise HTTPException(status_code=409, detail="Could not save settings. Check the local data directory permissions and free space; Intake remains paused. Restart and verify the saved values before resuming.")
     return {"restart_required": True, "message": "Settings saved locally. Restart the container to apply them."}
+
+
+@app.post("/admin/jobs/{job_id}/retry-hook")
+async def retry_promotion_hook(job_id: str):
+    async with controller.operation_lock:
+        try:
+            controller.require_drained()
+            with SessionLocal() as db:
+                job = db.get(Job, job_id)
+                if not job or job.hook_status not in {"failed", "interrupted"}:
+                    raise ValueError("Only a failed or interrupted copy/script can be retried")
+                if job.hook_kind == "copy":
+                    if not settings.post_promotion_copy_enabled:
+                        raise ValueError("Enable built-in copying and restart before retrying this copy")
+                elif not settings.post_promotion_enabled:
+                    raise ValueError("Enable the post-promotion script and restart first")
+                job.hook_status = None
+                if not queue_promotion_hook(job, settings):
+                    raise ValueError("This job has not completed clean promotion")
+                db.commit()
+            return {"queued": True, "message": "Action queued. Verify and resume Intake to run it; the torrent will not be scanned or moved again."}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/admin/deployment-notes")
@@ -386,6 +443,7 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
             final_parent=payload.final_parent,
             final_category=payload.final_category,
             staging_preference=payload.staging_preference,
+            nas_staging_id=payload.nas_staging_id,
             custom_tags=payload.custom_tags,
         )
         return job
@@ -415,6 +473,7 @@ def create_jobs_bulk(payload: JobBatchCreate, db: Session = Depends(get_db)):
                 final_parent=item.final_parent,
                 final_category=item.final_category,
                 staging_preference=item.staging_preference,
+                nas_staging_id=item.nas_staging_id,
                 custom_tags=item.custom_tags,
             )
             created_jobs.append(job)
@@ -463,6 +522,18 @@ def retry_job(job_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.patch("/jobs/{job_id}/final-destination", response_model=JobOut)
+def update_final_destination(job_id: str, payload: JobFinalDestinationUpdate, db: Session = Depends(get_db)):
+    try:
+        return service.update_final_destination(db, job_id=job_id, **payload.model_dump())
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FinalDestinationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.post("/jobs/bulk-retry", response_model=JobBulkResult)
 def bulk_retry_jobs(payload: JobSelectionIn, db: Session = Depends(get_db)):
     return service.retry_jobs(db, job_ids=payload.job_ids)
@@ -484,8 +555,8 @@ def bulk_resume_scans(payload: JobSelectionIn, db: Session = Depends(get_db)):
 
 
 @app.post("/jobs/bulk-move-to-nas", response_model=JobBulkResult)
-def bulk_move_waiting_jobs_to_nas(payload: JobSelectionIn, db: Session = Depends(get_db)):
-    return service.move_waiting_jobs_to_nas(db, job_ids=payload.job_ids)
+def bulk_move_waiting_jobs_to_nas(payload: NasJobSelectionIn, db: Session = Depends(get_db)):
+    return service.move_waiting_jobs_to_nas(db, job_ids=payload.job_ids, nas_staging_id=payload.nas_staging_id)
 
 
 @app.get("/qbt/categories")

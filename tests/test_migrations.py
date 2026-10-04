@@ -61,6 +61,13 @@ class AdditiveMigrationTests(unittest.TestCase):
                     text("SELECT custom_tags_json FROM jobs WHERE id = 'legacy-job'")
                 ).scalar_one()
             self.assertEqual(custom_tags_json, "[]")
+            with engine.connect() as connection:
+                self.assertEqual(connection.execute(text(
+                    "SELECT nas_staging_id,nas_staging_path,hook_status,hook_attempts FROM jobs WHERE id='legacy-job'"
+                )).one(), (None, None, None, 0))
+                self.assertEqual(connection.execute(text(
+                    "SELECT hook_kind,hook_destination FROM jobs WHERE id='legacy-job'"
+                )).one(), (None, None))
             with engine.begin() as connection:
                 self.assertEqual(connection.execute(text(
                     "SELECT torrent_file_name,torrent_file_data FROM jobs WHERE id = 'legacy-job'"

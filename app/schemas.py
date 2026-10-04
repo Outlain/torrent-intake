@@ -19,6 +19,7 @@ class JobOptions(BaseModel):
     final_parent: str = Field(min_length=2)
     final_category: str | None = None
     staging_preference: Literal["local", "nas"] = "local"
+    nas_staging_id: str | None = Field(default=None, max_length=64)
     custom_tags: list[str] = Field(default_factory=list, max_length=MAX_CUSTOM_TAGS)
 
     @field_validator("final_parent")
@@ -57,6 +58,13 @@ class JobBatchCreate(BaseModel):
     jobs: list[JobCreate] = Field(min_length=1, max_length=50)
 
 
+class JobFinalDestinationUpdate(BaseModel):
+    final_parent: str = Field(min_length=2, max_length=4096)
+    expected_final_parent: str = Field(min_length=1, max_length=4096)
+
+    model_config = {"extra": "forbid"}
+
+
 class JobOut(BaseModel):
     id: str
     created_at: datetime
@@ -64,9 +72,19 @@ class JobOut(BaseModel):
     magnet_uri: str
     torrent_file_name: str | None = None
     final_parent: str
+    can_edit_final_destination: bool = False
     final_category: str | None
     staging_preference: str
     staging_actual: str | None
+    nas_staging_id: str | None = None
+    nas_staging_label: str | None = None
+    nas_staging_path: str | None = None
+    hook_status: str | None = None
+    hook_kind: str | None = None
+    hook_destination: str | None = None
+    hook_error: str | None = None
+    hook_output: str | None = None
+    hook_exit_code: int | None = None
     staging_root_initial: str
     staging_root_actual: str | None
     staging_overridden: bool
@@ -114,6 +132,10 @@ class JobOut(BaseModel):
 
 class JobSelectionIn(BaseModel):
     job_ids: list[str] = Field(default_factory=list)
+
+
+class NasJobSelectionIn(JobSelectionIn):
+    nas_staging_id: str | None = Field(default=None, max_length=64)
 
 
 class ScannerSlotsUpdate(BaseModel):

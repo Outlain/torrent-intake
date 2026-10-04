@@ -50,7 +50,7 @@ def validate_draft(settings: Settings, updates: object) -> tuple[Settings, list[
     try:
         candidate = Settings(**values)
     except ValidationError as exc:
-        raise SettingsEditError({str(error["loc"][0]): "Invalid value or type for this setting."
+        raise SettingsEditError({str(error["loc"][0]) if error["loc"] else "_form": error["msg"]
                                  for error in exc.errors(include_input=False)}) from exc
     for name in updates:
         value = getattr(candidate, name)

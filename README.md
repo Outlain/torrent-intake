@@ -419,6 +419,203 @@ Set `TI_QBT_HOST` to the Web API endpoint reachable from Torrent Intake. Attach
 the application (not the ClamD sidecar) to an existing private Docker network if
 that endpoint relies on Docker DNS.
 
+### Editing a downloading job's final destination
+
+In **Recent Jobs**, use **Edit final location** beside an eligible job's final
+path, on desktop or mobile. Change the container-visible destination (for
+example `/downloads/TV/NewFolder`), then save. This is a per-job database change:
+it takes effect immediately and needs no Portainer environment change or restart.
+
+Only jobs still in the download stage, including local-space/NAS/hash waits,
+are eligible. Once completion has been recorded or a scan has been queued, the
+destination is locked. Scanning, promotion, infected, failed and completed jobs
+cannot be redirected with this action. If a job advances or another browser
+changes its destination while the editor is open, saving is rejected; refresh
+and review the current job instead.
+
+This changes **only the eventual clean-promotion destination**. The current
+download stays in its existing local/NAS staging location; its category, tags,
+selected NAS fallback and scan policy are unchanged. Normal scanning and
+promotion checks still apply. Paths must remain within the deployment's allowed
+final roots and outside staging/operational directories. A new final subfolder
+can be created by qBittorrent during promotion; editing does not create folders
+or mount storage. Both applications still need matching container paths.
+
+The action is unavailable while Intake is paused for maintenance/backup/restore,
+like other normal job changes. No additional administrator unlock is required;
+keep the Intake UI on a trusted network.
+
+### Named NAS staging locations
+
+**Settings & Help → Downloads/storage** can keep a named NAS staging list and one
+default. Each record contains `id`, `label`, an absolute container `path`, and an
+optional absolute `mount_marker` pointing to a pre-existing regular file. The
+protected editor uses review, pause/save and restart before new settings apply.
+These are temporary download/scan locations, not final media destinations.
+
+Select a NAS location for NAS staging in New Intake or per row in bulk review.
+A locally staged job remembers the current default for any later NAS fallback.
+Each job pins its chosen NAS ID, path and marker; changing the global list/default does not relocate old
+jobs. The selected NAS must be available: an unavailable path or configured marker
+does not cause a silent switch to another NAS. Old jobs keep their saved paths.
+Offline NAS checks are warnings at global resume, allowing unrelated local work.
+This is not a mount manager: filesystem calls on a hard-mounted, unresponsive NFS
+share can still block until the host/kernel's mount timeout or recovery occurs.
+
+Leave `nas_staging_locations` empty to retain the single-root behavior, including
+an existing `TI_NAS_STAGING_ROOT` override. The list, default and effective
+environment overrides live in `settings.json` and encrypted backups. See the
+[configuration example](CONFIGURATION.md#storage-and-torrent-placement).
+
+Intake and qBittorrent must have matching mounts for every staging path. Before
+using a marker, verify the host export and create the marker **on that export**, not
+in the directory underneath an unmounted share. A sentinel helps catch missing
+mounts but is not proof of NAS identity. The app never mounts exports or creates
+mount markers. Docker mounts/permissions still need separate deployment recovery.
+
+### Optional post-promotion copy
+
+The built-in **Copy after completion** action is **off by default**. No script,
+`/hooks` mount, or application environment variable is required. Configure its
+enable switch and destination in **Settings & Help → Downloads/storage**, after
+unlocking advanced settings. Review, pause/save, restart in Portainer, then verify
+and resume. A trusted custom script remains a separate advanced alternative;
+only one of the two actions may be enabled at a time.
+
+The sequence is:
+
+1. Scan successfully and promote through qBittorrent as usual.
+2. Confirm qBittorrent has finished moving into the final location.
+3. Queue a durable copy request with its destination saved for this job.
+4. Wait five seconds by default, then recheck qBittorrent and final content.
+5. Copy only this promoted file/folder into a new exclusive per-job directory.
+6. Record copy success separately from the already successful promotion.
+
+Changing the configured destination does not redirect previously queued copies.
+There is one copy worker, so copies do not start an unbounded number of `rsync`
+processes. Existing completed jobs are not automatically copied when enabled.
+The delay is not a substitute for checking that the move actually finished.
+
+#### One-time deployment preparation
+
+Mount an existing, writable copy destination **only into Intake**, at
+`/copy-target`. qBittorrent and ClamD do not need that mount. For example, after
+mounting your chosen export at `/mnt/nfs/intake-copies` in the Docker VM:
+
+```yaml
+# Add under torrent-intake.volumes; keep the existing mounts.
+- type: bind
+  source: /mnt/nfs/intake-copies
+  target: /copy-target
+  bind:
+    create_host_path: false
+```
+
+The longer bind syntax refuses to create a missing host directory. It does not
+prove that NFS is mounted. Verify the export and writable permissions first:
+
+```sh
+findmnt -T /mnt/nfs/intake-copies -o TARGET,SOURCE,FSTYPE,OPTIONS
+```
+
+After confirming the intended export, provision a dedicated `intake-copies`
+directory inside it, writable by Intake's UID/GID. Create an empty regular file
+named `.intake-copy-mount` **inside that directory on the export**. Do not put the
+marker in the local directory underneath an unmounted share. If creating these
+through the VM is denied by NFS permissions, provision them in TrueNAS with the
+correct ACL instead of enabling root access or broad `777` permissions.
+
+In the UI, choose `/copy-target/intake-copies` as the copy destination and enable
+**Copy after completion**. The destination must already exist, be at or below
+`/copy-target`, and contain its `.intake-copy-mount` marker. Intake does not mount
+NAS exports or create this marker for you. Keep the marker and destination stable
+while a copy is in progress. Omit explicit `TI_POST_PROMOTION_COPY_*` environment
+overrides if you want these fields editable in the UI.
+
+The resulting layout is:
+
+```text
+/copy-target/intake-copies/
+├── .intake-copy-mount
+└── intake-job-<job-id>/
+    ├── Original torrent file or folder
+    └── .intake-copy-complete.json
+```
+
+The action uses image-provided `rsync`, not SSH or another container. It does not
+delete the original, merge into existing library folders, overwrite existing job
+copies, or copy your entire library. It requires real additional destination
+space and reads/writes the whole payload: copying between two NAS shares through
+the VM adds network and disk I/O. It is not a replacement for ZFS replication or
+a snapshot-based backup system. See [the storage layout guide](docs/STORAGE_LAYOUT.md).
+
+#### Status, interruption and recovery
+
+Copy failure or timeout **does not repeat scanning, promotion, or qBittorrent
+changes**. The main job remains done and the separate post-promotion status shows
+the problem. The default whole-action timeout is `7200` seconds; adjust it in the
+UI for expected size and speed. Restarting or pausing while an action runs marks
+it interrupted and requires explicit review/retry, because some data may already
+have been copied. Disabling an action leaves already queued work pending; it is
+not cancellation. Queued/running work prevents **Clear completed** from forgetting
+its job.
+
+Each per-job directory is reserved exclusively with mode `0700`. Consumers must
+require `.intake-copy-complete.json`; a visible folder alone does not mean a copy
+finished. The marker is published after `rsync --fsync` succeeds, the source
+identity remains stable, and copied paths/sizes match. Per-file flushes avoid an
+extra payload-reading pass but can add storage latency; they are not a guarantee
+against NAS power loss or a substitute for snapshots. Hard-link support is required for
+atomic no-replace publication of that marker. Symlinks and special files are
+rejected. Do not let another program modify the source or reserved destination
+while copying. These checks are not a cryptographic recheck of scanned bytes or
+a sandbox against hostile concurrent writers; unchanged size/metadata is not a
+malware guarantee.
+
+For a failed/interrupted copy, inspect its exact per-job folder and reported
+error. An incomplete folder is never silently resumed, overwritten, or deleted.
+Move only that folder aside after review, retaining it for recovery, then unlock
+administration and pause/drain Intake to retry the post-promotion action. Resume
+after queuing the retry. A completed, unchanged matching copy is a no-op on retry.
+The ordinary failed-scan retry is not needed to repeat a copy.
+
+Copy settings, pinned destinations and action status are included in Intake's
+encrypted backup. **Copied media, NAS mounts, permissions and mount markers are
+not**; restore those separately before running pending work. With the built-in
+action there is no operator script file to back up.
+
+#### Advanced alternative: custom script
+
+For behavior beyond copying, mount a trusted executable under read-only `/hooks`
+and set `TI_POST_PROMOTION_SCRIPT`, or the equivalent local setting. Enable the
+custom-script action instead of the built-in copy action. The UI deliberately
+cannot edit arbitrary executable code. The script receives explicit arguments:
+
+```text
+/hooks/after-promotion-copy.py --source /downloads/Movies/Example.mkv --torrent-hash <hash> --torrent-name=<name> --job-id <id>
+```
+
+This is an argument list, not a shell command. Scripts run as Intake's non-root
+identity but can access its writable mounts: they are trusted code, not a sandbox.
+Keep host editing restricted to operators. Scripts must run in the foreground;
+the runner stops normal process-group children, not deliberately escaped ones.
+The [older copy script example](scripts/after-promotion-copy.py) remains available
+for custom workflows, but is unnecessary for built-in copying. Its destination
+constant must be edited if used. Script files/constants are not in Intake backups;
+restore them and the read-only `/hooks` mount separately. No SSH client is installed.
+
+### Upgrading existing installations
+
+Pause/drain Intake and make an encrypted backup before deploying this update.
+Keep the same `/app/data` mount. The additive migration preserves jobs and scan
+checkpoints, pins existing staging choices, and leaves the optional hook disabled
+unless explicitly enabled. No old completed jobs are automatically copied.
+Mount any additional storage in both Intake and qBittorrent at matching container
+paths, then configure the named locations through Settings & Help and restart.
+For rollback, stop Intake and restore the **pre-update** data/configuration with
+the older image; do not assume an older image understands the new settings keys.
+Never run old and new Intake controllers against the same qBittorrent instance.
+
 ## Important configuration
 
 See [the complete configuration reference](CONFIGURATION.md) for every application
@@ -447,7 +644,15 @@ written without the `TI_` prefix in `settings.json`:
 | `TI_CLAMD_SOCKET_HOST_DIR` | `/opt/docker/clamav-shared/sockets/torrent-intake` | private host socket directory |
 | `CLAMD_MAX_SCAN_SIZE_MIB` | `2000` | sidecar cumulative parser/expanded-data limit; bounded to `1`-`4000`, with `4000` as an explicit higher-work opt-in |
 | `TI_LOCAL_STAGING_ROOT` | `/staging-local` | exact local staging boundary |
-| `TI_NAS_STAGING_ROOT` | `/downloads/torrent-intake/staging` | exact NAS staging boundary |
+| `TI_NAS_STAGING_ROOT` | `/downloads/torrent-intake/staging` | legacy NAS staging boundary when the named list is empty |
+| `TI_NAS_STAGING_LOCATIONS` | `[]` | named NAS staging records (`id`, `label`, `path`, optional `mount_marker`) |
+| `TI_DEFAULT_NAS_STAGING_ID` | unset | default named location; per-job selections remain pinned |
+| `TI_POST_PROMOTION_COPY_ENABLED` | `false` | built-in copy after verified clean promotion; editable in UI |
+| `TI_POST_PROMOTION_COPY_DESTINATION` | unset; example `/copy-target/intake-copies` | existing marked destination at/below `/copy-target`; editable in UI |
+| `TI_POST_PROMOTION_ENABLED` | `false` | alternative trusted custom-script action; mutually exclusive with built-in copy |
+| `TI_POST_PROMOTION_SCRIPT` | unset; example `/hooks/after-promotion-copy.py` | trusted deployment-only executable under read-only `/hooks` |
+| `TI_POST_PROMOTION_DELAY_SECONDS` | `5` | delay before copy/script readiness checks |
+| `TI_POST_PROMOTION_TIMEOUT_SECONDS` | `7200` | whole copy/script attempt deadline |
 | `TI_FINAL_PARENT_PREFIX` | `/downloads` | primary allowed media root |
 | `TI_FINAL_PARENT_PREFIXES` | empty | optional additional mounted media roots |
 | `TI_SCANNER_MAX_FILE_MIB` | `2000` | native ClamD boundary; larger verified video and raw TrueHD content use the large-media route |
@@ -572,7 +777,7 @@ All application-owned durable state is on the existing `/app/data` mount:
 
 | File | Contents |
 | --- | --- |
-| `torrent_intake.db` | Jobs, private magnets, original uploaded .torrent metadata, tags, per-file checkpoints, scan queue and runtime scanner controls |
+| `torrent_intake.db` | Jobs, pinned NAS choices, hook status/attempts/output, private magnets, original uploaded .torrent metadata, tags, per-file checkpoints, scan queue and runtime scanner controls |
 | `torrent_intake.db-wal`, `torrent_intake.db-shm` | SQLite's live journals; never copy just the main database while it is running |
 | `settings.json` | All effective application settings, including connection secrets and explicit environment overrides |
 | `admin-token` | Locally generated credential for configuration and backup/restore APIs; intentionally not exported/restored |
@@ -627,8 +832,9 @@ are filled in and saved at the next successful startup. Example:
 }
 ```
 
-Deployment-only settings such as `infected_action` and staging/database
-boundaries remain read-only in the web editor. Edit their local file values
+Deployment-only settings such as `infected_action`, executable paths, and legacy
+staging/database boundaries remain read-only in the web editor. Named NAS locations
+use the protected Downloads/storage editor described above. Edit deployment-only values
 while Intake is stopped, or explicitly override them in the stack. Scanner
 limits use the advanced warning/unlock described above. Restoring a trusted
 backup restores its saved policy, but automatic actions remain paused until you
@@ -765,6 +971,9 @@ placeholders. The background poller still discovers missed callbacks.
   and `custom_tags`). Bulk file clients submit this endpoint sequentially, as the
   UI does; do not encode file bytes in JSON or submit multiple files per request.
 - `GET /jobs`, `GET /jobs/{id}`: inspect jobs
+- `PATCH /jobs/{id}/final-destination`: change a downloading job's planned final
+  folder with `final_parent` and `expected_final_parent`. A stale destination or
+  ineligible lifecycle state returns `409`; no files are moved by this endpoint.
 - retry, bulk retry/delete/clear, switch-waiting-jobs-to-NAS-staging, and scan
   priority/pause/resume endpoints used by the UI
 - `GET /scanner/status`, `POST /scanner/slots`, `POST /scanner/maintenance`

@@ -424,6 +424,10 @@
       grid-column: 1 / -1;
     }
 
+    #nas-staging-field[hidden], .bulk-row-field[hidden], [data-retry-hook][hidden] { display: none; }
+    .nas-move-field { min-width: 0; max-width: 100%; }
+    .nas-move-field select { min-width: 0; max-width: 420px; }
+
     #torrent-file-input {
       min-width: 0;
       max-width: 100%;
@@ -840,7 +844,10 @@
     .bulk-row-field {
       display: grid;
       gap: 7px;
+      min-width: 0;
     }
+
+    .bulk-nas-field { grid-column: 1 / -1; }
 
     .bulk-row-field span {
       color: var(--muted);
@@ -862,6 +869,33 @@
 
     .bulk-dialog-status.error {
       color: var(--danger);
+    }
+
+    .final-destination-dialog {
+      width: min(640px, calc(100vw - 24px));
+      max-height: 90vh;
+      padding: 0;
+      color: var(--ink);
+      background: rgba(13, 21, 33, 0.98);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      overflow-y: auto;
+    }
+
+    .final-destination-dialog::backdrop {
+      background: rgba(4, 8, 13, 0.72);
+      backdrop-filter: blur(10px);
+    }
+
+    .final-destination-dialog .bulk-dialog-copy {
+      overflow-wrap: anywhere;
+    }
+
+    .edit-final-destination {
+      margin-top: 8px;
+      min-height: 44px;
+      font-family: inherit;
+      font-size: 0.82rem;
     }
 
     .jobs-panel {
@@ -1268,6 +1302,7 @@
     }
 
     .state-pill[data-state="waiting_for_local_space"],
+    .state-pill[data-state="waiting_for_nas"],
     .state-pill[data-state="scan_paused"] {
       background: rgba(233, 178, 77, 0.14);
       color: var(--warning);
@@ -1532,8 +1567,8 @@
               <span class="meta-value">{{ settings.local_staging_root }}</span>
             </div>
             <div class="meta-card">
-              <span class="meta-label">NAS Stage</span>
-              <span class="meta-value">{{ settings.nas_staging_root }}</span>
+              <span class="meta-label">Default NAS Stage</span>
+              <span class="meta-value">{{ settings.default_nas_location.label }} · {{ settings.default_nas_location.path }}</span>
             </div>
             <div class="meta-card">
               <span class="meta-label">Aggregate Overflow Policy</span>
@@ -1622,11 +1657,21 @@
 
             <label class="field">
               <span>Staging Preference</span>
-              <select name="staging_preference">
+              <select id="staging-preference-select" name="staging_preference">
                 <option value="local">Local</option>
                 <option value="nas">NAS</option>
               </select>
-              <span class="hint">Local is default. Torrents above the local max use NAS intake staging automatically, while smaller local jobs follow the aggregate overflow policy. Final promotion still uses the chosen destination.</span>
+              <span class="hint">Local is default. Torrents above the local max use NAS intake staging automatically, while smaller local jobs follow the aggregate overflow policy. Local jobs retain {{ settings.default_nas_location.label }} as their NAS fallback when submitted. Final promotion still uses the chosen destination.</span>
+            </label>
+
+            <label id="nas-staging-field" class="field-wide" hidden>
+              <span>NAS Staging Location</span>
+              <select id="nas-staging-select" name="nas_staging_id" disabled>
+                {% for location in settings.effective_nas_locations %}
+                <option value="{{ location.id }}" data-label="{{ location.label }}" data-path="{{ location.path }}" data-mount-marker="{{ location.mount_marker or '' }}" {% if location.id == settings.default_nas_location.id %}selected{% endif %}>{{ location.label }} · {{ location.path }}</option>
+                {% endfor %}
+              </select>
+              <span class="hint">Temporary download staging only. Intake and qBittorrent must see this same mounted container path.</span>
             </label>
 
             <div class="field-wide">
@@ -1692,6 +1737,31 @@
       </div>
     </section>
 
+    <dialog id="final-destination-dialog" class="final-destination-dialog" aria-labelledby="final-destination-title" aria-describedby="final-destination-help">
+      <form id="final-destination-form">
+        <div class="bulk-dialog-head">
+          <div>
+            <h2 id="final-destination-title" class="bulk-dialog-title">Edit final location</h2>
+            <p id="final-destination-job" class="bulk-dialog-copy"></p>
+          </div>
+        </div>
+        <div class="bulk-dialog-controls">
+          <p id="final-destination-help" class="bulk-dialog-copy">Change where this torrent will go after a successful scan. Nothing moves now; its download staging location and final category stay unchanged. Editing locks once Intake records download completion or queues the scan.</p>
+          <label>
+            <span>Final parent path</span>
+            <input id="edit-final-parent-input" class="mono" type="text" list="edit-final-parent-suggestions" autocomplete="off" spellcheck="false" maxlength="4096" required aria-describedby="edit-final-parent-help">
+            <span id="edit-final-parent-help" class="hint">Use a container path under your allowed final roots, not a VM or NAS host path. A missing subfolder can be created during promotion when its configured storage root is available. The torrent's own file or folder name is added beneath this parent.</span>
+          </label>
+          <datalist id="edit-final-parent-suggestions"></datalist>
+          <p id="final-destination-status" class="bulk-dialog-status" role="status" aria-live="polite"></p>
+        </div>
+        <div class="bulk-dialog-actions">
+          <button id="final-destination-cancel" class="button-secondary" type="button">Cancel</button>
+          <button id="final-destination-save" class="button-primary" type="submit">Save final location</button>
+        </div>
+      </form>
+    </dialog>
+
     <div class="panel jobs-panel">
         <div class="jobs-head">
           <div>
@@ -1728,14 +1798,22 @@
             </div>
             <div class="jobs-toolbar-group">
               <button id="retry-selected-button" class="button-secondary toolbar-button" type="button">Retry Failed Selected</button>
+              <label class="toolbar-field nas-move-field">
+                <span>NAS staging target</span>
+                <select id="move-nas-staging-select" class="toolbar-select" aria-label="NAS staging target for selected queued jobs">
+                  {% for location in settings.effective_nas_locations %}
+                  <option value="{{ location.id }}" {% if location.id == settings.default_nas_location.id %}selected{% endif %}>{{ location.label }} · {{ location.path }}</option>
+                  {% endfor %}
+                </select>
+              </label>
               <button
                 id="move-selected-to-nas-button"
                 class="button-secondary toolbar-button"
                 type="button"
-                title="For selected jobs waiting for local space, pause qBittorrent, switch the active download staging path to the configured NAS staging root, and resume downloading. This does not perform the final clean-library promotion or change the chosen final destination."
+                title="For selected locally staged jobs waiting for local space or an unavailable NAS fallback, pause qBittorrent, switch the active download staging path to the selected NAS staging location, and resume downloading. This does not perform the final clean-library promotion or change the chosen final destination."
                 aria-describedby="nas-staging-action-help"
               >Use NAS Staging For Selected</button>
-              <span id="nas-staging-action-help" class="visually-hidden">This action changes only the temporary intake and download staging location. Scanning and promotion to the chosen final library destination still happen later.</span>
+              <span id="nas-staging-action-help" class="visually-hidden">This action changes only the temporary intake and download staging location for locally staged jobs waiting for local space or an unavailable NAS fallback. Scanning and promotion to the chosen final library destination still happen later.</span>
               <button id="delete-selected-button" class="button-secondary toolbar-button danger-soft" type="button">Forget Selected</button>
               <button id="retry-failed-button" class="button-secondary toolbar-button" type="button">Retry All Failed</button>
               <button id="clear-completed-button" class="button-secondary toolbar-button" type="button">Clear All Completed</button>
@@ -1790,11 +1868,13 @@
                 <td class="cell-select"><input class="job-checkbox" type="checkbox" data-job-id="{{ job.id }}"></td>
                 <td class="mono cell-id">{{ job.id }}</td>
                 <td class="cell-name">{{ job.torrent_name or job.torrent_file_name or '-' }}</td>
-                <td class="cell-state"><span class="state-pill" data-state="{{ job.state }}">{{ job.state }}</span></td>
-                <td class="mono cell-final-parent">{{ job.final_parent }}</td>
-                <td class="cell-stage">{{ job.staging_actual or job.staging_preference }}</td>
+                <td class="cell-state"><span class="state-pill" data-state="{{ job.state }}">{{ 'Waiting for NAS mount' if job.state == 'waiting_for_nas' else job.state }}</span></td>
+                <td class="mono cell-final-parent"><div>{{ job.final_parent }}</div>{% if job.can_edit_final_destination %}<button type="button" class="button-secondary edit-final-destination" data-edit-final-destination="{{ job.id }}" data-final-parent="{{ job.final_parent }}" data-torrent-name="{{ job.torrent_name or job.torrent_file_name or job.id }}" aria-haspopup="dialog" aria-controls="final-destination-dialog">Edit final location</button>{% endif %}</td>
+                <td class="cell-stage">{{ job.staging_actual or job.staging_preference }}{% if job.nas_staging_id %}<small>{{ 'NAS' if (job.staging_actual or job.staging_preference) == 'nas' else 'NAS fallback' }}: {{ job.nas_staging_label or job.nas_staging_id }} · {{ job.nas_staging_path or '' }}</small>{% endif %}</td>
                 <td class="mono cell-hash">{{ job.qbt_hash or '-' }}</td>
-                <td class="cell-last-error{% if job.last_error %} activity-error{% endif %}">{{ job.last_error or job.activity_summary or '-' }}</td>
+                <td class="cell-last-error{% if job.last_error %} activity-error{% endif %}">{{ job.last_error or job.activity_summary or '-' }}
+                  {% if job.hook_status %}<details class="job-hook-result" data-job-id="{{ job.id }}"><summary>{{ 'Copy' if job.hook_kind == 'copy' else 'Script' }} status: {{ job.hook_status }}</summary>{% if job.hook_kind == 'copy' and job.hook_destination %}<p>Copy destination: {{ job.hook_destination }}</p>{% endif %}{% if job.hook_error %}<p>{{ job.hook_error }}</p>{% endif %}{% if job.hook_exit_code is not none %}<p>Exit code: {{ job.hook_exit_code }}</p>{% endif %}{% if job.hook_output %}<p>{{ 'Copy' if job.hook_kind == 'copy' else 'Script' }} output:</p><pre>{{ job.hook_output }}</pre>{% endif %}</details>{% endif %}
+                </td>
               </tr>
               {% endfor %}
             </tbody>
@@ -1815,6 +1895,9 @@
     const settingsSearch = document.getElementById('settings-search');
     const settingsRuntimeControlsButton = document.getElementById('settings-runtime-controls-button');
     const jobForm = document.getElementById('job-form');
+    const stagingPreferenceSelect = document.getElementById('staging-preference-select');
+    const nasStagingSelect = document.getElementById('nas-staging-select');
+    const moveNasStagingSelect = document.getElementById('move-nas-staging-select');
     const finalParentInput = document.getElementById('final-parent-input');
     const finalCategoryInput = document.getElementById('final-category-input');
     const finalCategoryCombo = document.getElementById('final-category-combo');
@@ -1863,6 +1946,12 @@
     const bulkUseSameSettings = document.getElementById('bulk-use-same-settings');
     const bulkList = document.getElementById('bulk-list');
     const bulkTagsSummary = document.getElementById('bulk-tags-summary');
+    const finalDestinationDialog = document.getElementById('final-destination-dialog');
+    const finalDestinationForm = document.getElementById('final-destination-form');
+    const editFinalParentInput = document.getElementById('edit-final-parent-input');
+    const finalDestinationSave = document.getElementById('final-destination-save');
+    const finalDestinationCancel = document.getElementById('final-destination-cancel');
+    const finalDestinationStatus = document.getElementById('final-destination-status');
     const defaultFinalParentPrefix = finalParentInput.dataset.defaultPrefix || '/downloads';
     const managedQbtTag = {{ settings.managed_tag | tojson }};
     const maxCustomTags = {{ max_custom_tags }};
@@ -1892,6 +1981,9 @@
     let jobsRefreshTimer = null;
     let jobsRequestInFlight = false;
     let settingsReturnFocus = null;
+    let editingFinalDestination = null;
+    let finalDestinationSaving = false;
+    let editFinalPathTimer = null;
     const mobileHeroMediaQuery = window.matchMedia('(max-width: 720px)');
 
     function filterSettings() {
@@ -2175,6 +2267,7 @@
         final_parent: String(form.get('final_parent') || '').trim(),
         final_category: finalCategory || null,
         staging_preference: String(form.get('staging_preference') || 'local'),
+        nas_staging_id: form.get('staging_preference') === 'nas' ? nasStagingSelect.value : null,
         custom_tags: [...selectedCustomTags],
       };
     }
@@ -2196,6 +2289,12 @@
       const useSameSettings = bulkUseSameSettings.checked;
       bulkList.querySelectorAll('.bulk-final-parent, .bulk-final-category, .bulk-staging-preference').forEach((field) => {
         field.disabled = bulkSubmitting || useSameSettings;
+      });
+      bulkList.querySelectorAll('.bulk-row').forEach(row => {
+        const nasSelect = row.querySelector('.bulk-nas-staging');
+        const isNas = row.querySelector('.bulk-staging-preference').value === 'nas';
+        nasSelect.disabled = bulkSubmitting || useSameSettings || !isNas;
+        nasSelect.closest('label').hidden = !isNas;
       });
     }
 
@@ -2257,6 +2356,13 @@
       stagingLabel.appendChild(stagingSelect);
       row.appendChild(stagingLabel);
 
+      const nasLabel = document.createElement('label'); nasLabel.className = 'bulk-row-field bulk-nas-field';
+      const nasTitle = document.createElement('span'); nasTitle.textContent = 'NAS staging location';
+      const nasSelect = nasStagingSelect.cloneNode(true); nasSelect.removeAttribute('id'); nasSelect.removeAttribute('name');
+      nasSelect.className = 'bulk-nas-staging'; nasSelect.value = settings.nas_staging_id || nasStagingSelect.value;
+      nasLabel.append(nasTitle, nasSelect); row.append(nasLabel);
+      stagingSelect.addEventListener('change', syncBulkSettingsMode);
+
       return row;
     }
 
@@ -2295,6 +2401,7 @@
           final_parent: finalParent,
           final_category: finalCategory || null,
           staging_preference: stagingPreference,
+          nas_staging_id: stagingPreference === 'nas' ? row.querySelector('.bulk-nas-staging').value : null,
           custom_tags: [...sharedSettings.custom_tags],
         };
       });
@@ -2722,9 +2829,61 @@
       const pill = document.createElement('span');
       pill.className = 'state-pill';
       pill.dataset.state = state || '';
-      pill.textContent = formatFallback(state);
+      pill.textContent = state === 'waiting_for_nas' ? 'Waiting for NAS mount' : formatFallback(state);
       td.appendChild(pill);
       return td;
+    }
+
+    function createStageCell(job) {
+      const cell = createCell(job.staging_actual || job.staging_preference, 'cell-stage');
+      if (job.nas_staging_id || job.nas_staging_label || job.nas_staging_path) {
+        const detail = document.createElement('small');
+        const prefix = (job.staging_actual || job.staging_preference) === 'nas' ? 'NAS: ' : 'NAS fallback: ';
+        detail.textContent = `${prefix}${job.nas_staging_label || job.nas_staging_id || 'Saved NAS'}${job.nas_staging_path ? ` · ${job.nas_staging_path}` : ''}`;
+        cell.append(detail);
+      }
+      return cell;
+    }
+
+    function createHookResult(job) {
+      if (!job.hook_status) return null;
+      const isCopy = job.hook_kind === 'copy', actionName = isCopy ? 'Copy' : 'Script';
+      const details = document.createElement('details'); details.className = 'job-hook-result';
+      details.dataset.jobId = job.id;
+      const summary = document.createElement('summary'); summary.textContent = `${actionName} status: ${job.hook_status}`;
+      details.append(summary);
+      if (isCopy && job.hook_destination) {
+        const destination = document.createElement('p'); destination.textContent = `Copy destination: ${job.hook_destination}`;
+        details.append(destination);
+      }
+      const result = document.createElement('p');
+      result.textContent = [job.hook_error, job.hook_exit_code !== null && job.hook_exit_code !== undefined ? `Exit code: ${job.hook_exit_code}` : ''].filter(Boolean).join(' · ') || `${actionName} status is separate from the clean scan and final promotion result.`;
+      details.append(result);
+      if (job.hook_output) {
+        const outputLabel = document.createElement('p'); outputLabel.textContent = `${actionName} output:`;
+        const output = document.createElement('pre'); output.textContent = job.hook_output; details.append(outputLabel, output);
+      }
+      if (['failed', 'interrupted'].includes(job.hook_status)) {
+        const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'button-secondary';
+        retry.dataset.retryHook = job.id; retry.textContent = `Retry ${actionName.toLowerCase()}`;
+        retry.hidden = !window.TISettings.isAdmin(); retry.disabled = !window.TISettings.canRetryHook();
+        retry.addEventListener('click', async () => {
+          const warning = isCopy
+            ? 'Retry the copy after promotion? Inspect any partial copy first. Existing data will not be overwritten or deleted. This does not rerun scanning or promotion.'
+            : 'Run the post-promotion script again? A previous attempt may have partially completed. This does not rerun scanning or promotion.';
+          if (!confirm(warning)) return;
+          retry.disabled = true;
+          try {
+            const response = await window.TISettings.retryHook(job.id); await loadJobs();
+            flashJobsToolbarStatus(response.message || `${actionName} queued. Verify and resume Intake in Settings to run it.`);
+          }
+          catch (error) { result.textContent = String(error); retry.disabled = !window.TISettings.canRetryHook(); }
+        });
+        details.append(retry);
+        const hint = document.createElement('p'); hint.textContent = 'To retry, unlock administration and pause Intake in Settings, then wait for drained. '
+          + (isCopy ? 'Inspect any partial copy first; it will not be overwritten automatically.' : 'A retry may repeat effects of an earlier attempt.'); details.append(hint);
+      }
+      return details;
     }
 
     function createActivityCell(job) {
@@ -2740,6 +2899,7 @@
         td.classList.add('activity-detail');
       }
       td.appendChild(copy);
+      const hookResult = createHookResult(job); if (hookResult) td.append(hookResult);
 
       const hasProgress = job.scan_progress_percent !== null && job.scan_progress_percent !== undefined;
       const progress = Number(job.scan_progress_percent);
@@ -2789,6 +2949,67 @@
       return td;
     }
 
+    function createFinalParentCell(job) {
+      const td = document.createElement('td');
+      td.className = 'mono cell-final-parent';
+      const path = document.createElement('div');
+      path.textContent = job.final_parent || '-';
+      td.appendChild(path);
+      if (job.can_edit_final_destination) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'button-secondary edit-final-destination';
+        button.textContent = 'Edit final location';
+        button.dataset.editFinalDestination = job.id;
+        button.dataset.finalParent = job.final_parent;
+        button.dataset.torrentName = job.torrent_name || job.torrent_file_name || job.id;
+        button.setAttribute('aria-haspopup', 'dialog');
+        button.setAttribute('aria-controls', 'final-destination-dialog');
+        td.appendChild(button);
+      }
+      return td;
+    }
+
+    function openFinalDestination(button) {
+      // Capture the original value, not a live reference: the server rejects stale edits.
+      editingFinalDestination = {id: button.dataset.editFinalDestination, expected: button.dataset.finalParent};
+      document.getElementById('final-destination-job').textContent = button.dataset.torrentName;
+      editFinalParentInput.value = editingFinalDestination.expected;
+      finalDestinationStatus.textContent = '';
+      finalDestinationStatus.classList.remove('error');
+      finalDestinationDialog.showModal();
+      editFinalParentInput.focus();
+      loadFinalPathSuggestions(editFinalParentInput, 'edit-final-parent-suggestions');
+    }
+
+    async function saveFinalDestination(event) {
+      event.preventDefault();
+      if (!editingFinalDestination || finalDestinationSaving) return;
+      finalDestinationSaving = true;
+      editFinalParentInput.disabled = finalDestinationSave.disabled = finalDestinationCancel.disabled = true;
+      finalDestinationStatus.textContent = 'Saving final location…';
+      finalDestinationStatus.classList.remove('error');
+      try {
+        const response = await fetch(`/jobs/${encodeURIComponent(editingFinalDestination.id)}/final-destination`, {
+          method: 'PATCH',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({final_parent: editFinalParentInput.value.trim(), expected_final_parent: editingFinalDestination.expected}),
+        });
+        if (!response.ok) throw new Error(await readErrorDetail(response));
+        const updatedJob = await response.json();
+        latestJobs = latestJobs.map(job => job.id === updatedJob.id ? updatedJob : job);
+        renderJobs(latestJobs);
+        finalDestinationDialog.close();
+        flashJobsToolbarStatus('Final location saved. Download staging and category are unchanged; files move only after a successful scan.');
+      } catch (error) {
+        finalDestinationStatus.textContent = String(error);
+        finalDestinationStatus.classList.add('error');
+      } finally {
+        finalDestinationSaving = false;
+        editFinalParentInput.disabled = finalDestinationSave.disabled = finalDestinationCancel.disabled = false;
+      }
+    }
+
     function compareJobsByCreatedAt(left, right) {
       const leftMs = new Date(left.created_at || 0).getTime();
       const rightMs = new Date(right.created_at || 0).getTime();
@@ -2818,7 +3039,7 @@
       const retryEligible = jobs.filter((job) => selectedJobIds.has(job.id) && job.state === 'error').length;
       const retryIneligibleSelected = jobs.filter((job) => selectedJobIds.has(job.id) && job.state !== 'error').length;
       const moveNasEligible = jobs.filter(
-        (job) => selectedJobIds.has(job.id) && job.state === 'waiting_for_local_space' && job.staging_actual === 'local'
+        (job) => selectedJobIds.has(job.id) && ['waiting_for_local_space', 'waiting_for_nas'].includes(job.state) && job.staging_actual === 'local'
       ).length;
       const deleteEligible = jobs.filter((job) => selectedJobIds.has(job.id)).length;
       const scanNextEligible = jobs.filter(
@@ -2893,6 +3114,7 @@
     }
 
     function renderJobs(jobs) {
+      const openHookResults = new Set([...jobsTbody.querySelectorAll('.job-hook-result[open]')].map(node => node.dataset.jobId));
       jobsTbody.innerHTML = '';
       const sortedJobs = getDisplayedJobs();
 
@@ -2916,10 +3138,11 @@
         row.appendChild(createCell(job.id, 'mono cell-id'));
         row.appendChild(createCell(job.torrent_name || job.torrent_file_name, 'cell-name'));
         row.appendChild(createStateCell(job.state));
-        row.appendChild(createCell(job.final_parent, 'mono cell-final-parent'));
-        row.appendChild(createCell(job.staging_actual || job.staging_preference, 'cell-stage'));
+        row.appendChild(createFinalParentCell(job));
+        row.appendChild(createStageCell(job));
         row.appendChild(createCell(job.qbt_hash, 'mono cell-hash'));
         row.appendChild(createActivityCell(job));
+        const hookResult = row.querySelector('.job-hook-result'); if (hookResult) hookResult.open = openHookResults.has(job.id);
         jobsTbody.appendChild(row);
       });
 
@@ -2980,9 +3203,9 @@
       }
     }
 
-    async function loadFinalPathSuggestions() {
+    async function loadFinalPathSuggestions(input = finalParentInput, listId = 'final-parent-suggestions') {
       try {
-        const rawPrefix = finalParentInput.value.trim();
+        const rawPrefix = input.value.trim();
         const prefix = encodeURIComponent(rawPrefix);
         const pathsRes = await fetch(`/fs/final-path-suggestions?prefix=${prefix}`);
         if (!pathsRes.ok) return;
@@ -2994,7 +3217,7 @@
           return path.toLowerCase().startsWith(loweredPrefix);
         });
         const paths = Array.from(new Set([...filteredKnownPaths, ...filesystemPaths])).sort();
-        replaceOptions('final-parent-suggestions', paths);
+        if (input.value.trim() === rawPrefix) replaceOptions(listId, paths);
       } catch (error) {}
     }
 
@@ -3056,6 +3279,12 @@
       const displayedIds = new Set(getDisplayedJobs().map((job) => job.id));
       return [...selectedJobIds].filter((jobId) => displayedIds.has(jobId));
     }
+
+    stagingPreferenceSelect.addEventListener('change', () => {
+      const isNas = stagingPreferenceSelect.value === 'nas';
+      document.getElementById('nas-staging-field').hidden = !isNas;
+      nasStagingSelect.disabled = !isNas;
+    });
 
     jobForm.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -3156,7 +3385,23 @@
       if (finalPathTimer) clearTimeout(finalPathTimer);
       finalPathTimer = setTimeout(loadFinalPathSuggestions, 140);
     });
-    finalParentInput.addEventListener('focus', loadFinalPathSuggestions);
+    finalParentInput.addEventListener('focus', () => loadFinalPathSuggestions());
+    finalDestinationForm.addEventListener('submit', saveFinalDestination);
+    finalDestinationCancel.addEventListener('click', () => finalDestinationDialog.close());
+    finalDestinationDialog.addEventListener('cancel', event => {
+      if (finalDestinationSaving) event.preventDefault();
+    });
+    finalDestinationDialog.addEventListener('close', () => {
+      const jobId = editingFinalDestination?.id;
+      editingFinalDestination = null;
+      if (editFinalPathTimer) clearTimeout(editFinalPathTimer);
+      const button = [...jobsTbody.querySelectorAll('[data-edit-final-destination]')].find(node => node.dataset.editFinalDestination === jobId);
+      (button || refreshJobsButton).focus({preventScroll: true});
+    });
+    editFinalParentInput.addEventListener('input', () => {
+      if (editFinalPathTimer) clearTimeout(editFinalPathTimer);
+      editFinalPathTimer = setTimeout(() => loadFinalPathSuggestions(editFinalParentInput, 'edit-final-parent-suggestions'), 140);
+    });
     finalCategoryInput.addEventListener('focus', () => openCategoryMenu({ showAll: !finalCategoryInput.value.trim() }));
     finalCategoryInput.addEventListener('input', () => openCategoryMenu());
     finalCategoryInput.addEventListener('keydown', (event) => {
@@ -3276,6 +3521,10 @@
       }
       renderJobs(latestJobs);
     });
+    jobsTbody.addEventListener('click', event => {
+      const button = event.target.closest('[data-edit-final-destination]');
+      if (button && jobsTbody.contains(button)) openFinalDestination(button);
+    });
     retrySelectedButton.addEventListener('click', () => {
       const jobIds = getSelectedJobIds();
       if (jobIds.length === 0) return;
@@ -3290,7 +3539,7 @@
       if (jobIds.length === 0) return;
       runBulkAction({
         url: '/jobs/bulk-move-to-nas',
-        payload: { job_ids: jobIds },
+        payload: { job_ids: jobIds, nas_staging_id: moveNasStagingSelect.value },
         label: 'Use NAS staging',
       });
     });

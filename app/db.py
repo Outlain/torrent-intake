@@ -55,6 +55,21 @@ SCHEMA_ADDITIONS: dict[str, dict[str, str]] = {
         "custom_tags_json": "TEXT NOT NULL DEFAULT '[]'",
         "torrent_file_name": "TEXT",
         "torrent_file_data": "BLOB",
+        "nas_staging_id": "VARCHAR(64)",
+        "nas_staging_label": "VARCHAR(100)",
+        "nas_staging_path": "TEXT",
+        "nas_mount_marker": "TEXT",
+        "hook_status": "VARCHAR(32)",
+        "hook_kind": "VARCHAR(16)",
+        "hook_destination": "TEXT",
+        "hook_due_at": "DATETIME",
+        "hook_started_at": "DATETIME",
+        "hook_finished_at": "DATETIME",
+        "hook_error": "TEXT",
+        "hook_output": "TEXT",
+        "hook_script": "TEXT",
+        "hook_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "hook_exit_code": "INTEGER",
     },
     "scan_runs": {
         "current_file_started_at": "DATETIME",
@@ -83,6 +98,7 @@ SCHEMA_ADDITIONS: dict[str, dict[str, str]] = {
 }
 
 SCHEMA_INDEXES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "ix_jobs_hook_due": ("jobs", ("hook_status", "hook_due_at")),
     "ix_scan_files_job_status_scanned": (
         "scan_files",
         ("job_id", "status", "scanned_at"),

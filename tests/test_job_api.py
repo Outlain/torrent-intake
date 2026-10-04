@@ -13,6 +13,7 @@ class JobApiTagForwardingTests(unittest.TestCase):
             magnet_uri=f"magnet:?xt=urn:btih:{'d' * 40}",
             final_parent="/downloads/Movies",
             custom_tags=["Review"],
+            staging_preference="nas", nas_staging_id="second-nas",
         )
         db = MagicMock()
 
@@ -21,6 +22,7 @@ class JobApiTagForwardingTests(unittest.TestCase):
             self.assertEqual(create_job(payload, db), "created-job")
 
         self.assertEqual(service.submit_job.call_args.kwargs["custom_tags"], ["Review"])
+        self.assertEqual(service.submit_job.call_args.kwargs["nas_staging_id"], "second-nas")
 
     def test_bulk_create_forwards_each_custom_tag_list(self) -> None:
         payload = JobBatchCreate(
@@ -29,11 +31,13 @@ class JobApiTagForwardingTests(unittest.TestCase):
                     "magnet_uri": f"magnet:?xt=urn:btih:{'e' * 40}",
                     "final_parent": "/downloads/Movies",
                     "custom_tags": ["Review", "Long term"],
+                    "nas_staging_id": "first-nas",
                 },
                 {
                     "magnet_uri": f"magnet:?xt=urn:btih:{'f' * 40}",
                     "final_parent": "/downloads/Shows",
                     "custom_tags": ["Needs subtitles"],
+                    "nas_staging_id": "second-nas",
                 },
             ]
         )
@@ -43,6 +47,8 @@ class JobApiTagForwardingTests(unittest.TestCase):
             result = create_jobs_bulk(payload, MagicMock())
 
         self.assertEqual(result["created"], 2)
+        self.assertEqual([call.kwargs["nas_staging_id"] for call in service.submit_job.call_args_list],
+                         ["first-nas", "second-nas"])
         self.assertEqual(
             [call.kwargs["custom_tags"] for call in service.submit_job.call_args_list],
             [["Review", "Long term"], ["Needs subtitles"]],

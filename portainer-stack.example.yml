@@ -15,6 +15,10 @@ services:
     # environment:
     #   TI_QBT_HOST: ${TI_QBT_HOST}
     #   TI_INFECTED_ACTION: ${TI_INFECTED_ACTION}
+    # Built-in Copy after completion is configured in the UI; no script/env needed.
+    # Mount /copy-target below and provision its marker before enabling in Settings.
+    # Advanced custom-script alternative only (mutually exclusive with built-in copy):
+    #   TI_POST_PROMOTION_SCRIPT: /hooks/after-promotion-copy.py
     volumes:
       - ${TI_DATA_HOST_DIR:-/opt/docker/torrent-intake/data}:/app/data:rw
       - ${TI_LOCAL_STAGING_HOST_DIR:-/mnt/bulk/docker/torrent-intake/staging}:/staging-local:rw
@@ -22,6 +26,24 @@ services:
       - ${TI_EVENTS_HOST_DIR:-/opt/docker/clamav-shared/events/torrent-intake}:/events:rw
       - ${TI_QUARANTINE_HOST_DIR:-/opt/docker/clamav-shared/quarantine/torrent-intake}:/quarantine:rw
       - ${TI_CLAMD_SOCKET_HOST_DIR:-/opt/docker/clamav-shared/sockets/torrent-intake}:/run/clamav:rw
+      # Custom scripts ONLY: not needed for built-in Copy after completion.
+      # Optional operator-owned scripts, executable/readable by INTAKE_UID/GID.
+      # - type: bind
+      #   source: ${TI_HOOKS_HOST_DIR:-/opt/docker/torrent-intake/hooks}
+      #   target: /hooks
+      #   read_only: true
+      #   bind:
+      #     create_host_path: false
+      # Optional ALREADY MOUNTED copy target: Intake only, not qB or ClamD.
+      # Set /copy-target or a subdirectory in the UI; that directory needs
+      # a pre-existing .intake-copy-mount marker on the intended filesystem.
+      # create_host_path:false checks existence, not that NFS is mounted.
+      # - type: bind
+      #   source: ${TI_COPY_TARGET_HOST_DIR:?set_existing_host_mount}
+      #   target: /copy-target
+      #   read_only: false
+      #   bind:
+      #     create_host_path: false
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777
     ports:

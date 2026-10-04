@@ -10,7 +10,7 @@
 .settings-inline input { flex: 1 1 200px; min-width: 0; }
 .settings-navigation { display: grid; gap: 8px; }
 .settings-content label { display: block; margin: 10px 0 6px; font-weight: 600; }
-.settings-content input:not([type=checkbox]), .settings-content select { width: 100%; box-sizing: border-box; min-width: 0; }
+.settings-content input:not([type=checkbox]):not([type=radio]), .settings-content select { width: 100%; box-sizing: border-box; min-width: 0; }
 .settings-content .settings-check { display: flex; gap: 10px; align-items: flex-start; font-weight: 500; line-height: 1.5; }
 .settings-check input { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 3px; }
 .settings-content button { min-height: 44px; white-space: normal; }
@@ -34,6 +34,15 @@
 #settings-review button { margin: 8px 8px 0 0; }
 #setup-results { padding-left: 20px; overflow-wrap: anywhere; }
 #setup-results:empty, #admin-result:empty { display: none; }
+.nas-location-row { display: grid; gap: 10px; min-width: 0; margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
+.nas-location-row legend { padding: 0 6px; color: var(--muted); overflow-wrap: anywhere; }
+.nas-location-row label { display: grid; gap: 6px; }
+.nas-location-row input[type=radio] { width: 18px; height: 18px; }
+.job-hook-result { margin-top: 10px; font-size: .85rem; overflow-wrap: anywhere; }
+.job-hook-result summary { cursor: pointer; }
+.job-hook-result pre { max-height: 180px; max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.job-hook-result button { margin-top: 8px; }
+.cell-stage small { display: block; margin-top: 5px; overflow-wrap: anywhere; }
 @media (max-width: 720px) {
   .settings-head { padding: 12px 14px; }
   .settings-head h2 { font-size: 1.3rem; }

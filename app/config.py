@@ -2,7 +2,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, DotEnvSettingsSource, EnvSettingsSource, SettingsConfigDict
 
 from .tags import normalize_managed_tag
@@ -25,6 +25,31 @@ def saved_settings() -> dict:
     return values
 
 
+class NasStagingLocation(BaseModel):
+    id: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")
+    label: str = Field(min_length=1, max_length=100)
+    path: str
+    mount_marker: str | None = None
+
+    @field_validator("path", "mount_marker")
+    @classmethod
+    def absolute_path(cls, value):
+        if value is None:
+            return None
+        if not value.startswith("/") or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("Use an absolute container path without control characters")
+        if ".." in Path(value).parts:
+            raise ValueError("Parent traversal is not allowed")
+        return str(Path(value))
+
+    @field_validator("label")
+    @classmethod
+    def clean_label(cls, value):
+        if not value.strip() or any(ord(c) < 32 for c in value):
+            raise ValueError("Use a non-empty label without control characters")
+        return value.strip()
+
+
 class Settings(BaseSettings):
     app_name: str = "torrent-intake"
     debug: bool = False
@@ -44,6 +69,8 @@ class Settings(BaseSettings):
 
     local_staging_root: str = "/staging-local"
     nas_staging_root: str = "/downloads/torrent-intake/staging"
+    nas_staging_locations: list[NasStagingLocation] = Field(default_factory=list, max_length=32)
+    default_nas_staging_id: str | None = None
     final_parent_prefix: str = "/downloads"
     final_parent_prefixes: str | None = None
 
@@ -92,6 +119,13 @@ class Settings(BaseSettings):
     quarantine_root: str = "/quarantine"
     event_dir: str = "/events"
 
+    post_promotion_enabled: bool = False
+    post_promotion_script: str | None = None
+    post_promotion_copy_enabled: bool = False
+    post_promotion_copy_destination: str | None = None
+    post_promotion_delay_seconds: int = Field(default=5, ge=0, le=3600)
+    post_promotion_timeout_seconds: int = Field(default=7200, ge=1, le=604800)
+
     ui_title: str = "Torrent Intake"
 
     model_config = SettingsConfigDict(
@@ -111,6 +145,76 @@ class Settings(BaseSettings):
         # qBittorrent silently ignores invalid tags on torrent-add requests.
         # This tag is an ownership credential, so fail startup instead.
         return normalize_managed_tag(value)
+
+    @field_validator("post_promotion_copy_destination")
+    @classmethod
+    def validate_copy_destination(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("Copy destination must not contain control characters")
+        value = value.strip()
+        if not value:
+            return None
+        path = Path(value)
+        if (not path.is_absolute() or ".." in path.parts
+                or not path.is_relative_to("/copy-target")):
+            raise ValueError("Copy destination must be /copy-target or a subdirectory of that mount")
+        return str(path)
+
+    @model_validator(mode="after")
+    def validate_locations_and_hook(self):
+        locations = self.effective_nas_locations
+        ids = [location.id for location in locations]
+        if len(set(ids)) != len(ids):
+            raise ValueError("NAS location IDs must be unique")
+        if self.default_nas_staging_id is not None and self.default_nas_staging_id not in ids:
+            raise ValueError("The default NAS location must refer to a configured location")
+        if len(locations) > 1 and not self.default_nas_staging_id:
+            raise ValueError("Select exactly one automatic NAS default")
+        # Check explicit new registries strictly without breaking old mount layouts.
+        roots = [Path(self.local_staging_root).resolve()]
+        operational = [Path(value).resolve() for value in (
+            "/app", "/state", "/events", "/hooks", "/copy-target", "/var/lib/clamav", "/quarantine",
+            "/downloads/docker", self.data_dir, self.event_dir, self.quarantine_root,
+        )]
+        for location in self.nas_staging_locations:
+            root = Path(location.path).resolve()
+            if any(root == p or p in root.parents or root in p.parents for p in operational):
+                raise ValueError("NAS staging cannot use an operational directory")
+            if any(root == p or root in p.parents or p in root.parents for p in roots):
+                raise ValueError("Staging directories must not duplicate or overlap one another")
+            if str(root) in self.allowed_final_parent_prefixes:
+                raise ValueError("Use a staging subdirectory, not an entire final media root")
+            roots.append(root)
+        if self.post_promotion_script:
+            path = Path(self.post_promotion_script)
+            if not path.is_absolute() or ".." in path.parts or Path("/hooks") not in path.parents:
+                raise ValueError("The trusted post-promotion executable must be under /hooks")
+        if self.post_promotion_enabled and not self.post_promotion_script:
+            raise ValueError("Configure TI_POST_PROMOTION_SCRIPT before enabling the hook")
+        if self.post_promotion_copy_enabled and self.post_promotion_enabled:
+            raise ValueError("Choose either built-in copying or a custom script, not both")
+        if self.post_promotion_copy_enabled and not self.post_promotion_copy_destination:
+            raise ValueError("Set the copy destination before enabling built-in copying")
+        return self
+
+    @property
+    def effective_nas_locations(self) -> list[NasStagingLocation]:
+        return self.nas_staging_locations or [NasStagingLocation(
+            id="primary", label="Main NAS", path=self.nas_staging_root,
+        )]
+
+    @property
+    def default_nas_location(self) -> NasStagingLocation:
+        return self.nas_location(self.default_nas_staging_id)
+
+    def nas_location(self, location_id: str | None = None) -> NasStagingLocation:
+        location_id = location_id or self.default_nas_staging_id or self.effective_nas_locations[0].id
+        for location in self.effective_nas_locations:
+            if location.id == location_id:
+                return location
+        raise ValueError(f"Unknown NAS staging location: {location_id}")
 
     @property
     def local_max_bytes(self) -> int:

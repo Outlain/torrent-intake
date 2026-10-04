@@ -38,8 +38,10 @@ def canonical_final_parent(value: str, settings) -> str:
         "/state",
         "/var/lib/clamav",
         "/quarantine",
+        "/copy-target",
         settings.local_staging_root,
         settings.nas_staging_root,
+        *(location.path for location in getattr(settings, "effective_nas_locations", ())),
     }
     for raw_blocked in blocked_values:
         blocked = _clean_absolute(raw_blocked, "blocked operational path")

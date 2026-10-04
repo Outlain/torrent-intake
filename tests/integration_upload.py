@@ -76,9 +76,9 @@ def main():
                 time.sleep(0.1)
             assert server.started
 
-            def send(path, data, content_type):
+            def send(path, data, content_type, *, method="POST"):
                 request = urllib.request.Request("http://127.0.0.1:18083" + path, data=data,
-                                                 headers={"Content-Type": content_type})
+                                                 headers={"Content-Type": content_type}, method=method)
                 try:
                     with urllib.request.urlopen(request, timeout=30) as response:
                         return response.status, json.load(response)
@@ -113,6 +113,29 @@ def main():
                     assert {"torrent_intake", job.unique_tag, "Review"} <= set(matches[0].tags.split(", "))
                     trackers = client.torrents_trackers(job.qbt_hash)
                     assert any("private-passkey" in tracker.url for tracker in trackers)
+                    torrent_hash, category, tags = job.qbt_hash, matches[0].category, matches[0].tags
+                    staging, nas_choice = job.staging_root_actual, job.nas_staging_path
+                edited_parent = f"/downloads/EditedShows-{number}"
+                edit = {"final_parent": edited_parent, "expected_final_parent": settings["final_parent"]}
+                status, updated = send(f"/jobs/{identifier}/final-destination", json.dumps(edit).encode(),
+                                       "application/json", method="PATCH")
+                assert status == 200, updated
+                assert updated["final_parent"] == edited_parent
+                assert updated["can_edit_final_destination"] is True
+                with Session(engine) as db:
+                    job = db.get(Job, identifier)
+                    assert job.final_parent == edited_parent and job.final_category == "Shows"
+                    assert (job.staging_root_actual, job.nas_staging_path) == (staging, nas_choice)
+                live = client.torrents_info(torrent_hashes=torrent_hash)[0]
+                assert live.save_path.rstrip("/") == staging, "Editing the final destination must not move the download"
+                assert (live.category, live.tags) == (category, tags)
+                status, _ = send(f"/jobs/{identifier}/final-destination", json.dumps(edit).encode(),
+                                 "application/json", method="PATCH")
+                assert status == 409, "A stale open editor must not overwrite another saved destination"
+                status, _ = send(f"/jobs/{identifier}/final-destination", json.dumps({
+                    "final_parent": "/app/data", "expected_final_parent": edited_parent,
+                }).encode(), "application/json", method="PATCH")
+                assert status in {409, 422}, "Operational paths must never become final destinations"
                 duplicate_status, _ = send("/jobs/torrent", body, "multipart/form-data; boundary=test-boundary")
                 assert duplicate_status == 409
                 if b"pieces" in info:
@@ -120,7 +143,7 @@ def main():
                     assert status == 409, "upload/magnet duplicates must not create a second job"
             with Session(engine) as db:
                 assert db.query(Job).count() == 3
-            print(f"PASS real qBittorrent {version}: v1/v2/hybrid multipart uploads, original bytes, tracker preservation, staging/tags, hash resolution and file/magnet duplicates")
+            print(f"PASS real qBittorrent {version}: v1/v2/hybrid multipart uploads, original bytes, tracker preservation, staging/tags, hash resolution, file/magnet duplicates, persisted final-destination HTTP edits without moving downloads, stale-editor rejection")
         finally:
             if server:
                 server.should_exit = True

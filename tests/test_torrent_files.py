@@ -145,7 +145,10 @@ class TorrentServiceTests(unittest.TestCase):
 
     def test_original_bytes_use_same_staging_category_and_tags(self):
         for preference, root in (("local", "/staging-local"), ("nas", "/downloads/torrent-intake/staging")):
-            job = self.submit(staging_preference=preference)
+            # This transport unit test does not have deployment bind mounts.
+            # Actual unavailable/read-only/marker behavior is tested separately.
+            with patch("app.service.require_storage"):
+                job = self.submit(staging_preference=preference)
             call = self.service.qbt.add_torrent.call_args.kwargs
             self.assertEqual(call["torrent_file_data"], torrent())
             self.assertEqual(call["save_path"], root)

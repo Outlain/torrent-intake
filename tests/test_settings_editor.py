@@ -61,6 +61,33 @@ class SettingsEditorTests(unittest.TestCase):
             self.assertTrue(raised.exception.fields)
             self.assertNotIn("never-expose", repr(raised.exception.fields))
 
+    def test_builtin_copy_can_be_configured_without_script_environment(self):
+        candidate, changes = validate_draft(self.settings, {
+            "post_promotion_copy_enabled": True,
+            "post_promotion_copy_destination": "/copy-target/intake-copies",
+        })
+        self.assertTrue(candidate.post_promotion_copy_enabled)
+        self.assertIsNone(candidate.post_promotion_script)
+        self.assertTrue(all(change["advanced"] for change in changes))
+        persist_settings(candidate)
+        self.assertEqual(Settings().post_promotion_copy_destination, "/copy-target/intake-copies")
+
+    def test_builtin_copy_rejects_unsafe_paths_and_conflicting_modes(self):
+        for destination in ("/app/data", "/downloads/Movies", "/copy-target/../app", "relative", "/copy-target-bad", "/copy-target/x\n"):
+            with self.subTest(destination=destination), self.assertRaises(SettingsEditError):
+                validate_draft(self.settings, {
+                    "post_promotion_copy_enabled": True,
+                    "post_promotion_copy_destination": destination,
+                })
+        with self.assertRaises(SettingsEditError):
+            validate_draft(self.settings, {"post_promotion_copy_enabled": True})
+        scripted = self.settings.model_copy(update={"post_promotion_script": "/hooks/test.py"})
+        persist_settings(scripted)
+        with self.assertRaisesRegex(SettingsEditError, "Check"):
+            validate_draft(scripted, {"post_promotion_copy_enabled": True,
+                                      "post_promotion_enabled": True,
+                                      "post_promotion_copy_destination": "/copy-target"})
+
     def test_secret_replacements_clear_and_redacted_review(self):
         candidate, changes = validate_draft(self.settings, {"qbt_password": ""})
         self.assertEqual(candidate.qbt_password, "test-secret")
@@ -182,6 +209,16 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_storage_check_reports_permission_errors_without_crashing(self):
         with patch.object(main.Path, "is_dir", side_effect=PermissionError):
             self.assertTrue(all(not check["ok"] for check in main._storage_checks()))
+
+    async def test_copy_unavailable_is_an_optional_setup_warning(self):
+        main.settings = self.settings.model_copy(update={
+            "post_promotion_copy_enabled": True, "post_promotion_copy_destination": "/copy-target/library",
+        })
+        with patch.object(main, "validate_copy_destination", side_effect=FileNotFoundError("copy mount offline")):
+            check = next(item for item in main._storage_checks() if item["name"].startswith("Copy destination:"))
+        self.assertFalse(check["ok"])
+        self.assertFalse(check["required"])
+        self.assertIn("copy mount offline", check["message"])
 
 
 if __name__ == "__main__":

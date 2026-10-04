@@ -1,5 +1,6 @@
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -60,6 +61,20 @@ class SettingsViewTests(unittest.TestCase):
         self.assertIn("remove the torrent and delete its data", infected["current_effect"])
         self.assertIn("Compose or Portainer", infected["change_hint"])
 
+    def test_builtin_copy_fields_are_advanced_and_scripts_remain_deployment_only(self) -> None:
+        items = catalog_items(build_settings_catalog(Settings()))
+        for name in ("post_promotion_copy_enabled", "post_promotion_copy_destination"):
+            self.assertTrue(items[name]["editable"])
+            self.assertTrue(items[name]["advanced"])
+            self.assertEqual(items[name]["permission"], "advanced")
+        self.assertFalse(items["post_promotion_script"]["editable"])
+        self.assertEqual(items["post_promotion_script"]["permission"], "deployment")
+
+        with patch.dict("os.environ", {"TI_POST_PROMOTION_COPY_ENABLED": "false"}):
+            overridden = catalog_items(build_settings_catalog(Settings()))
+            self.assertFalse(overridden["post_promotion_copy_enabled"]["editable"])
+            self.assertEqual(overridden["post_promotion_copy_enabled"]["permission"], "environment")
+
     def test_template_renders_settings_panel_without_secret_values(self) -> None:
         settings = Settings(
             infected_action="delete",
@@ -82,6 +97,12 @@ class SettingsViewTests(unittest.TestCase):
 
         self.assertIn('id="settings-dialog"', html)
         self.assertIn("Settings &amp; Help", html)
+        self.assertIn("Optional copy after successful promotion", html)
+        self.assertIn(".intake-copy-mount", html)
+        self.assertIn("No custom script", html)
+        self.assertIn('id="edit-post_promotion_copy_enabled"', html)
+        self.assertIn('id="edit-post_promotion_copy_destination"', html)
+        self.assertNotIn('id="edit-post_promotion_script"', html)
         self.assertIn("TI_INFECTED_ACTION", html)
         self.assertIn("<code data-active-value>delete</code>", html)
         self.assertIn("<code>hold</code>", html)
