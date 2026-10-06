@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import hashlib
 import io
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -25,16 +26,30 @@ CHAPTER_HASH_PAYLOAD = b"".join(
     len(title.encode()).to_bytes(2, "big") + title.encode() + b"\0\0\0\x0cencd\0\0\x01\0"
     for title in CHAPTER_HASH_TITLES
 )
+COVER_ART_CODECS = ("mjpeg", "png")
 
 
 def prepare() -> None:
     definitions = ROOT / "defs"
     definitions.mkdir()
     (definitions / "test.ndb").write_text(f"Test.EICAR:0:*:{EICAR.hex()}\n")
-    (definitions / "test.hdb").write_text(
+    hash_definitions = (
         f"{hashlib.md5(HASH_ONLY_ATTACHMENT).hexdigest()}:{len(HASH_ONLY_ATTACHMENT)}:Test.AttachmentHash\n"
         f"{hashlib.md5(CHAPTER_HASH_PAYLOAD).hexdigest()}:{len(CHAPTER_HASH_PAYLOAD)}:Test.ChapterHash\n"
     )
+    # Sign complete, valid images before ClamD starts. The MP4 containers do not
+    # match these hashes: detection requires scanning each extracted cover whole.
+    for codec in COVER_ART_CODECS:
+        for kind, color in (("clean", "blue"), ("hash", "red")):
+            content = subprocess.run([
+                "ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                f"color=c={color}:size=32x32", "-frames:v", "1", "-threads", "1",
+                "-c:v", codec, "-f", "image2pipe", "pipe:1",
+            ], check=True, capture_output=True, timeout=30).stdout
+            (ROOT / f"cover-{codec}-{kind}.image").write_bytes(content)
+            if kind == "hash":
+                hash_definitions += f"{hashlib.md5(content).hexdigest()}:{len(content)}:Test.CoverHash.{codec}\n"
+    (definitions / "test.hdb").write_text(hash_definitions)
     benchmark = os.environ.get("TI_TEST_BENCHMARK_WINDOWS") == "1"
     if benchmark:
         (definitions / "test.ldb").write_text(
@@ -84,6 +99,19 @@ def make_chapter_video(name: str, titles: tuple[str, ...]) -> Path:
     return path
 
 
+def make_cover_video(codec: str, kind: str) -> Path:
+    path = ROOT / f"cover-{codec}-{kind}.mp4"
+    # MP4's covr atom creates a real attached_pic video stream, but has no
+    # Matroska-style filename or mimetype tags. Do not manufacture those tags.
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i", "color=size=32x32:rate=1",
+        "-f", "image2pipe", "-c:v", codec, "-i", str(path.with_suffix(".image")),
+        "-map", "0:v:0", "-map", "1:v:0", "-t", "1", "-threads", "1",
+        "-c:v:0", "mpeg4", "-c:v:1", "copy", "-disposition:v:1", "attached_pic", str(path),
+    ], check=True, timeout=30)
+    return path
+
+
 def run() -> None:
     scanner = ScannerService()
     scanner.settings = scanner.settings.model_copy(update={
@@ -119,6 +147,10 @@ def run() -> None:
                     "-frames:v", "1", "-threads", "1", str(ROOT / "cover.png")], check=True, timeout=30)
     picture_mkv = make_video("picture.mkv", "matroska", attachment="cover.png",
                              filename="cover.png", mimetype="image/png")
+    cover_cases = tuple(
+        (make_cover_video(codec, kind), codec, kind == "hash")
+        for codec in COVER_ART_CODECS for kind in ("clean", "hash")
+    )
     # Synthetic TTC-named objects test admission/extraction/scanning, not font
     # rendering or conformance. A filename must never exempt bytes from ClamD.
     (ROOT / "font-collection.ttc").write_bytes(b"Synthetic harmless font-collection test attachment")
@@ -182,6 +214,42 @@ def run() -> None:
     check(hash_mkv, infected=True, method="clamd_native_with_attachments", threat="AttachmentHash")
     check(ttc_hash, infected=True, method="clamd_native_with_attachments", threat="AttachmentHash")
 
+    for path, codec, expected_infected in cover_cases:
+        raw_probe = json.loads(subprocess.run([
+            "ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path),
+        ], check=True, capture_output=True, timeout=30).stdout)
+        pictures = [stream for stream in raw_probe["streams"]
+                    if stream.get("disposition", {}).get("attached_pic") == 1]
+        assert len(pictures) == 1, raw_probe
+        assert pictures[0]["codec_type"] == "video" and pictures[0]["codec_name"] == codec, pictures
+        assert not {"filename", "mimetype"}.intersection(pictures[0].get("tags", {})), pictures
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            expected = file_identity(os.fstat(descriptor))
+            probe = scanner._probe_large_media_descriptor(descriptor, str(path))
+            assert len(probe.attachments) == 1 and probe.attachments[0].is_picture, probe
+            assert probe.attachments[0].index == pictures[0]["index"], probe
+            assert probe.attachments[0].size_bytes is None, probe
+            scanned_images = []
+            real_scan = scanner._scan_descriptor
+
+            def record_image(image_descriptor, *args, **kwargs):
+                scanned_images.append(os.pread(image_descriptor, os.fstat(image_descriptor).st_size, 0))
+                return real_scan(image_descriptor, *args, **kwargs)
+
+            with patch.object(scanner, "_scan_descriptor", side_effect=record_image):
+                infected, threat, _ = scanner._scan_media_attachments(
+                    descriptor, str(path), expected, probe,
+                    deadline=time.monotonic() + 30, heartbeat=None, should_stop=None,
+                )
+            assert scanned_images == [path.with_suffix(".image").read_bytes()], path
+            assert infected == expected_infected, (path, infected, threat)
+            if expected_infected:
+                assert f"CoverHash.{codec}" in (threat or ""), threat
+            print(f"PASS nameless {codec} MP4 cover extracted whole: {threat or 'clean'}", flush=True)
+        finally:
+            os.close(descriptor)
+
     descriptor = os.open(chapter_hash, os.O_RDONLY)
     try:
         expected = file_identity(os.fstat(descriptor))
@@ -197,16 +265,19 @@ def run() -> None:
     finally:
         os.close(descriptor)
 
-    # A native limit below 2000 MiB must use the same verified chapter path.
+    # A native limit below 2000 MiB must use the same verified attachment path.
     original_scan = scanner._scan_descriptor
+    native_limit_paths = {str(chapter_clean), *(str(path) for path, _, _ in cover_cases)}
 
     def native_limit(descriptor, path, *args, **kwargs):
-        if path == str(chapter_clean):
+        if path in native_limit_paths:
             raise ScannerLimitError("synthetic native MaxScanSize limit", limit_name="maxscansize")
         return original_scan(descriptor, path, *args, **kwargs)
 
     with patch.object(scanner, "_scan_descriptor", side_effect=native_limit):
         check(chapter_clean, infected=False, method="media_windows_and_attachments")
+        for path, codec, infected in cover_cases:
+            check(path, infected=infected, method="media_windows_and_attachments", threat=f"CoverHash.{codec}")
 
     # Scale only routing/window sizes for tiny fixtures. Real ffprobe, opened
     # descriptors, parallel INSTREAM requests, ClamD and replies remain unmocked.
@@ -219,7 +290,8 @@ def run() -> None:
     ):
         for path in (clean_asf, clean_mkv, infected_mkv, infected_asf, hash_mkv, picture_mkv,
                      ttc_clean, ttc_eicar, ttc_hash, timed_mp4,
-                     chapter_clean, chapter_eicar, chapter_hash, chapter_broken):
+                     chapter_clean, chapter_eicar, chapter_hash, chapter_broken,
+                     *(path for path, _, _ in cover_cases)):
             if path.stat().st_size <= 8192:
                 with path.open("ab") as output:
                     output.write(b"\0" * (8193 - path.stat().st_size))
@@ -233,6 +305,8 @@ def run() -> None:
         check(ttc_hash, infected=True, method="media_windows_and_attachments", threat="AttachmentHash")
         check(picture_mkv, infected=False, method="media_windows_and_attachments")
         check(chapter_hash, infected=True, method="media_windows_and_attachments", threat="ChapterHash")
+        for path, codec, infected in cover_cases:
+            check(path, infected=infected, method="media_windows_and_attachments", threat=f"CoverHash.{codec}")
         try:
             scanner.scan_path(str(chapter_broken), identity=identity)
         except ScannerPolicyError as error:

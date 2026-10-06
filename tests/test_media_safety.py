@@ -211,10 +211,106 @@ class MediaSafetyTests(unittest.TestCase):
 
     def test_attached_picture_does_not_count_as_real_video(self):
         payload = {"format": {"format_name": "matroska"}, "streams": [
-            {"index": 0, "codec_type": "video", "disposition": {"attached_pic": 1}, "tags": {"filename": "cover.png"}},
+            {"index": 0, "codec_type": "video", "codec_name": "png", "disposition": {"attached_pic": 1}, "tags": {"filename": "cover.png"}},
         ]}
         with self.assertRaisesRegex(ScannerPolicyError, "video stream"):
             parse_large_media_probe(json.dumps(payload), "test")
+
+    def test_nameless_attached_pictures_are_admitted_by_codec_for_full_scanning(self):
+        for codec, suffix in (("mjpeg", ".jpg"), ("png", ".png"), ("gif", ".gif"), ("webp", ".webp")):
+            with self.subTest(codec=codec):
+                payload = {"format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"}, "streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 43, "codec_type": "video", "codec_name": codec,
+                     "codec_tag_string": "[0][0][0][0]", "disposition": {"attached_pic": 1}},
+                ]}
+                probe = parse_large_media_probe(json.dumps(payload), "/staging-local/movie.mp4")
+                self.assertEqual(probe.attachments, (
+                    MediaAttachment(43, f"attached-picture-43{suffix}", None, is_picture=True),
+                ))
+                # Cover art is not a substitute for the real video requirement.
+                payload["streams"].pop(0)
+                with self.assertRaisesRegex(ScannerPolicyError, "does not contain a video stream"):
+                    parse_large_media_probe(json.dumps(payload), "cover-only.mp4")
+
+    def test_attached_picture_flag_and_filename_do_not_admit_unknown_codecs(self):
+        for codec in (None, "unknown", "h264", "bin_data"):
+            for tags in ({}, {"filename": "cover.jpg", "mimetype": "image/jpeg"}):
+                with self.subTest(codec=codec, tags=tags):
+                    payload = {"format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"}, "streams": [
+                        {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                        {"index": 43, "codec_type": "video", "codec_name": codec,
+                         "disposition": {"attached_pic": 1}, "tags": tags},
+                    ]}
+                    with self.assertRaisesRegex(ScannerPolicyError, "unsupported attached-picture codec") as caught:
+                        parse_large_media_probe(json.dumps(payload), "movie.mp4")
+                    for detail in ("attached_pic=1", "stream_index=43", "attachment=", "mime="):
+                        self.assertIn(detail, str(caught.exception))
+        # A generic, nameless attachment is not cover art just because it says JPEG.
+        payload["streams"][1] = {"index": 43, "codec_type": "attachment", "codec_name": "mjpeg"}
+        with self.assertRaisesRegex(ScannerPolicyError, "unsupported attachment"):
+            parse_large_media_probe(json.dumps(payload), "movie.mp4")
+
+    def test_nameless_cover_retains_index_and_total_budget_checks(self):
+        cover = {"index": 43, "codec_type": "video", "codec_name": "mjpeg",
+                 "disposition": {"attached_pic": 1}}
+        payload = {"format": {"format_name": "mp4"}, "streams": [
+            {"index": 0, "codec_type": "video"}, cover,
+        ]}
+        for index in (None, -1, True, "43"):
+            with self.subTest(index=index), self.assertRaisesRegex(ScannerPolicyError, "stream index"):
+                cover["index"] = index
+                parse_large_media_probe(json.dumps(payload), "movie.mp4")
+        cover["index"] = 43
+        payload["streams"].append({**cover, "index": 44})
+        with self.assertRaisesRegex(ScannerPolicyError, "total extraction budget"):
+            parse_large_media_probe(json.dumps(payload), "movie.mp4", attachment_max_bytes=16, attachment_total_bytes=16)
+        payload["streams"][2]["index"] = 43
+        with self.assertRaisesRegex(ScannerPolicyError, "duplicate stream index"):
+            parse_large_media_probe(json.dumps(payload), "movie.mp4")
+
+    def test_nameless_cover_is_extracted_and_scanned_whole_without_limit_fallback(self):
+        payload = {"format": {"format_name": "mp4"}, "streams": [
+            {"index": 0, "codec_type": "video"},
+            {"index": 43, "codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}},
+        ]}
+        probe = parse_large_media_probe(json.dumps(payload), "movie.mp4")
+        cover_bytes = b"synthetic complete cover payload"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "movie.mp4"
+            path.write_bytes(b"test")
+            with path.open("rb") as source:
+                for reply in (b"stream: OK", b"stream: Test.EICAR FOUND", b"stream: Heuristics.Limits.Exceeded.MaxScanSize FOUND"):
+                    def scan_cover(descriptor, *, offset, length, **kwargs):
+                        self.assertEqual(offset, 0)
+                        self.assertEqual(length, len(cover_bytes))
+                        self.assertEqual(os.pread(descriptor, length, offset), cover_bytes)
+                        return reply
+
+                    with (
+                        self.subTest(reply=reply),
+                        patch.object(self.scanner, "_run_media_tool", return_value=subprocess.CompletedProcess([], 0, cover_bytes, b"")) as extract,
+                        patch.object(self.scanner, "_scan_descriptor_window", side_effect=scan_cover) as scan,
+                        patch.object(self.scanner, "_scan_large_media_descriptor") as fallback,
+                    ):
+                        def scan_attachment():
+                            return self.scanner._scan_media_attachments(
+                                source.fileno(), str(path), file_identity(os.fstat(source.fileno())), probe,
+                                deadline=time.monotonic() + 30, heartbeat=None, should_stop=None,
+                            )
+                        if b"Limits.Exceeded" in reply:
+                            with self.assertRaises(ScannerPolicyError):
+                                scan_attachment()
+                        else:
+                            infected, _, _ = scan_attachment()
+                            self.assertEqual(infected, b"FOUND" in reply)
+                        scan.assert_called_once()
+                        fallback.assert_not_called()
+                        command = extract.call_args.args[0]
+                        self.assertEqual(command[command.index("-map") + 1], "0:43")
+                        self.assertEqual(command[command.index("-c") + 1], "copy")
+                        self.assertNotIn(probe.attachments[0].filename, command)
+                        self.assertEqual(extract.call_args.kwargs["max_stdout_bytes"], self.scanner.settings.media_attachment_max_mib * 1024 * 1024)
 
     def test_native_matroska_attachment_limit_is_held_without_chunking(self):
         with tempfile.TemporaryDirectory() as directory:

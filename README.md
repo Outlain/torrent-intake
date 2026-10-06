@@ -185,6 +185,14 @@ audio-only Matroska files remain supported; cover art alone cannot qualify an
 oversized file as video. This does not claim to extract every possible metadata
 field or codec payload from every container.
 
+Cover pictures marked by FFprobe as `attached_pic` are admitted by their detected
+JPEG (`mjpeg`), PNG, GIF, or WebP codec, not by an optional filename or MIME tag.
+This includes MP4 cover art with neither tag. A recognized codec is only permission
+to extract and scan the image: every extracted picture must still pass its whole
+ClamD scan. Unknown attached-picture codecs remain blocked, even if named `.jpg`.
+Diagnostic names such as `attached-picture-43.jpg` are generated for nameless
+pictures; they are never used as output paths.
+
 Extraction uses FFmpeg stream-copy/attachment output, not movie transcoding or
 general-purpose torrent archive extraction. It reads from the already-open source
 descriptor. One object at a time is bounded while arriving through a pipe, then

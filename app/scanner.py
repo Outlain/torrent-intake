@@ -31,7 +31,7 @@ LIMIT_DETECTION_MARKERS = (
 STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_REPLY_BYTES = 1024 * 1024
 FileIdentity = tuple[int, int, int, int, int]
-SCANNER_IMPLEMENTATION_POLICY = "bounded-media-attachments-v1"
+SCANNER_IMPLEMENTATION_POLICY = "bounded-media-attachments-v2-cover-art"
 
 LARGE_VIDEO_FORMATS = frozenset(
     {
@@ -50,6 +50,9 @@ LARGE_VIDEO_FORMATS = frozenset(
 LARGE_TRUEHD_FORMAT = "truehd"
 LARGE_TRUEHD_SUFFIXES = frozenset({".thd", ".truehd"})
 LARGE_MEDIA_STREAM_TYPES = frozenset({"audio", "attachment", "subtitle", "video"})
+# ffprobe reports cover art as attached video, often without a filename/MIME.
+# These codecs admit the picture to a complete scan, never directly to clean.
+ATTACHED_PICTURE_SUFFIXES = {"mjpeg": ".jpg", "png": ".png", "gif": ".gif", "webp": ".webp"}
 MAX_CHAPTER_SAMPLES = 4096
 KODI_METADATA_FILENAMES = frozenset({"kodi-metadata", "kodi-override-metadata"})
 KODI_METADATA_MIMETYPES = frozenset({"application/xml", "text/xml", "text/plain"})
@@ -304,7 +307,11 @@ def _media_policy_error(
             codec=stream.get("codec_name"), codec_tag=stream.get("codec_tag_string"),
             handler=tags.get("handler_name"),
         )
-        if stream.get("codec_type") == "attachment" or "filename" in tags:
+        disposition = stream.get("disposition")
+        is_picture = isinstance(disposition, dict) and disposition.get("attached_pic") == 1
+        if is_picture:
+            fields["attached_pic"] = 1
+        if stream.get("codec_type") == "attachment" or is_picture or "filename" in tags:
             filename = tags.get("filename")
             fields.update(
                 attachment=filename,
@@ -407,6 +414,9 @@ def parse_large_media_probe(
         is_picture = isinstance(disposition, dict) and disposition.get("attached_pic") == 1
         if is_picture and stream_type != "video":
             raise rejected("media has an invalid attached-picture stream", stream)
+        picture_suffix = ATTACHED_PICTURE_SUFFIXES.get(str(stream.get("codec_name") or "").casefold())
+        if is_picture and picture_suffix is None:
+            raise rejected("unsupported attached-picture codec: expected JPEG, PNG, GIF, or WebP", stream)
         if stream_type == "video" and not is_picture:
             video_streams += 1
         if stream_type == "attachment" or is_picture or is_chapter_text:
@@ -425,7 +435,7 @@ def parse_large_media_probe(
                 and str(mimetype or "").split(";", 1)[0].strip().casefold()
                 in KODI_METADATA_MIMETYPES
             )
-            if not is_chapter_text and suffix not in SAFE_ATTACHMENT_SUFFIXES and not is_kodi_metadata:
+            if not is_picture and not is_chapter_text and suffix not in SAFE_ATTACHMENT_SUFFIXES and not is_kodi_metadata:
                 raise rejected(
                     "unsupported attachment: expected a recognized font, image, subtitle, "
                     "text file, or named Kodi text/XML metadata", stream,
@@ -436,6 +446,9 @@ def parse_large_media_probe(
             attachment_indices.add(index)
             size = stream.get("extradata_size")
             chapter_samples = None
+            if is_picture and not filename:
+                # Diagnostic label only; extraction always uses the stream index.
+                filename = f"attached-picture-{index}{picture_suffix}"
             if is_chapter_text:
                 try:
                     chapter_samples = _media_integer(stream.get("nb_frames"))
