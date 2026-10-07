@@ -577,7 +577,7 @@ class ScanCoordinator:
 
         for job in jobs:
             run = runs.get(job.id)
-            job.can_edit_final_destination = job.final_destination_is_editable(has_scan_run=run is not None)
+            job.can_edit_final_destination = job.final_destination_is_editable(scan_run=run)
             job.scan_priority = run.priority if run else 0
             job.scan_pause_requested = run.pause_requested if run else False
             job.scan_total_files = run.total_files if run else 0

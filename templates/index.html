@@ -1746,7 +1746,7 @@
           </div>
         </div>
         <div class="bulk-dialog-controls">
-          <p id="final-destination-help" class="bulk-dialog-copy">Change where this torrent will go after a successful scan. Nothing moves now; its download staging location and final category stay unchanged. Editing locks once Intake records download completion or queues the scan.</p>
+          <p id="final-destination-help" class="bulk-dialog-copy">Change where this torrent will go after a successful scan. Nothing moves now; download staging and final category stay unchanged. Edit before download completion, or choose Pause After File and wait for Scan paused. Saving a paused scan keeps its checkpoints and leaves it paused; choose Resume Scan when ready.</p>
           <label>
             <span>Final parent path</span>
             <input id="edit-final-parent-input" class="mono" type="text" list="edit-final-parent-suggestions" autocomplete="off" spellcheck="false" maxlength="4096" required aria-describedby="edit-final-parent-help">
@@ -1840,7 +1840,7 @@
               <div class="scanner-control-group">
                 <span class="toolbar-group-label">Selected scans</span>
                 <button id="scan-next-button" class="button-secondary toolbar-button" type="button" title="Move selected queued scans ahead without resuming paused scans.">Prioritize Scan</button>
-                <button id="pause-scan-button" class="button-secondary toolbar-button" type="button" title="Queued scans pause immediately. An active scan pauses safely after its current file finishes.">Pause After File</button>
+                <button id="pause-scan-button" class="button-secondary toolbar-button" type="button" title="Queued scans pause immediately. An active scan pauses safely after its current file finishes. Wait for Scan paused before editing an eligible job's final location.">Pause After File</button>
                 <button id="resume-scan-button" class="button-secondary toolbar-button" type="button">Resume Scan</button>
               </div>
             </div>
@@ -3006,7 +3006,9 @@
         latestJobs = latestJobs.map(job => job.id === updatedJob.id ? updatedJob : job);
         renderJobs(latestJobs);
         finalDestinationDialog.close();
-        flashJobsToolbarStatus('Final location saved. Download staging and category are unchanged; files move only after a successful scan.');
+        flashJobsToolbarStatus(updatedJob.state === 'scan_paused'
+          ? 'Final location saved. Scan remains paused with checkpoints preserved; choose Resume Scan when ready. Download staging and category are unchanged.'
+          : 'Final location saved. Download staging and category are unchanged; files move only after a successful scan.');
       } catch (error) {
         finalDestinationStatus.textContent = String(error);
         finalDestinationStatus.classList.add('error');

@@ -5,12 +5,16 @@ import os
 from pathlib import Path
 import shutil
 from uuid import uuid4
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .config import get_settings
 from .event_writer import emit_event
-from .models import FINAL_DESTINATION_EDITABLE_STATES, FINAL_DESTINATION_LOCK_MARKERS, Job, ScanRun
+from .models import (
+    FINAL_DESTINATION_EDITABLE_STATES, FINAL_DESTINATION_LOCK_MARKERS,
+    FINAL_DESTINATION_PAUSED_RUN_LOCK_MARKERS, FINAL_DESTINATION_SCAN_LOCK_MARKERS,
+    Job, ScanRun,
+)
 from .metainfo import parse_torrent
 from .paths import canonical_final_parent, path_is_within
 from .storage import StorageUnavailable, ensure_nas_choice, pin_nas_choice, require_storage, require_final_storage
@@ -58,17 +62,31 @@ class JobService:
     def update_final_destination(
         self, db: Session, *, job_id: str, final_parent: str, expected_final_parent: str,
     ) -> Job:
-        """Change the promotion plan only; never move or touch downloading files."""
+        """Change only the plan for downloading or safely paused scan jobs."""
         destination = canonical_final_parent(final_parent, self.settings)
+        downloading = and_(
+            Job.state.in_(FINAL_DESTINATION_EDITABLE_STATES),
+            *(getattr(Job, name).is_(None) for name in FINAL_DESTINATION_LOCK_MARKERS),
+            ~select(ScanRun.job_id).where(ScanRun.job_id == Job.id).exists(),
+        )
+        paused_scan = and_(
+            Job.state == "scan_paused",
+            *(getattr(Job, name).is_(None) for name in FINAL_DESTINATION_SCAN_LOCK_MARKERS),
+            select(ScanRun.job_id).where(
+                ScanRun.job_id == Job.id,
+                ScanRun.pause_requested.is_(True),
+                *(getattr(ScanRun, name).is_(None) for name in FINAL_DESTINATION_PAUSED_RUN_LOCK_MARKERS),
+            ).exists(),
+        )
+        # Test the run and job in the same conditional write. A resume or scan
+        # completion that wins the race must close the editing window.
         result = db.execute(
             update(Job)
             .where(
                 Job.id == job_id,
                 Job.final_parent == expected_final_parent,
-                Job.state.in_(FINAL_DESTINATION_EDITABLE_STATES),
                 Job.is_terminal.is_(False),
-                *(getattr(Job, name).is_(None) for name in FINAL_DESTINATION_LOCK_MARKERS),
-                ~select(ScanRun.job_id).where(ScanRun.job_id == Job.id).exists(),
+                or_(downloading, paused_scan),
             )
             .values(final_parent=destination, updated_at=datetime.utcnow())
             .execution_options(synchronize_session=False)
@@ -79,15 +97,15 @@ class JobService:
             if job is None:
                 raise LookupError("Job not found")
             raise FinalDestinationConflict(
-                "The destination changed or this job is no longer awaiting download completion. "
-                "Refresh the job; final destinations cannot be edited after completion or scan queueing."
+                "The destination changed or this job is no longer safely editable. "
+                "Refresh the job. Edit while downloading, or use Pause After File and wait for Scan paused. "
+                "Editing is locked once the scan completes or promotion begins."
             )
         db.commit()
         job = db.get(Job, job_id, populate_existing=True)
         if job is None:
             raise LookupError("Job was removed after its destination was updated")
-        has_scan_run = db.get(ScanRun, job_id) is not None
-        job.can_edit_final_destination = job.final_destination_is_editable(has_scan_run=has_scan_run)
+        job.can_edit_final_destination = job.final_destination_is_editable(scan_run=db.get(ScanRun, job_id))
         return job
 
     def submit_job(

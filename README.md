@@ -427,24 +427,31 @@ Set `TI_QBT_HOST` to the Web API endpoint reachable from Torrent Intake. Attach
 the application (not the ClamD sidecar) to an existing private Docker network if
 that endpoint relies on Docker DNS.
 
-### Editing a downloading job's final destination
+### Editing a job's final destination
 
 In **Recent Jobs**, use **Edit final location** beside an eligible job's final
 path, on desktop or mobile. Change the container-visible destination (for
 example `/downloads/TV/NewFolder`), then save. This is a per-job database change:
 it takes effect immediately and needs no Portainer environment change or restart.
 
-Only jobs still in the download stage, including local-space/NAS/hash waits,
-are eligible. Once completion has been recorded or a scan has been queued, the
-destination is locked. Scanning, promotion, infected, failed and completed jobs
-cannot be redirected with this action. If a job advances or another browser
-changes its destination while the editor is open, saving is rejected; refresh
-and review the current job instead.
+Jobs still in the download stage, including local-space/NAS/hash waits, remain
+eligible until completion is recorded or a scan is queued. To change the final
+location of an unfinished scan, select its row, choose **Pause After File**, and
+wait for **Scan paused**. Then use **Edit final location**, save, and explicitly
+choose **Resume Scan** when ready. A pause request alone is not enough: the worker
+must have stopped, with no current file or scan verdict. Clean scans, promotion,
+infected, failed and completed jobs cannot be redirected, nor can jobs with prior
+promotion or post-promotion copy progress. If a job resumes or another browser
+changes its destination while the editor is open, saving is rejected and the
+draft stays open; close and reopen to review the current job before trying again.
 
 This changes **only the eventual clean-promotion destination**. The current
 download stays in its existing local/NAS staging location; its category, tags,
 selected NAS fallback and scan policy are unchanged. Normal scanning and
-promotion checks still apply. Paths must remain within the deployment's allowed
+promotion checks still apply. A paused scan remains paused with its existing
+checkpoints; changing only the destination does not trigger a rescan. After a
+clean scan and promotion, post-promotion copy rules use the **new final path**.
+Paths must remain within the deployment's allowed
 final roots and outside staging/operational directories. A new final subfolder
 can be created by qBittorrent during promotion; editing does not create folders
 or mount storage. Both applications still need matching container paths.
@@ -1020,9 +1027,11 @@ placeholders. The background poller still discovers missed callbacks.
   and `custom_tags`). Bulk file clients submit this endpoint sequentially, as the
   UI does; do not encode file bytes in JSON or submit multiple files per request.
 - `GET /jobs`, `GET /jobs/{id}`: inspect jobs
-- `PATCH /jobs/{id}/final-destination`: change a downloading job's planned final
-  folder with `final_parent` and `expected_final_parent`. A stale destination or
-  ineligible lifecycle state returns `409`; no files are moved by this endpoint.
+- `PATCH /jobs/{id}/final-destination`: change a downloading or safely paused
+  unfinished scan job's planned final folder with `final_parent` and
+  `expected_final_parent`. A stale destination or ineligible lifecycle state
+  returns `409`; no files are moved and paused scans are not resumed by this
+  endpoint. Existing scan checkpoints are preserved.
 - retry, bulk retry/delete/clear, switch-waiting-jobs-to-NAS-staging, and scan
   priority/pause/resume endpoints used by the UI
 - `GET /scanner/status`, `POST /scanner/slots`, `POST /scanner/maintenance`

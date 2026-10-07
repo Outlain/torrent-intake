@@ -34,7 +34,7 @@ let container, browser;
     browser = await puppeteer.launch({headless: true, args: ['--no-sandbox'],
       ...(process.env.CHROME_PATH ? {executablePath: process.env.CHROME_PATH} : {})});
     const page = await browser.newPage();
-    const errors = [], submitted = [], moves = [], hookRetries = [], finalDestinationEdits = [];
+    const errors = [], submitted = [], moves = [], hookRetries = [], finalDestinationEdits = [], scanResumes = [];
     const queuedJob = {id: 'queued-test', state: 'waiting_for_local_space', staging_actual: 'local',
       final_parent: '/downloads/Original', torrent_name: '<img src=x onerror=alert(1)> series', can_edit_final_destination: true,
       nas_staging_id: 'main', nas_staging_label: 'Main NAS', nas_staging_path: '/nas/main/intake'};
@@ -47,6 +47,12 @@ let container, browser;
       hook_error: 'Copy interrupted; inspect partial data before retrying', hook_destination: '/copy-target/Movies',
       hook_copy_source_root: '/downloads/Movies', hook_copy_relative_path: 'Action/Film'};
     const scanningJob = {...queuedJob, id: 'scanning-test', state: 'scanning', can_edit_final_destination: false};
+    const pendingPauseJob = {...scanningJob, id: 'pending-pause-test', scan_pause_requested: true,
+      scan_current_file: 'episode-3.mkv'};
+    const pausedJob = {...queuedJob, id: 'paused-test', state: 'scan_paused', activity_summary: 'Scan paused',
+      scan_pause_requested: true, scan_current_file: null, final_category: 'TV',
+      scan_completed_files: 2, scan_total_files: 5, scan_completed_bytes: 400, scan_total_bytes: 1000,
+      scan_progress_percent: 40};
     let finalDestinationPaused = false, knownPathRequests = 0;
     let failOnce = true, inFlight = 0, peak = 0;
     page.on('pageerror', error => errors.push(error.message));
@@ -55,13 +61,22 @@ let container, browser;
     page.on('request', async request => {
       const path = new URL(request.url()).pathname;
       const respond = (body, status = 200) => request.respond({status, contentType: 'application/json', body: JSON.stringify(body)});
-      if (request.method() === 'PATCH' && path === '/jobs/queued-test/final-destination') {
+      if (request.method() === 'PATCH' && ['/jobs/queued-test/final-destination', '/jobs/paused-test/final-destination'].includes(path)) {
+        const job = path.includes('/paused-test/') ? pausedJob : queuedJob;
         const payload = JSON.parse(request.postData()); finalDestinationEdits.push(payload);
         if (finalDestinationPaused) return respond({detail: 'Intake is paused for maintenance. Verify and resume before editing jobs.'}, 503);
-        if (!queuedJob.can_edit_final_destination) return respond({detail: 'Scanning has begun; final location can no longer be edited.'}, 409);
-        if (payload.expected_final_parent !== queuedJob.final_parent) return respond({detail: 'Final location changed in another request. Close and reopen the editor.'}, 409);
-        queuedJob.final_parent = payload.final_parent;
-        return respond(queuedJob);
+        if (!job.can_edit_final_destination) return respond({detail: job === pausedJob
+          ? 'Scan resumed; final location can no longer be edited.'
+          : 'Scanning has begun; final location can no longer be edited.'}, 409);
+        if (payload.expected_final_parent !== job.final_parent) return respond({detail: 'Final location changed in another request. Close and reopen the editor.'}, 409);
+        job.final_parent = payload.final_parent;
+        return respond(job);
+      }
+      if (path === '/jobs/bulk-scan-resume') {
+        const payload = JSON.parse(request.postData()); scanResumes.push(payload);
+        Object.assign(pausedJob, {state: 'scan_pending', activity_summary: 'Scan queued',
+          scan_pause_requested: false, can_edit_final_destination: false});
+        return respond({processed: 1, failed: 0, errors: {}, processed_ids: payload.job_ids});
       }
       if (request.method() === 'POST' && ['/jobs', '/jobs/torrent', '/jobs/bulk'].includes(path)) {
         inFlight++; peak = Math.max(peak, inFlight);
@@ -80,7 +95,7 @@ let container, browser;
         return respond({moved: 1, failed: 0, errors: {}, processed_ids: payload.job_ids});
       }
       if (['/admin/jobs/hook-test/retry-hook', '/admin/jobs/copy-test/retry-hook'].includes(path)) { hookRetries.push({path, headers: request.headers()}); return respond({hook_status: 'pending'}); }
-      if (path === '/jobs') return respond([queuedJob, unavailableFallbackJob, unavailableNasJob, hookedJob, copiedJob, scanningJob]);
+      if (path === '/jobs') return respond([queuedJob, unavailableFallbackJob, unavailableNasJob, hookedJob, copiedJob, scanningJob, pendingPauseJob, pausedJob]);
       if (path === '/qbt/final-path-suggestions') { knownPathRequests++; return respond({paths: ['/downloads/Shows']}); }
       if (path === '/fs/final-path-suggestions') return respond({paths: ['/downloads/Movies', '/downloads/TV']});
       if (path === '/qbt/tags') return respond({tags: ['Review']});
@@ -105,12 +120,15 @@ let container, browser;
 
     for (const width of [1440, 390]) {
       queuedJob.final_parent = '/downloads/Original';
+      Object.assign(pausedJob, {final_parent: '/downloads/Original', state: 'scan_paused', activity_summary: 'Scan paused',
+        scan_pause_requested: true, can_edit_final_destination: true});
       await page.setViewport({width, height: 900});
       await page.goto(`${origin}/ui`, {waitUntil: 'networkidle0'});
       const editSelector = '[data-edit-final-destination="queued-test"]';
       const editsBefore = finalDestinationEdits.length;
       const suggestionsBefore = knownPathRequests;
       assert.equal(await page.$('[data-edit-final-destination="scanning-test"]'), null);
+      assert.equal(await page.$('[data-edit-final-destination="pending-pause-test"]'), null, 'pause requested is not a confirmed pause');
       assert.equal(await page.$('[data-edit-final-destination="hook-test"]'), null);
       assert.equal(await page.$('#jobs-tbody img'), null, 'torrent name must remain plain text');
       await click(editSelector);
@@ -161,6 +179,45 @@ let container, browser;
       await page.keyboard.press('Escape');
       assert(!(await page.$eval('#final-destination-dialog', node => node.open)));
       finalDestinationPaused = false;
+
+      const pausedEditSelector = '[data-edit-final-destination="paused-test"]';
+      const resumesBefore = scanResumes.length;
+      const pausedBefore = {...pausedJob};
+      await click(pausedEditSelector);
+      assert.match(await page.$eval('#final-destination-help', node => node.textContent), /wait for Scan paused.*keeps its checkpoints.*Resume Scan/);
+      await fill('#edit-final-parent-input', '/downloads/TV/Redirected');
+      await click('#final-destination-save');
+      await page.waitForFunction(() => !document.querySelector('#final-destination-dialog').open);
+      assert.deepEqual(finalDestinationEdits.at(-1), {final_parent: '/downloads/TV/Redirected', expected_final_parent: '/downloads/Original'});
+      assert.deepEqual(pausedJob, {...pausedBefore, final_parent: '/downloads/TV/Redirected'}, 'saving must change only the paused job destination');
+      assert.equal(scanResumes.length, resumesBefore, 'saving must never resume a paused scan');
+      const pausedRowText = await page.$eval(pausedEditSelector, node => node.closest('tr').textContent);
+      assert.match(pausedRowText, /Scan paused/);
+      assert.match(pausedRowText, /40\.0% bytes checkpointed.*2\/5 files/);
+      assert.match(await page.$eval('#jobs-toolbar-status', node => node.textContent), /Scan remains paused with checkpoints preserved; choose Resume Scan/);
+
+      await click(pausedEditSelector);
+      await fill('#edit-final-parent-input', '/downloads/TV/Retained draft');
+      Object.assign(pausedJob, {state: 'scan_pending', activity_summary: 'Scan queued',
+        scan_pause_requested: false, can_edit_final_destination: false});
+      await page.evaluate(() => loadJobs({silent: true}));
+      assert.equal(await page.$(pausedEditSelector), null, 'resume must remove the edit action');
+      await click('#final-destination-save');
+      await page.waitForFunction(() => document.querySelector('#final-destination-status').textContent.includes('Scan resumed'));
+      assert(await page.$eval('#final-destination-dialog', node => node.open), 'resume conflict must keep the editor open');
+      assert.equal(await page.$eval('#edit-final-parent-input', node => node.value), '/downloads/TV/Retained draft');
+      assert.equal(pausedJob.final_parent, '/downloads/TV/Redirected', 'stale edit must not change the destination');
+      assert.equal(finalDestinationEdits.at(-1).expected_final_parent, '/downloads/TV/Redirected');
+      await click('#final-destination-cancel');
+      Object.assign(pausedJob, {state: 'scan_paused', activity_summary: 'Scan paused',
+        scan_pause_requested: true, can_edit_final_destination: true});
+      await page.evaluate(() => loadJobs({silent: true}));
+      await click('.job-checkbox[data-job-id="paused-test"]');
+      const resumed = page.waitForResponse(response => response.url().endsWith('/jobs/bulk-scan-resume'));
+      await click('#resume-scan-button'); await resumed;
+      assert.deepEqual(scanResumes.at(-1), {job_ids: ['paused-test']}, 'resume must be an explicit user action');
+      await page.waitForFunction(() => !document.querySelector('.job-checkbox[data-job-id="paused-test"]').checked);
+
       assert(await page.$eval('#nas-staging-field', node => node.hidden));
       assert.equal(await page.$eval('#nas-staging-select', node => node.value), 'main');
       assert.match(await page.$eval('#jobs-tbody .cell-stage', node => node.textContent), /local.*NAS fallback: Main NAS/);
@@ -285,7 +342,7 @@ let container, browser;
     assert(hookRetries.at(-1).headers['x-ti-admin-token'] === token, 'copy retry must use the unlocked administrator token');
     assert.equal(peak, 1, 'mixed bulk requests must be sequential');
     assert.deepEqual(errors, []);
-    console.log('PASS desktop/mobile final-destination editing/cancel/stale/scan-start/paused errors/draft preservation/escaping, mixed intake, named NAS/default selection, manual NAS moves, per-row retry, environment locks, escaped copy/script output, authenticated copy/script retry, tags and selection limits');
+    console.log('PASS desktop/mobile final-destination editing/cancel/stale/scan-start/maintenance errors, paused checkpoint preservation/explicit resume/stale resume draft, escaping, mixed intake, named NAS/default selection, manual NAS moves, per-row retry, environment locks, escaped copy/script output, authenticated copy/script retry, tags and selection limits');
   } finally {
     if (browser) await browser.close();
     if (container) docker('rm', '-f', container);

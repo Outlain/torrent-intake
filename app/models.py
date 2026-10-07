@@ -8,9 +8,15 @@ from .tags import decode_custom_tags, encode_custom_tags
 FINAL_DESTINATION_EDITABLE_STATES = (
     "downloading", "waiting_for_local_space", "waiting_for_nas", "waiting_for_qbt_hash",
 )
-FINAL_DESTINATION_LOCK_MARKERS = (
-    "completion_event_received_at", "download_complete_at", "scan_completed_at",
+FINAL_DESTINATION_SCAN_LOCK_MARKERS = (
+    "scan_completed_at",
     "promoted_at", "deleted_at", "threat_name", "quarantine_path", "hook_status",
+)
+FINAL_DESTINATION_LOCK_MARKERS = (
+    "completion_event_received_at", "download_complete_at",
+) + FINAL_DESTINATION_SCAN_LOCK_MARKERS
+FINAL_DESTINATION_PAUSED_RUN_LOCK_MARKERS = (
+    "worker_id", "lease_expires_at", "heartbeat_at", "current_file", "current_file_started_at", "verdict",
 )
 
 
@@ -80,12 +86,22 @@ class Job(Base):
     threat_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    def final_destination_is_editable(self, *, has_scan_run: bool) -> bool:
+    def final_destination_is_editable(self, *, scan_run: "ScanRun | None") -> bool:
+        if self.is_terminal:
+            return False
+        if self.state in FINAL_DESTINATION_EDITABLE_STATES:
+            return (
+                scan_run is None
+                and all(getattr(self, name) is None for name in FINAL_DESTINATION_LOCK_MARKERS)
+            )
+        # A pause request is not a pause: the worker must have checkpointed its
+        # current file and released the run before the promotion plan can change.
         return (
-            self.state in FINAL_DESTINATION_EDITABLE_STATES
-            and not self.is_terminal
-            and not has_scan_run
-            and all(getattr(self, name) is None for name in FINAL_DESTINATION_LOCK_MARKERS)
+            self.state == "scan_paused"
+            and all(getattr(self, name) is None for name in FINAL_DESTINATION_SCAN_LOCK_MARKERS)
+            and scan_run is not None
+            and scan_run.pause_requested is True
+            and all(getattr(scan_run, name) is None for name in FINAL_DESTINATION_PAUSED_RUN_LOCK_MARKERS)
         )
 
     @property

@@ -1,4 +1,4 @@
-"""Real qB NAS selection -> clean promotion -> optional hook, entirely offline.
+"""Real qB NAS selection -> paused destination edit -> promotion/hook, offline.
 
 Run in the test-only qB image with --network none, /tmp:noexec and a writable
 /hooks:exec and /copy-target:noexec tmpfs. ClamD itself is covered by the separate media integration;
@@ -14,7 +14,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from unittest.mock import patch
 
 import qbittorrentapi
 from sqlalchemy import create_engine
@@ -44,8 +46,9 @@ def main() -> None:
         from app.config import Settings, get_settings
         from app.db import Base
         from app.models import Job, ScanFile, ScanRun
-        from app.post_promotion import PostPromotionRunner
+        from app.post_promotion import PostPromotionRunner, matching_copy_rule
         from app.qbt import QbtService
+        from app.scanner import ScannerHealth, ScannerIdentity
         from app.service import JobService
         from test_torrent_files import torrent, v1_info
 
@@ -116,7 +119,17 @@ def main() -> None:
             service.settings = settings
             service.qbt = QbtService.__new__(QbtService)
             service.qbt._with_client = lambda operation: operation(client)
+            coordinator = service.scan_coordinator
+            coordinator.settings = settings
+            coordinator.qbt = service.qbt
             runner = PostPromotionRunner(settings=settings, qbt=service.qbt, session_factory=sessions)
+            # ClamD is deliberately outside this movement integration. Seed its
+            # clean checkpoint and provide the same identity when resuming it.
+            identity = ScannerIdentity(
+                backend="clamd", engine_version="1.4.3", database_version="12345",
+                database_updated_at=datetime.utcnow(), policy_version="location-integration-v1",
+                raw_version="ClamAV 1.4.3/12345",
+            )
 
             for number, location in enumerate([locations[0], locations[1], locations[1]]):
                 identifier = ("one", "two", "unmatched")[number]
@@ -126,10 +139,10 @@ def main() -> None:
                     settings = Settings(**{**settings.model_dump(), "post_promotion_enabled": False,
                                           "post_promotion_script": None, "post_promotion_copy_enabled": True,
                                           "post_promotion_copy_rules": [{
-                                              "source": str(library / "edited-two"),
+                                              "source": str(library / "paused-edited-two"),
                                               "destination": str(target), "enabled": True,
                                           }]})
-                    service.settings = runner.settings = settings
+                    service.settings = runner.settings = coordinator.settings = settings
                 name = f"payload {identifier} $(ignored); 'quoted'.txt"
                 staged_source = Path(location["path"]) / name
                 final_parent = library / f"new-{identifier}" / "nested"
@@ -185,18 +198,80 @@ def main() -> None:
                         return live if live is not None and runner.guard.is_paused(live) else None
 
                     wait_for(paused_complete, f"{identifier} paused completed torrent")
-                    job.state, job.is_terminal = "scan_clean", False
-                    job.scan_completed_at = datetime.utcnow()
+                    job.state, job.is_terminal = ("scan_paused" if identifier == "two" else "scan_clean"), False
+                    job.completion_event_received_at = job.download_complete_at = datetime.utcnow()
+                    job.scan_completed_at = None if identifier == "two" else datetime.utcnow()
                     job.content_path = str(staged_source)
-                    db.add(ScanRun(
-                        job_id=job.id, verdict="clean", root_path=str(staged_source),
+                    run = ScanRun(
+                        job_id=job.id, pause_requested=identifier == "two",
+                        verdict=None if identifier == "two" else "clean", root_path=str(staged_source),
                         total_files=1, completed_files=1, total_bytes=9, completed_bytes=9,
-                    ))
-                    db.add(ScanFile(
+                    )
+                    coordinator._sync_run_identity(run, identity)
+                    fingerprint = staged_source.stat()
+                    checkpoint = ScanFile(
                         job_id=job.id, relative_path=".", size_bytes=9,
-                        mtime_ns=staged_source.stat().st_mtime_ns, status="clean",
-                    ))
+                        mtime_ns=fingerprint.st_mtime_ns, ctime_ns=fingerprint.st_ctime_ns,
+                        device=fingerprint.st_dev, inode=fingerprint.st_ino, status="clean",
+                        attempts=1, scanned_at=datetime.utcnow(), scanner_version=identity.raw_version,
+                        engine_version=identity.engine_version, database_version=identity.database_version,
+                        database_updated_at=identity.database_updated_at, policy_version=identity.policy_version,
+                        scan_method="integration-supplied-clean-checkpoint",
+                    )
+                    db.add_all([run, checkpoint])
                     db.commit()
+                    if identifier == "two":
+                        # Model a pause after the final clean file: progress is
+                        # 100%, but the final manifest gate has not run yet.
+                        original_paused_parent = final_parent
+                        checkpoint_before = {column.name: getattr(checkpoint, column.name)
+                                             for column in ScanFile.__table__.columns}
+                        run_before = {column.name: getattr(run, column.name)
+                                      for column in ScanRun.__table__.columns}
+                        assert matching_copy_rule(str(original_paused_parent), settings) is None
+                        final_parent = library / "paused-edited-two" / "nested"
+                        job = service.update_final_destination(
+                            db, job_id=job.id, final_parent=str(final_parent),
+                            expected_final_parent=str(original_paused_parent),
+                        )
+                        db.refresh(run)
+                        db.refresh(checkpoint)
+                        assert job.state == "scan_paused" and job.scan_completed_at is None
+                        assert job.content_path == str(staged_source) and job.final_category is None
+                        assert job.nas_staging_id == location["id"] and job.staging_root_actual == location["path"]
+                        assert {column.name: getattr(checkpoint, column.name)
+                                for column in ScanFile.__table__.columns} == checkpoint_before
+                        assert {column.name: getattr(run, column.name)
+                                for column in ScanRun.__table__.columns} == run_before
+                        assert not final_parent.exists() and not original_paused_parent.exists()
+                        assert staged_source.read_bytes() == b"test data"
+                        assert Path(service.qbt.get_torrent(torrent_hash).save_path) == Path(location["path"])
+                        assert runner.claim_next() is None, "Editing a paused plan must not queue a hook"
+
+                        coordinator._resume_job(db, job.id)
+                        assert job.state == "scan_pending" and not run.pause_requested
+                        health = ScannerHealth(
+                            status="healthy", can_scan=True, message="Integration-supplied checkpoint",
+                            checked_at=datetime.utcnow(), identity=identity,
+                        )
+                        with patch("app.scan_coordinator.SessionLocal", sessions), \
+                                patch.object(coordinator.scanner, "health", return_value=health), \
+                                patch.object(coordinator.scanner, "require_healthy", return_value=identity), \
+                                patch.object(coordinator.scanner, "scan_path", side_effect=AssertionError(
+                                    "An unchanged clean checkpoint must not be rescanned"
+                                )) as scan_path:
+                            claims = coordinator.claim_jobs(db, "integration-paused-destination")
+                            assert len(claims) == 1 and claims[0].job_id == job.id
+                            coordinator.run_claim(claims[0], threading.Event())
+                            scan_path.assert_not_called()
+                        db.refresh(job)
+                        db.refresh(run)
+                        db.refresh(checkpoint)
+                        assert job.state == "scan_clean" and job.scan_completed_at is not None, job.last_error
+                        assert job.final_parent == str(final_parent) and run.verdict == "clean"
+                        assert run.worker_id is None and run.lease_expires_at is None
+                        assert {column.name: getattr(checkpoint, column.name)
+                                for column in ScanFile.__table__.columns} == checkpoint_before
                     before = recorded.read_text().splitlines() if recorded.exists() else []
                     assert runner.claim_next() is None, "A clean scan alone must not execute a hook"
                     assert not service._reconcile_clean_promotion(db, job), "Requesting a qB move must not finalize promotion"
@@ -236,8 +311,9 @@ def main() -> None:
                     else:
                         assert job.hook_kind == "copy" and job.hook_script is None
                         assert job.hook_destination == str(target)
-                        assert job.hook_copy_source_root == str(library / "edited-two")
+                        assert job.hook_copy_source_root == str(library / "paused-edited-two")
                         assert job.hook_copy_relative_path == str(Path("nested") / name)
+                        assert not original_paused_parent.exists(), "Promotion must not use the pre-pause destination"
                         assert (target / "nested" / name).read_bytes() == source.read_bytes()
                         assert not (target / f"intake-job-{job.id}").exists(), "Mapped copies must not add a job wrapper"
                         assert recorded.read_text().splitlines() == before, "Built-in copying must not execute an operator script"
@@ -249,7 +325,8 @@ def main() -> None:
             assert len(invocations) == 1
             print(
                 f"PASS real qBittorrent {version}: two pinned NAS locations, complete/paused local payloads, "
-                "edited download destinations used for real moves into absent final subdirectories, no early hooks, literal path/name arguments, "
+                "download and paused destination edits used for real moves into absent final subdirectories, "
+                "checkpoint-preserving resume with the final manifest gate, no early hooks, literal path/name arguments, "
                 "one script and one routed copy with preserved nested paths, unmatched final location skipped, retained seeding originals"
             )
         finally:
