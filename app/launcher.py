@@ -1,9 +1,11 @@
 """One controller per local data directory; offline restore before opening SQLite."""
 import fcntl
+import logging
 import os
 import sys
 
 from .config import Settings, persist_settings
+from .archive_tools import ArchiveError, cleanup_archive_workspaces
 from .restore import apply_pending_restore
 from .state_files import data_directory
 
@@ -20,7 +22,15 @@ def main() -> None:
     # Retain the advisory lock across exec for the entire server lifetime.
     os.set_inheritable(descriptor, True)
     apply_pending_restore(Settings())
-    persist_settings(Settings())
+    settings = Settings()
+    if settings.archive_enabled:
+        try:
+            cleanup_archive_workspaces(str(root), settings.archive_scratch_dir, settings.archive_scratch_mount_marker)
+        except (ArchiveError, OSError) as exc:
+            # An offline NAS should hold archive scans, not prevent access to
+            # the UI or unrelated native/media jobs. Every scan rechecks it.
+            logging.getLogger(__name__).warning("Archive scratch cleanup deferred: %s", exc)
+    persist_settings(settings)
     (root / "restart-required").unlink(missing_ok=True)
     command = sys.argv[1:]
     if not command:

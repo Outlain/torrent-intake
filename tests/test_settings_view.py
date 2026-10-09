@@ -34,6 +34,13 @@ class SettingsViewTests(unittest.TestCase):
         self.assertFalse(item["editable"])
         self.assertIn("no effect", item["description"])
 
+    def test_archive_scratch_fields_explain_default_and_are_advanced(self):
+        items = catalog_items(build_settings_catalog(Settings(data_dir="/local-app-data")))
+        self.assertEqual(items["archive_scratch_dir"]["current"], "Automatic: /local-app-data")
+        for name in ("archive_scratch_dir", "archive_scratch_mount_marker"):
+            self.assertTrue(items[name]["editable"])
+            self.assertTrue(items[name]["advanced"])
+
     def test_secrets_and_url_credentials_are_redacted(self) -> None:
         settings = Settings(
             qbt_password="qbt-super-secret",

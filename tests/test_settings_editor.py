@@ -73,6 +73,20 @@ class SettingsEditorTests(unittest.TestCase):
         persist_settings(candidate)
         self.assertEqual(Settings().model_dump()["post_promotion_copy_rules"], rules)
 
+    def test_archive_scratch_storage_is_editable_persisted_and_clearable(self):
+        candidate, changes = validate_draft(self.settings, {
+            "archive_scratch_dir": "/archive-scratch",
+            "archive_scratch_mount_marker": "/archive-scratch/.mounted",
+        })
+        self.assertTrue(all(change["advanced"] for change in changes))
+        persist_settings(candidate)
+        restored = Settings()
+        self.assertEqual(restored.archive_workspace_root, "/archive-scratch/archive-scan")
+        cleared, _ = validate_draft(restored, {"archive_scratch_dir": "", "archive_scratch_mount_marker": ""})
+        self.assertEqual(cleared.archive_workspace_root, str(self.root / "archive-scan"))
+        with self.assertRaises(SettingsEditError):
+            validate_draft(restored, {"archive_scratch_dir": "/staging-local"})
+
     def test_builtin_copy_rejects_unsafe_paths_and_conflicting_modes(self):
         for destination in ("/app/data", "/downloads/Movies", "/copy-target/../app", "relative", "/copy-target-bad", "/copy-target/x\n"):
             with self.subTest(destination=destination), self.assertRaises(SettingsEditError):

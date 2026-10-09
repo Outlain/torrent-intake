@@ -140,6 +140,15 @@ class Settings(BaseSettings):
     ffmpeg_binary: str = "/usr/bin/ffmpeg"
     media_attachment_max_mib: int = 16
     media_attachment_total_mib: int = 64
+    archive_enabled: bool = True
+    archive_scratch_dir: str | None = None
+    archive_scratch_mount_marker: str | None = None
+    archive_max_file_gib: int = Field(default=100, ge=1, le=1024)
+    archive_max_expanded_gib: int = Field(default=20, ge=1, le=1024)
+    archive_max_files: int = Field(default=10000, ge=1, le=100000)
+    archive_max_depth: int = Field(default=4, ge=1, le=8)
+    archive_scan_timeout_seconds: int = Field(default=7200, ge=1, le=172800)
+    archive_free_space_buffer_gib: int = Field(default=1, ge=1, le=1024)
     per_job_scan_workers: int = 1
     clamd_max_inflight_requests: int = 4
     max_concurrent_scans: int = 2
@@ -190,6 +199,42 @@ class Settings(BaseSettings):
     @classmethod
     def validate_copy_destination(cls, value: str | None) -> str | None:
         return copy_destination(value)
+
+    @field_validator("archive_scratch_dir", "archive_scratch_mount_marker")
+    @classmethod
+    def validate_archive_storage_path(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        path = Path(value)
+        if (not path.is_absolute() or ".." in path.parts or path == Path("/")
+                or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+            raise ValueError("Use an absolute archive storage path without traversal or control characters")
+        return str(path)
+
+    @model_validator(mode="after")
+    def validate_archive_storage(self):
+        if self.archive_scratch_mount_marker:
+            if not self.archive_scratch_dir:
+                raise ValueError("Configure an archive scratch directory before its mount marker")
+            marker = Path(self.archive_scratch_mount_marker)
+            if not marker.is_relative_to(self.archive_scratch_dir) or str(marker) == self.archive_scratch_dir:
+                raise ValueError("Archive scratch mount marker must be a file inside the scratch directory")
+        if self.archive_scratch_dir:
+            scratch = Path(self.archive_workspace_root).resolve()
+            content_roots = (
+                self.local_staging_root, self.nas_staging_root,
+                *(location.path for location in self.effective_nas_locations),
+                self.quarantine_root, self.event_dir, "/copy-target",
+            )
+            for value in content_roots:
+                protected = Path(value).resolve()
+                if scratch.is_relative_to(protected) or protected.is_relative_to(scratch):
+                    raise ValueError("Archive scratch space must not overlap torrent staging, quarantine, events or copy targets")
+        return self
+
+    @property
+    def archive_workspace_root(self) -> str:
+        return str(Path(self.archive_scratch_dir or self.data_dir) / "archive-scan")
 
     @model_validator(mode="after")
     def validate_locations_and_hook(self):

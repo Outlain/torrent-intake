@@ -33,7 +33,8 @@ the supplied `.env.example` explicitly selects UID/GID `3000:3000`.
 | `TI_UI_PUBLISH_IP` | `127.0.0.1` | Host interface for the UI. Localhost requires a tunnel/proxy for remote access; a host LAN address permits access through that interface. |
 | `TI_UI_HOST_PORT` | `8095` | Browser-facing host port; the app still listens on container port `8000`. |
 | `MEDIA_NETWORK` | `shared_media_net` | Existing external Docker network that can reach qBittorrent's API endpoint. VLAN/VPN routing is managed outside Intake. |
-| `TI_DATA_HOST_DIR` | `/opt/docker/torrent-intake/data` | Local SSD/M.2 directory for SQLite, settings, token and restore work. |
+| `TI_DATA_HOST_DIR` | `/opt/docker/torrent-intake/data` | Local SSD/M.2 directory for SQLite, settings, token, restore work and temporary archive inspection copies. |
+| `TI_ARCHIVE_SCRATCH_HOST_DIR` | no default | Optional existing local/NAS scratch folder; uncomment its `/archive-scratch:rw` bind mount on Intake only, then set the application scratch directory to `/archive-scratch`. |
 | `TI_LOCAL_STAGING_HOST_DIR` | `/mnt/bulk/docker/torrent-intake/staging` | Local unfinished/intake torrent content. |
 | `TI_MEDIA_HOST_DIR` | `/mnt/media` | Intentional broad media mount, including NAS staging. |
 | `TI_HOOKS_HOST_DIR` | `/opt/docker/torrent-intake/hooks` | Optional existing operator-owned directory; uncomment its read-only `/hooks` mount for a post-promotion script. |
@@ -298,6 +299,15 @@ See [copy setup and recovery](README.md#optional-post-promotion-copy) and
 | `TI_FFMPEG_BINARY` | `/usr/bin/ffmpeg` | Image-provided bounded attachment extractor; normally leave unchanged. |
 | `TI_MEDIA_ATTACHMENT_MAX_MIB` | `16` | Per-object extraction budget (attachments, cover art, validated MP4 chapter-text tracks), hard maximum 64. |
 | `TI_MEDIA_ATTACHMENT_TOTAL_MIB` | `64` | Combined extracted-object budget in one media file, hard maximum 256. Unknown-size cover art/chapter tracks reserve the full per-object allowance. |
+| `TI_ARCHIVE_ENABLED` | `true` | Inspect oversized RAR4/RAR5/ZIP archives and eligible native size-limit failures using temporary copies; originals and torrent structure are preserved. |
+| `TI_ARCHIVE_SCRATCH_DIR` | unset (use `TI_DATA_DIR`) | Existing absolute container directory on local/NAS storage. Intake manages only its private `archive-scan` child. Editable under advanced Scanning settings. Missing custom storage never falls back to the data disk. A Docker bind mount must be provisioned separately. |
+| `TI_ARCHIVE_SCRATCH_MOUNT_MARKER` | unset | Optional existing readable regular marker file inside the custom scratch directory, e.g. `/archive-scratch/.intake-scratch-mount`. Intake never creates this file; missing markers hold archive scans. |
+| `TI_ARCHIVE_MAX_FILE_GIB` | `100` | Maximum source archive size, from 1 through 1024 GiB. |
+| `TI_ARCHIVE_MAX_EXPANDED_GIB` | `20` | Cumulative extraction budget per archive, including nested archive copies; 1–1024 GiB. Scratch uses `archive-scan` on the configured scratch storage, not `/tmp` or the torrent directory. |
+| `TI_ARCHIVE_MAX_FILES` | `10000` | Maximum entries across the archive and its nested RAR/ZIP archives, including directories; 1–100000. |
+| `TI_ARCHIVE_MAX_DEPTH` | `4` | Maximum nesting levels, counting the outer archive as level one; 1–8. |
+| `TI_ARCHIVE_SCAN_TIMEOUT_SECONDS` | `7200` | Total extraction and member-scan deadline; 1–172800 seconds. |
+| `TI_ARCHIVE_FREE_SPACE_BUFFER_GIB` | `1` | Free-space reserve on the selected scratch filesystem during extraction; 1–1024 GiB. Each concurrent archive job has its own extraction budget. |
 
 App definition-age checks use the loaded daemon's reported timestamp. Sidecar
 startup/health checks inspect database files on disk. They are independent checks,

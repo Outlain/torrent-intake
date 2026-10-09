@@ -352,6 +352,8 @@ def run() -> None:
     else:
         raise AssertionError("encrypted archive received a verdict")
     assert not list(Path("/tmp").glob("ti-attachment-*")), "temporary attachments leaked"
+    from integration_archives import run_archive_checks
+    run_archive_checks(scanner, identity, ROOT, EICAR)
     if os.environ.get("TI_TEST_BENCHMARK_WINDOWS") == "1":
         benchmark_windows(scanner, clean_asf)
 

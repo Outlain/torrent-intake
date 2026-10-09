@@ -3,7 +3,7 @@ FROM python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f14
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg rsync \
+    && apt-get install -y --no-install-recommends ffmpeg rsync libarchive13 \
     && rm -rf /var/lib/apt/lists/* \
     && ffprobe -version >/dev/null \
     && rsync --version >/dev/null \

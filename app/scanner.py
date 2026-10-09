@@ -18,6 +18,7 @@ from email.utils import parsedate_to_datetime
 from subprocess import CompletedProcess
 
 from .config import get_settings
+from .archive_tools import ArchiveError, ArchiveLimits, archive_format, require_archive_storage, scan_archive
 from .media_tools import MAX_SINGLE_ALLOCATION_BYTES, MAX_STDOUT_BYTES, MediaToolError, run_media_tool
 
 VERSION_PATTERN = re.compile(r"ClamAV\s+([^/\s]+)/([^/\s]+)/([^\r\n]+)", re.IGNORECASE)
@@ -31,7 +32,7 @@ LIMIT_DETECTION_MARKERS = (
 STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_REPLY_BYTES = 1024 * 1024
 FileIdentity = tuple[int, int, int, int, int]
-SCANNER_IMPLEMENTATION_POLICY = "bounded-media-attachments-v2-cover-art"
+SCANNER_IMPLEMENTATION_POLICY = "bounded-media-attachments-v3-archive-members"
 
 LARGE_VIDEO_FORMATS = frozenset(
     {
@@ -515,6 +516,11 @@ class ScannerService:
             "policy_version": self.settings.scanner_policy_version,
             "media_attachment_max_mib": self.settings.media_attachment_max_mib,
             "media_attachment_total_mib": self.settings.media_attachment_total_mib,
+            "archive_enabled": self.settings.archive_enabled,
+            "archive_max_file_gib": self.settings.archive_max_file_gib,
+            "archive_max_expanded_gib": self.settings.archive_max_expanded_gib,
+            "archive_max_files": self.settings.archive_max_files,
+            "archive_max_depth": self.settings.archive_max_depth,
         }
         fingerprint = hashlib.sha256(
             json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -560,6 +566,8 @@ class ScannerService:
         heartbeat: Callable[[], bool] | None = None,
         should_stop: Callable[[], bool] | None = None,
         expected_file_identity: FileIdentity | None = None,
+        _deadline: float = float("inf"),
+        _allow_archives: bool = True,
     ) -> ScanResult:
         identity = identity or self.require_healthy(force=True)
         try:
@@ -577,7 +585,8 @@ class ScannerService:
                 raise ScanInterrupted("scan interrupted before the current file started")
             started_at = datetime.utcnow()
             started = time.monotonic()
-            native_deadline = started + max(self.settings.scanner_scan_timeout_seconds, 60)
+            native_deadline = min(_deadline, started + max(self.settings.scanner_scan_timeout_seconds, 60))
+            is_archive = _allow_archives and archive_format(descriptor) is not None
             if initial_stat.st_size <= self.settings.scanner_max_file_bytes:
                 try:
                     infected, threat_name, output = self._scan_descriptor(
@@ -594,25 +603,28 @@ class ScannerService:
                         raise
                     # MaxScanSize accounts for parser/expanded content, so a
                     # file below the raw native-size boundary can still reach
-                    # it. Retry only through the media route: that route first
-                    # verifies the real container and rejects archives or
-                    # unknown formats before using bounded ClamD windows.
+                    # it. Known archives use bounded member extraction; media
+                    # must pass container validation before using ClamD windows.
                     try:
-                        infected, threat_name, output = self._scan_large_media_descriptor(
-                            descriptor,
-                            path,
-                            expected,
-                            heartbeat=heartbeat,
-                            should_stop=should_stop,
-                        )
+                        if is_archive:
+                            infected, threat_name, output = self._scan_archive_descriptor(
+                                descriptor, path, expected, identity=identity,
+                                heartbeat=heartbeat, should_stop=should_stop, deadline=_deadline,
+                            )
+                        else:
+                            infected, threat_name, output = self._scan_large_media_descriptor(
+                                descriptor, path, expected, heartbeat=heartbeat,
+                                should_stop=should_stop, deadline=_deadline,
+                            )
                     except ScannerPolicyError as fallback_error:
+                        fallback = "archive" if is_archive else "verified-media"
                         raise ScannerPolicyError(
-                            f"{native_limit}; verified-media fallback was rejected: {fallback_error}"
+                            f"{native_limit}; {fallback} fallback was rejected: {fallback_error}"
                         ) from fallback_error
                     output = (
                         f"native-limit fallback ({native_limit}); {output}"
                     )[:MAX_REPLY_BYTES]
-                    scan_method = "media_windows_and_attachments"
+                    scan_method = "archive_members" if is_archive else "media_windows_and_attachments"
                 else:
                     # Matroska attachments are not necessarily extracted by
                     # ClamAV's native scan. Inspect them even below 2000 MiB.
@@ -629,6 +641,12 @@ class ScannerService:
                         if probe.attachments:
                             scan_method = "clamd_native_with_attachments"
                             output = f"{output}; {attachment_output}"
+            elif is_archive:
+                infected, threat_name, output = self._scan_archive_descriptor(
+                    descriptor, path, expected, identity=identity,
+                    heartbeat=heartbeat, should_stop=should_stop, deadline=_deadline,
+                )
+                scan_method = "archive_members"
             else:
                 infected, threat_name, output = self._scan_large_media_descriptor(
                     descriptor,
@@ -636,6 +654,7 @@ class ScannerService:
                     expected,
                     heartbeat=heartbeat,
                     should_stop=should_stop,
+                    deadline=_deadline,
                 )
                 scan_method = "media_windows_and_attachments"
             self._verify_file_identity(descriptor, path, expected)
@@ -804,6 +823,66 @@ class ScannerService:
         infected, threat_name = parse_scan_response(output)
         return infected, threat_name, output
 
+    def _scan_archive_descriptor(
+        self, descriptor: int, path: str, expected: FileIdentity, *, identity: ScannerIdentity,
+        heartbeat: Callable[[], bool] | None, should_stop: Callable[[], bool] | None,
+        deadline: float = float("inf"),
+    ) -> tuple[bool, str | None, str]:
+        if not self.settings.archive_enabled:
+            raise ScannerPolicyError(f"archive exceeds native scan limits and archive inspection is disabled: {path}")
+        if expected[2] > self.settings.archive_max_file_gib * 1024**3:
+            raise ScannerPolicyError(f"archive exceeds TI_ARCHIVE_MAX_FILE_GIB: {path}")
+        timeout = self.settings.archive_scan_timeout_seconds
+        deadline = min(deadline, time.monotonic() + timeout)
+        next_heartbeat = 0.0
+
+        def check_active() -> None:
+            nonlocal next_heartbeat
+            if should_stop and should_stop():
+                raise ScanInterrupted("scan interrupted during archive inspection")
+            if time.monotonic() >= deadline:
+                raise ScannerPolicyError(f"archive inspection timed out: {path}")
+            if time.monotonic() >= next_heartbeat:
+                if self.settings.archive_scratch_dir:
+                    require_archive_storage(self.settings.archive_scratch_dir, self.settings.archive_scratch_mount_marker)
+                if heartbeat and not heartbeat():
+                    raise ScanInterrupted("scan lease was lost during archive inspection")
+                self._verify_file_identity(descriptor, path, expected)
+                next_heartbeat = time.monotonic() + 5
+
+        def inspect_member(member_path: str, name: str) -> tuple[bool, str | None, str]:
+            check_active()
+            try:
+                result = self.scan_path(
+                    member_path, identity=identity, heartbeat=heartbeat, should_stop=should_stop,
+                    _deadline=deadline, _allow_archives=False,
+                )
+            except ScannerPolicyError as exc:
+                raise ScannerPolicyError(f"archive member {json.dumps(name)} could not be inspected: {exc}: {path}") from exc
+            return result.infected, result.threat_name, result.scan_method
+
+        limits = ArchiveLimits(
+            expanded_bytes=self.settings.archive_max_expanded_gib * 1024**3,
+            files=self.settings.archive_max_files, depth=self.settings.archive_max_depth,
+            reserve_bytes=self.settings.archive_free_space_buffer_gib * 1024**3,
+            timeout_seconds=timeout,
+        )
+        try:
+            result = scan_archive(
+                descriptor, data_dir=self.settings.data_dir, limits=limits,
+                check_active=check_active, scan_member=inspect_member,
+                scratch_dir=self.settings.archive_scratch_dir, mount_marker=self.settings.archive_scratch_mount_marker,
+            )
+        except (ArchiveError, OSError) as exc:
+            raise ScannerPolicyError(f"archive inspection failed: {exc}: {path}") from exc
+        if self.settings.archive_scratch_dir:
+            try:
+                require_archive_storage(self.settings.archive_scratch_dir, self.settings.archive_scratch_mount_marker)
+            except ArchiveError as exc:
+                raise ScannerPolicyError(f"archive inspection failed: {exc}: {path}") from exc
+        self._verify_file_identity(descriptor, path, expected)
+        return result
+
     def _scan_large_media_descriptor(
         self,
         descriptor: int,
@@ -812,6 +891,7 @@ class ScannerService:
         *,
         heartbeat: Callable[[], bool] | None,
         should_stop: Callable[[], bool] | None,
+        deadline: float = float("inf"),
     ) -> tuple[bool, str | None, str]:
         if not self.settings.large_media_enabled:
             raise ScannerPolicyError(
@@ -834,7 +914,7 @@ class ScannerService:
             raise ScannerPolicyError(f"invalid large-media window configuration: {exc}") from exc
 
         timeout = max(int(self.settings.large_media_scan_timeout_seconds), 60)
-        deadline = time.monotonic() + timeout
+        deadline = min(deadline, time.monotonic() + timeout)
         probe = self._probe_large_media_descriptor(
             descriptor, path, deadline=deadline, heartbeat=heartbeat, should_stop=should_stop,
         )

@@ -79,8 +79,9 @@ identity again. ClamAV limit detections, malformed replies, unavailable/stale
 definitions, and socket failures never become clean verdicts.
 
 The native raw-file and `INSTREAM` boundary remains `2000 MiB`. That is now a
-routing boundary, not the application's final ceiling. A larger file is accepted
-only when `ffprobe` identifies either an approved container with a real video
+routing boundary, not the application's final ceiling. RAR/ZIP archives above
+that boundary use the bounded member-inspection route described below. A larger
+media file is accepted only when `ffprobe` identifies an approved container with a real video
 stream and no unsupported stream or attachment type, or narrowly validated raw
 TrueHD audio. Torrent Intake then reads every byte in independent `512 MiB` ClamD
 windows with a `1024 KiB` overlap. Up to four windows from that file are streamed
@@ -227,8 +228,8 @@ up to `4000 MiB` with `CLAMD_MAX_SCAN_SIZE_MIB`. Consequently, a file below
 raw-file or stream boundary. When that limit response still occurs, Torrent
 Intake requires the same `ffprobe` media validation and retries the file through
 the bounded overlapping-window route. This fallback never applies merely because
-a filename looks like media: archives, unknown formats, and unsafe attachments
-remain held without a clean verdict.
+a filename looks like media. Recognized RAR/ZIP archives use separate bounded
+member inspection; unknown formats and unsafe attachments remain held.
 
 The sidecar validates `CLAMD_MAX_SCAN_SIZE_MIB` as a whole number from `1` through
 `4000`, writes a private runtime configuration under the `/tmp` tmpfs, and changes
@@ -268,11 +269,93 @@ ClamD sees all raw bytes and `ffprobe` identifies the container and stream table
 it does not fully decode or prove the file is harmless. Whole-file hashes and
 parsers cannot span independent ClamD windows. The default bounded
 ceiling is `100 GiB`, so normal 5-50 GiB MKV/MP4 files can complete without being
-skipped. Oversized archives, disk images, executables, unapproved audio-only
+skipped. Unsupported oversized archives, disk images, executables, unapproved audio-only
 files, unknown formats, unsafe media attachments, files above the configured
 ceiling, and limit/error responses that the validated-media fallback cannot
 safely resolve remain held with no clean verdict. A filename extension never
 selects the large-media path.
+
+### Oversized RAR and ZIP archives
+
+RAR4, RAR5 and ZIP/ZIP64 archives are identified by their bytes before the media
+fallback. Archives above the native boundary, or whose native scan hits an
+eligible size limit, can use `archive_members` inspection. Small archives that
+complete their native scan retain the native verdict. No native ClamAV size
+limit needs to be raised for a 6 GiB RAR containing ordinary photo files.
+
+**The original torrent is never extracted in place.** The archive's bytes,
+filename, and every original torrent folder remain unchanged. Promotion still
+moves the original torrent, including its archives. Extracted copies are only
+for inspection; they are never added to the torrent or its final destination.
+
+A separate libarchive helper reads the already-open archive descriptor and
+writes application-named, non-executable temporary members under
+`TI_ARCHIVE_SCRATCH_DIR/archive-scan`, defaulting to `TI_DATA_DIR/archive-scan`
+(normally `/app/data/archive-scan`). Archive paths are
+never used as output paths. Every regular member must complete its own scanner
+route before the helper proceeds. Oversized verified media members can use the
+existing media route; oversized unsupported members remain held. Nested RAR/ZIP
+archives share the outer archive's entry, expanded-byte, depth and time budgets.
+Other nested formats must complete the normal scanner route.
+
+Defaults allow a 100 GiB source archive, 20 GiB of cumulative extracted data,
+10,000 entries, four nesting levels, and two hours for extraction plus scanning.
+The helper keeps at least 1 GiB free on the scratch filesystem and uses one leaf
+member at a time, plus any containing nested archive copies. The selected
+scratch filesystem needs space for these copies; the 256 MiB media `/tmp`
+tmpfs is not used. Concurrent archive jobs each have their own budget. These
+limits are available in Settings & Help under Scanning and `TI_ARCHIVE_*`.
+
+For a dedicated disk or NAS, bind an existing scratch folder into **Intake only**
+at `/archive-scratch`, then set **Archive scratch storage** to `/archive-scratch`
+in Settings & Help. Alternatively set `TI_ARCHIVE_SCRATCH_DIR=/archive-scratch`
+in the application's container environment. This is a container path, not the
+host's path. Leave it blank to use the application data directory again.
+Keep the scratch folder separate from torrent staging, quarantine and copy
+targets. Only a private `archive-scan` subdirectory is managed by Intake; other
+files on the selected storage are left alone. Original torrent folders remain
+unchanged regardless of scratch location.
+
+The Compose/Portainer examples include a commented bind mount using
+`TI_ARCHIVE_SCRATCH_HOST_DIR` and `create_host_path: false`. Mount the NAS on the
+host first and give the Intake UID/GID write access. The root may be a shared
+directory, but Intake's `archive-scan` subdirectory must support private ownership
+and permissions and advisory file locks. Concurrent controllers using the same
+scratch filesystem can scan together; startup cleanup skips storage with active
+scans. Completed workspaces are removed after each scan; stale workspaces are
+cleaned on startup when no scanner is using that storage.
+
+An optional **Archive scratch mount marker**, for example
+`/archive-scratch/.intake-scratch-mount`, must be created by the operator on the
+intended storage. Missing storage or a missing configured marker blocks archive
+inspection without falling back to the application disk. An unavailable NAS
+does not stop the UI or unrelated native/media scans from starting. Neither a
+directory nor a marker alone proves a NAS mount is healthy. The existing free-
+space reserve is measured on the selected scratch filesystem. Settings follow
+the normal pause/save/restart workflow; changing them does not move old scratch
+files or provision Docker mounts.
+
+Encrypted entries, multipart archives, unsupported compression, malformed data,
+CRC/read failures, traversal paths, links, special files and exceeded budgets
+block promotion. RAR5 payload members currently require CRC32 checksums; archives
+using only alternate checksums remain held. RAR framing and member checksums are
+verified explicitly, including complete end records and absence of trailing data.
+Empty archives/directories contain no payload members to scan.
+Pause, lease loss, detection and extraction/scan failures terminate the helper
+and remove temporary copies. Startup removes stale private workspaces after
+acquiring the exclusive controller lock. The source identity is checked during
+inspection and again before recording a result.
+
+`archive_members` records scans of the extracted content, not a native whole-
+archive verdict. It does not scan archive comments/headers as separate objects
+or guarantee that libarchive and every possible extraction tool interpret an
+archive identically. The helper has memory/CPU/output limits; these are not a
+complete sandbox for a compromised parser. Keep the application image updated.
+
+To enable this in an existing deployment, rebuild/redeploy the application image
+(it now includes `libarchive13`) and retry the failed job. The sidecar limits and
+original torrent data do not need changing. The scan policy revision invalidates
+previous clean checkpoints so they are re-evaluated under the new policy.
 
 ### Inspection warnings and remaining limits
 
@@ -776,7 +859,7 @@ written without the `TI_` prefix in `settings.json`:
 | `TI_POST_PROMOTION_TIMEOUT_SECONDS` | `7200` | whole copy/script attempt deadline |
 | `TI_FINAL_PARENT_PREFIX` | `/downloads` | primary allowed media root |
 | `TI_FINAL_PARENT_PREFIXES` | empty | optional additional mounted media roots |
-| `TI_SCANNER_MAX_FILE_MIB` | `2000` | native ClamD boundary; larger verified video and raw TrueHD content use the large-media route |
+| `TI_SCANNER_MAX_FILE_MIB` | `2000` | native ClamD boundary; larger RAR/ZIP archives use member inspection, verified video and raw TrueHD use the large-media route |
 | `TI_SCANNER_POLICY_VERSION` | `clamav-policy-v5-media-attachments` | checkpoint policy identity; changing it deliberately reschedules prior file checkpoints |
 | `TI_SCANNER_SCAN_TIMEOUT_SECONDS` | `1200` | total per-file client deadline |
 | `TI_LARGE_MEDIA_ENABLED` | `true` | enable verified oversized-video and raw-TrueHD routing |

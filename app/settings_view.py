@@ -229,7 +229,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     "scanner_max_file_mib": SettingSpec(
         "ClamAV scanner",
         "Native ClamD stream boundary",
-        "Raw-size boundary for one native ClamD stream. Larger verified videos and raw TrueHD audio, plus eligible media whose native parser reaches MaxScanSize, use bounded overlapping windows; other unsupported content remains held.",
+        "Raw-size boundary for one native ClamD stream. Larger RAR/ZIP archives use member extraction; verified video and raw TrueHD use bounded windows. Eligible native size-limit failures use the same routes.",
         safety_critical=True,
     ),
     "scanner_health_cache_seconds": SettingSpec(
@@ -312,6 +312,45 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         "ClamAV scanner", "Total attachment budget",
         "Maximum MiB extracted from one media file, at most 256. Cover images reserve their per-attachment maximum because their size is unknown before extraction.",
         safety_critical=True,
+    ),
+    "archive_enabled": SettingSpec(
+        "ClamAV scanner", "Archive member scanning",
+        "Inspect oversized RAR/ZIP archives and eligible native size-limit failures using temporary extracted copies. Original archives and torrent folders are preserved.",
+        safety_critical=True,
+    ),
+    "archive_scratch_dir": SettingSpec(
+        "ClamAV scanner", "Archive scratch storage",
+        "Existing container directory on local or NAS storage. Intake uses a private archive-scan subdirectory. Leave blank to use TI_DATA_DIR. Configure the matching writable Docker mount first; unavailable custom storage never falls back to the data disk.",
+        safety_critical=True,
+    ),
+    "archive_scratch_mount_marker": SettingSpec(
+        "ClamAV scanner", "Archive scratch mount marker",
+        "Optional absolute path to an existing readable marker file inside custom scratch storage. A missing marker blocks archive inspection; Intake never creates it. Leave blank to disable the marker check.",
+        safety_critical=True,
+    ),
+    "archive_max_file_gib": SettingSpec(
+        "ClamAV scanner", "Maximum archive size",
+        "Maximum GiB for a source RAR/ZIP archive admitted to member scanning.", safety_critical=True,
+    ),
+    "archive_max_expanded_gib": SettingSpec(
+        "ClamAV scanner", "Archive extraction budget",
+        "Maximum total GiB extracted per archive, including nested archive copies. Scratch files use the selected scratch filesystem and are removed after inspection.", safety_critical=True,
+    ),
+    "archive_max_files": SettingSpec(
+        "ClamAV scanner", "Maximum archive entries",
+        "Total entries, including directories and nested archives, admitted during one archive inspection.", safety_critical=True,
+    ),
+    "archive_max_depth": SettingSpec(
+        "ClamAV scanner", "Maximum archive nesting",
+        "Maximum RAR/ZIP nesting levels sharing the extraction budget; the outer archive is level one.", safety_critical=True,
+    ),
+    "archive_scan_timeout_seconds": SettingSpec(
+        "ClamAV scanner", "Archive inspection timeout",
+        "Total seconds allowed for extraction and all member scans of one archive.",
+    ),
+    "archive_free_space_buffer_gib": SettingSpec(
+        "ClamAV scanner", "Archive scratch free-space reserve",
+        "GiB kept free on the selected scratch filesystem while temporary members are extracted.", safety_critical=True,
     ),
     "per_job_scan_workers": SettingSpec(
         "Scan scheduling",
@@ -450,6 +489,9 @@ ADVANCED_SETTINGS = frozenset({
     "pause_confirmation_timeout_seconds",
     "nas_staging_locations", "post_promotion_enabled",
     "post_promotion_copy_enabled", "post_promotion_copy_rules",
+    "archive_enabled", "archive_max_file_gib", "archive_max_expanded_gib", "archive_max_files",
+    "archive_max_depth", "archive_free_space_buffer_gib",
+    "archive_scratch_dir", "archive_scratch_mount_marker",
 })
 
 # Shared by the form controls and the settings API.
@@ -459,6 +501,9 @@ NUMBER_LIMITS = {
     "per_job_scan_workers": (1, 4), "clamd_max_inflight_requests": (1, 4),
     "media_attachment_max_mib": (1, 64), "media_attachment_total_mib": (1, 256),
     "post_promotion_delay_seconds": (0, 3600), "post_promotion_timeout_seconds": (1, 604800),
+    "archive_max_file_gib": (1, 1024), "archive_max_expanded_gib": (1, 1024),
+    "archive_max_files": (1, 100000), "archive_max_depth": (1, 8),
+    "archive_scan_timeout_seconds": (1, 172800), "archive_free_space_buffer_gib": (1, 1024),
 }
 
 
@@ -481,6 +526,10 @@ def build_settings_catalog(settings: Settings, pending: Settings | None = None) 
         current_value = getattr(settings, name)
         current_display = _display_value(spec, current_value)
         default_display = _display_value(spec, field.get_default(call_default_factory=True), default=True)
+        if name == "archive_scratch_dir":
+            default_display = "TI_DATA_DIR (normally /app/data)"
+            if current_value is None:
+                current_display = f"Automatic: {settings.data_dir}"
         editable = ui_editable(name) and name not in overrides
         if not ui_editable(name):
             permission = "deployment"

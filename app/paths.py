@@ -43,6 +43,9 @@ def canonical_final_parent(value: str, settings) -> str:
         settings.nas_staging_root,
         *(location.path for location in getattr(settings, "effective_nas_locations", ())),
     }
+    archive_workspace = getattr(settings, "archive_workspace_root", None)
+    if archive_workspace:
+        blocked_values.add(archive_workspace)
     for raw_blocked in blocked_values:
         blocked = _clean_absolute(raw_blocked, "blocked operational path")
         if path_is_within(candidate, blocked):

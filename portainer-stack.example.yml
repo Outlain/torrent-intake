@@ -21,7 +21,18 @@ services:
     # Advanced custom-script alternative only (mutually exclusive with built-in copy):
     #   TI_POST_PROMOTION_SCRIPT: /hooks/after-promotion-copy.py
     volumes:
+      # Default archive scratch: /app/data/archive-scan; optional dedicated storage below.
+      # Budget: 20 GiB per archive job by default, plus a 1 GiB free-space reserve.
       - ${TI_DATA_HOST_DIR:-/opt/docker/torrent-intake/data}:/app/data:rw
+      # Optional archive scratch disk/NAS, mounted on Intake only.
+      # First configure Archive scratch storage = /archive-scratch in Settings & Help.
+      # Optional marker: /archive-scratch/.intake-scratch-mount (create on the host storage).
+      # - type: bind
+      #   source: ${TI_ARCHIVE_SCRATCH_HOST_DIR:?set_existing_scratch_storage}
+      #   target: /archive-scratch
+      #   read_only: false
+      #   bind:
+      #     create_host_path: false
       - ${TI_LOCAL_STAGING_HOST_DIR:-/mnt/bulk/docker/torrent-intake/staging}:/staging-local:rw
       - ${TI_MEDIA_HOST_DIR:-/mnt/media}:/downloads:rw
       - ${TI_EVENTS_HOST_DIR:-/opt/docker/clamav-shared/events/torrent-intake}:/events:rw

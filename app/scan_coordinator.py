@@ -711,6 +711,11 @@ class ScanCoordinator:
             raise RuntimeError(f"scan path does not exist: {root}")
         if root.is_symlink():
             raise RuntimeError(f"scan path cannot be a symbolic link: {root}")
+        if self.settings.archive_scratch_dir:
+            scratch = Path(self.settings.archive_workspace_root).resolve()
+            source = root.resolve()
+            if scratch.is_relative_to(source) or source.is_relative_to(scratch):
+                raise ScannerPolicyError("Archive scratch space must be outside the torrent being scanned")
         if root.is_file():
             stat = root.stat()
             return [(".", stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev, stat.st_ino)]
