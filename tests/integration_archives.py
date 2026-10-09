@@ -54,13 +54,21 @@ def run_archive_checks(scanner: ScannerService, identity, root: Path, eicar: byt
         assert result.infected and "nested.rar!/deep/test.txt" in result.raw_output, result
         print("PASS nested archive member detection", flush=True)
 
-        # A tiny compressed ZIP can exceed the real daemon's 16 MiB expansion
-        # limit. Its individual files remain below the native stream boundary.
+        # This ZIP exceeds the normal daemon's 16 MiB expansion limit, while
+        # every member fits the native stream boundary. Benchmark mode raises
+        # the daemon's expansion budget to 4000 MiB, so a native clean verdict
+        # is expected there. CI runs both modes to exercise both routes.
         archive.write_bytes(zip_archive([(f"photo-{index}.txt", first) for index in range(30)]))
         result = scanner.scan_path(str(archive), identity=identity)
-        assert result.clean and result.scan_method == "archive_members", result
-        assert "native-limit fallback" in result.raw_output, result
-        print("PASS real native expansion-limit fallback to archive member scans", flush=True)
+        assert result.clean, result
+        if os.environ.get("TI_TEST_BENCHMARK_WINDOWS") == "1":
+            assert result.scan_method == "clamd_native", result
+            assert "native-limit fallback" not in result.raw_output, result
+            print("PASS native archive scan within benchmark daemon's expanded-data budget", flush=True)
+        else:
+            assert result.scan_method == "archive_members", result
+            assert "native-limit fallback" in result.raw_output, result
+            print("PASS real native expansion-limit fallback to archive member scans", flush=True)
 
         corrupt = rar5([("photo.jpg", first + second)])
         archive.write_bytes(corrupt[:-7])

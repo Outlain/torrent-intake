@@ -85,6 +85,9 @@ jobs:
             'import clamd_entrypoint; clamd_entrypoint.configured_max_scan_size_mib()'
 
       - name: Test real media scanning over the private ClamD socket
+        run: bash tests/run_media_integration.sh
+
+      - name: Test large-media windows with benchmark daemon limits
         env:
           TI_TEST_BENCHMARK_WINDOWS: "1"
         run: bash tests/run_media_integration.sh
