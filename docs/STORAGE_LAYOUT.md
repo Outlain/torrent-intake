@@ -210,8 +210,11 @@ or Intake jobs. It is a controlled cutover, **not live transparent storage tieri
 
 1. Verify backups and SSD free capacity. Seed `ssd/media/movies` from
    `hdd/media/movies`, preferably with TrueNAS local ZFS snapshot replication.
-2. Pause/drain Intake, stop active copy actions safely, pause qBittorrent work using
-   Movies, and stop all other writers. Stop affected containers before unmounting.
+2. Let active moves/copies finish where possible, then pause/drain Intake. Review
+   queued/failed/interrupted copies and use **Cancel copy** for requests that must
+   not follow the replacement mounts; cancellation removes no media. Pause
+   qBittorrent work using Movies and stop all other writers. Stop affected
+   containers before unmounting.
 3. Take and replicate the final snapshot/delta. Verify data, ACLs, UID/GID and
    required marker files. Keep the old dataset intact for rollback. Disable old
    replication schedules that would overwrite the now-active destination.
@@ -224,6 +227,15 @@ or Intake jobs. It is a controlled cutover, **not live transparent storage tieri
 6. Check qBittorrent's files and Intake's setup, then resume. Identity-sensitive
    scan checkpoints may need rescanning after changing filesystems; this is safe,
    but uninterrupted scan progress is not promised.
+
+For reversed copy direction, bind the active dataset at the same `/downloads/Movies`
+path in **both** qBittorrent and Intake, and the other dataset only in Intake at
+`/copy-target/movies`. The existing rule keeps working for new promotions. A queued
+rule pins path strings, not an export identity: cancel unwanted old requests
+before the switch. Already successful jobs never automatically recopy themselves.
+Routed copies accept an existing identical target only after matching its whole
+tree and bytes (or an unchanged matching receipt); conflicting content is never
+merged or overwritten. This is not bidirectional library synchronization.
 
 TrueNAS local replication can copy selected datasets between pools on the same
 system. A replication destination may be read-only depending on its properties;

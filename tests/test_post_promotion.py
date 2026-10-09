@@ -655,6 +655,147 @@ class PostPromotionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rejected.exception.status_code, 409)
             self.assertEqual(self.record().hook_status, "failed")
 
+    async def test_cancel_copy_preserves_media_audit_and_cannot_replay(self) -> None:
+        from fastapi import HTTPException
+        from app.main import cancel_promotion_copy, retry_promotion_hook
+
+        destination = self.enable_copy()
+        partial = destination / "partial-copy"
+        partial.write_bytes(b"keep partial data")
+        self.job()
+        controller = SimpleNamespace(operation_lock=asyncio.Lock(), require_drained=Mock())
+        service = JobService()
+        service.qbt = Mock()
+        with patch("app.main.controller", controller), patch("app.main.SessionLocal", self.sessions), patch("app.main.settings", self.settings):
+            for status in ("pending", "failed", "interrupted"):
+                with self.subTest(status=status):
+                    self.update(hook_status=status, hook_attempts=2, hook_output="saved diagnostic", hook_exit_code=9)
+                    before = self.record()
+                    result = await cancel_promotion_copy("hook-job")
+                    self.assertEqual(result["hook_status"], "cancelled")
+                    job = self.record()
+                    self.assertEqual(job.hook_status, "cancelled")
+                    self.assertIsNotNone(job.hook_finished_at)
+                    self.assertIn("No files were removed", job.hook_error)
+                    self.assertEqual(job.hook_attempts, 2)
+                    self.assertEqual(job.hook_output, "saved diagnostic")
+                    self.assertEqual(job.hook_exit_code, 9)
+                    for field in ("state", "content_path", "qbt_hash", "promoted_at", "scan_completed_at",
+                                  "hook_destination", "hook_copy_source_root", "hook_copy_relative_path"):
+                        self.assertEqual(getattr(job, field), getattr(before, field), field)
+                    with self.sessions() as db:
+                        self.assertIsNotNone(db.scalar(select(ScanFile).where(ScanFile.job_id == "hook-job")))
+                        self.assertFalse(queue_promotion_hook(db.get(Job, "hook-job"), self.settings))
+                    self.assertEqual(self.runner.recover_interrupted(), 0)
+                    self.assertIsNone(self.runner.claim_next())
+                    with self.assertRaises(HTTPException) as rejected:
+                        await retry_promotion_hook("hook-job")
+                    self.assertEqual(rejected.exception.status_code, 409)
+            # Clearing Intake history after cancellation must never delete media.
+            with self.sessions() as db:
+                service.delete_job(db, job_id="hook-job")
+            with self.sessions() as db:
+                self.assertIsNone(db.get(Job, "hook-job"))
+            self.assertEqual((self.source / "video.mkv").read_bytes(), b"clean media")
+            self.assertEqual(partial.read_bytes(), b"keep partial data")
+            self.assertEqual(service.qbt.mock_calls, [])
+
+    async def test_cancel_stale_copy_needs_no_source_destination_or_qbt_access(self) -> None:
+        from app.main import cancel_promotion_copy
+
+        destination = self.enable_copy()
+        self.job()
+        (self.source / "video.mkv").unlink()
+        self.source.rmdir()
+        (destination / ".intake-copy-mount").unlink()
+        destination.rmdir()
+        controller = SimpleNamespace(operation_lock=asyncio.Lock(), require_drained=Mock())
+        with patch("app.main.controller", controller), patch("app.main.SessionLocal", self.sessions), patch("app.main.service") as service:
+            result = await cancel_promotion_copy("hook-job")
+        self.assertEqual(result["hook_status"], "cancelled")
+        self.assertEqual(self.record().state, "done")
+        self.assertFalse(self.source.exists())
+        self.assertFalse(destination.exists())
+        self.assertEqual(service.mock_calls, [])
+        self.runner.qbt = Mock()
+        self.assertIsNone(self.runner.claim_next())
+        self.assertEqual(self.runner.qbt.mock_calls, [])
+
+    async def test_cancel_copy_refuses_running_succeeded_script_missing_and_undrained(self) -> None:
+        from fastapi import HTTPException
+        from app.main import cancel_promotion_copy
+
+        self.enable_copy()
+        self.job()
+        controller = SimpleNamespace(operation_lock=asyncio.Lock(), require_drained=Mock())
+        with patch("app.main.controller", controller), patch("app.main.SessionLocal", self.sessions):
+            for kind, status in (("copy", "running"), ("copy", "succeeded"), ("copy", None),
+                                 ("copy", "cancelled"), ("script", "pending"), ("script", "failed")):
+                with self.subTest(kind=kind, status=status):
+                    self.update(hook_kind=kind, hook_status=status)
+                    with self.assertRaises(HTTPException) as rejected:
+                        await cancel_promotion_copy("hook-job")
+                    self.assertEqual(rejected.exception.status_code, 409)
+                    self.assertEqual(self.record().hook_status, status)
+            with self.assertRaises(HTTPException) as rejected:
+                await cancel_promotion_copy("missing-job")
+            self.assertEqual(rejected.exception.status_code, 409)
+            self.update(hook_kind="copy", hook_status="pending")
+            controller.require_drained.side_effect = ValueError("Pause and drain first")
+            with self.assertRaises(HTTPException) as rejected:
+                await cancel_promotion_copy("hook-job")
+            self.assertEqual(rejected.exception.status_code, 409)
+            self.assertEqual(self.record().hook_status, "pending")
+
+    async def test_cancel_copy_uses_live_status_not_stale_pending_session(self) -> None:
+        from fastapi import HTTPException
+        from app.main import cancel_promotion_copy
+
+        self.enable_copy()
+        self.job()
+        controller = SimpleNamespace(operation_lock=asyncio.Lock(), require_drained=Mock())
+        with self.sessions() as stale_db:
+            stale_job = stale_db.get(Job, "hook-job")
+            self.assertEqual(stale_job.hook_status, "pending")
+            self.update(hook_status="running", hook_attempts=1)
+            self.assertEqual(stale_job.hook_status, "pending")
+            with patch("app.main.controller", controller), patch("app.main.SessionLocal", return_value=stale_db):
+                with self.assertRaises(HTTPException) as rejected:
+                    await cancel_promotion_copy("hook-job")
+                self.assertEqual(rejected.exception.status_code, 409)
+        self.assertEqual(self.record().hook_status, "running")
+        self.assertEqual(self.record().hook_attempts, 1)
+
+    async def test_cancel_copy_admin_guard_rejects_missing_token_and_cross_origin(self) -> None:
+        from fastapi import Request, Response
+        from app.main import administration_guard, cancel_promotion_copy
+
+        self.enable_copy()
+        self.job()
+        controller = SimpleNamespace(operation_lock=asyncio.Lock(), require_drained=Mock(),
+                                     paused=True, authorized=lambda supplied: supplied == "test-admin-token")
+
+        async def handler(request):
+            await cancel_promotion_copy("hook-job")
+            return Response("cancelled")
+
+        def request(headers=()):
+            return Request({"type": "http", "method": "POST", "scheme": "http",
+                            "path": "/admin/jobs/hook-job/cancel-copy", "query_string": b"",
+                            "headers": [(b"host", b"localhost"), *headers]})
+
+        with patch("app.main.controller", controller), patch("app.main.SessionLocal", self.sessions):
+            response = await administration_guard(request(), handler)
+            self.assertEqual(response.status_code, 403)
+            headers = [(b"x-ti-admin-token", b"test-admin-token"), (b"origin", b"http://other-host")]
+            response = await administration_guard(request(headers), handler)
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(self.record().hook_status, "pending")
+            controller.require_drained.assert_not_called()
+            response = await administration_guard(request(headers[:1]), handler)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(self.record().hook_status, "cancelled")
+
     def test_delete_refuses_pending_and_running_hook_without_losing_scan_audit(self) -> None:
         self.job()
         service = JobService()

@@ -589,8 +589,13 @@ The resulting layout is:
 The action uses image-provided `rsync`, not SSH or another container. It does not
 delete the original, merge into an existing torrent target, overwrite existing
 files, or copy your entire library. Existing category/relative parent directories
-may be reused, but an occupied final torrent file/folder is a collision and fails
-safely unless it is a verified completed copy of this same job. It requires real additional destination
+may be reused. For routed copies, an existing torrent file/folder is accepted
+only if it has an unchanged matching completion receipt, or its complete tree
+and file bytes match the source. The latter check reads both payloads but writes
+no media; it handles an identical copy from an earlier job or a storage switch.
+Different or partial content is a collision and remains untouched. A normal copy
+to an empty target does not incur this extra comparison pass.
+It requires real additional destination
 space and reads/writes the whole payload: copying between two NAS shares through
 the VM adds network and disk I/O. It is not a replacement for ZFS replication or
 a snapshot-based backup system. See [the storage layout guide](docs/STORAGE_LAYOUT.md).
@@ -612,18 +617,78 @@ wait for the job's successful copy status/private completion record. Single file
 are copied privately and published using an exclusive hard link; hard-link
 support is required. No `renameat2` support is required. Private action records
 live under the destination root's `.intake-copy-state/<job-id>/`, never inside
-the copied torrent; `complete.json` is the successful completion record.
+the copied torrent; `complete.json` is the latest successful completion record.
+Routed retry attempts keep separate private work/receipts, and a per-job lock
+prevents simultaneous attempts from replacing each other's records. The
+destination filesystem must support file locking as well as hard links.
 Source identity and copied paths/sizes are checked after `rsync --fsync`.
-The checks do not reread the whole payload for a cryptographic comparison and
-cannot replace snapshots or protect against hostile concurrent writers. Keep the
+Normal fresh copies do not reread the whole payload for a cryptographic comparison.
+The checks cannot replace snapshots or protect against hostile concurrent writers. Keep the
 source and target unchanged during copying. Symlinks and special files are rejected.
 
 For a failed/interrupted copy, inspect the reported target and private action
-record. Partial content is never silently resumed, overwritten or deleted.
-Preserve/move aside only the affected partial content and action record after
-review, then unlock administration and pause/drain Intake to retry the action.
-Resume after queuing the retry. A completed, unchanged matching copy is a no-op
-on retry. The ordinary failed-scan retry is not needed to repeat a copy.
+record. Partial content is never silently resumed, overwritten or deleted. For a
+routed copy, preserve/move aside only the affected conflicting payload after
+review; the retry can keep the old records and start a fresh attempt when the
+whole target is absent. A complete identical payload is verified without copying
+it again. Unlock administration and pause/drain Intake to retry the action, then
+resume after queuing it. The ordinary failed-scan retry is not needed to repeat
+a copy. Older `intake-job-*` wrapper copies retain their previous recovery rules:
+move the affected incomplete wrapper aside before retrying.
+
+If a torrent/source was deliberately removed, or a pending request is no longer
+wanted, open its **Copy status** details and choose **Cancel copy** while
+administration is unlocked and Intake is paused/drained. This is available for
+pending, failed and interrupted copies, not a running or successful copy. It
+cancels only the request, retains the audit/output and all partial/copied/source
+files, and lets the old Intake job be cleared. It does not undo promotion, remove
+the qBittorrent torrent, or queue a replacement copy. Cancelled requests stay
+cancelled; re-adding through Intake creates a separate new job.
+
+#### Deletions, re-added torrents and swapped storage
+
+These are one-time deliveries, **not a live synchronization or repair service**:
+
+| Situation | Routed-copy behavior |
+| --- | --- |
+| Delete both payloads, remove the old qBittorrent torrent, then re-add through Intake | The new job downloads/scans/promotes normally and copies to the empty target. Old job receipts do not block it. |
+| Re-add when an identical destination already exists | Compare all paths and bytes, then record success without replacing the payload. |
+| The destination contains different or partial files | Fail the copy safely; no merging, replacement or automatic cleanup. Promotion remains successful. |
+| A failed/interrupted attempt has old state but its target was fully removed | Explicit retry starts a fresh copy, retaining the earlier attempt's private data/records. |
+| Delete a destination after the copy succeeded | Leave it deleted. Completed jobs are not automatically replayed. |
+
+`.intake-copy-mount` is an operator-provisioned presence sentinel, **not a NAS
+export UUID**. `.intake-copy-state` contains receipts and possibly private
+incomplete work, **not instructions to copy/delete your library**. Receipts alone
+never prove that files still exist. They can be retained when torrents are removed;
+old private incomplete payloads may consume space and require manual review.
+
+To reverse source and copy storage, preserve the container names while switching
+their host bindings: for example `/downloads/movies` may change from HDD to SSD
+in **both** qBittorrent and Intake, and Intake's `/copy-target/movies` from SSD to
+HDD. A rule `/downloads/movies` → `/copy-target/movies` then keeps the same logical
+direction. Do not point both at the same physical data or change a mount live.
+
+1. Let active moves/copies finish where possible. Pause/drain Intake and review
+   pending/failed/interrupted copies; cancel requests that must not follow the
+   new mounts. Pause/stop qBittorrent and other writers before the cutover.
+2. Stop the affected containers. Synchronize/verify the data needed by existing
+   qBittorrent torrents, including their relative paths. This copy feature does
+   not synchronize the entire source library for you.
+3. Switch the host mounts/binds, verify the intended exports, write permissions
+   and destination sentinel, then recreate both containers with matching source
+   and staging binds. Existing Docker binds must not be assumed to follow a host
+   remount automatically.
+4. Keep Intake paused while checking qBittorrent's data and Intake's setup, then
+   resume. New promotions follow the new mounts. Existing succeeded jobs do not
+   replay; uncancelled pending requests retain their saved container paths and
+   therefore follow whatever storage those paths now expose.
+
+Root/marker checks detect changes during a copy, but cannot make live mount
+swaps safe or prove that two different Docker containers share identical host
+bindings. Scan checkpoints may invalidate after a filesystem switch; rescanning
+is the safe response, not a reason to bypass scanning. Follow the same maintenance
+procedure when switching back, reconciling any new data first.
 
 Copy rules, pinned paths and action status are included in Intake's encrypted
 backup. **Copied media, destination-side private action records, NAS mounts,

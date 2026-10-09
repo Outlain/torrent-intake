@@ -326,7 +326,7 @@ class RoutedCopySafetyTests(RoutedCopyBase):
         run.assert_not_called()
         state_link = self.destination / hook.STATE_DIRECTORY / "other-job"
         state_link.symlink_to(self.root, target_is_directory=True)
-        with self.assertRaisesRegex(RuntimeError, "manual retry"):
+        with self.assertRaisesRegex(RuntimeError, "Symbolic links"):
             self.copy_routed(job_id="other-job")
 
     def test_source_tree_symlinks_and_special_files_are_rejected(self):
@@ -358,7 +358,7 @@ class RoutedCopySafetyTests(RoutedCopyBase):
             self.copy_routed()
         run.assert_not_called()
         self.assertEqual(target.read_bytes(), b"keep existing")
-        self.assertTrue((self.state / "request.json").exists())
+        self.assertEqual(list(self.state.glob("attempt-*")), [])
         self.assertFalse((self.state / "complete.json").exists())
 
     def test_existing_directory_is_not_merged_even_when_empty(self):
@@ -411,6 +411,84 @@ class RoutedCopySafetyTests(RoutedCopyBase):
         copy.assert_called_once_with(self.source, "a" * 40, "Movie", "safe-job", destination=self.destination,
                                      source_root=self.library, relative_path=Path("movie.mkv"))
 
+    def test_existing_same_size_different_content_is_not_success(self):
+        target = self.destination / self.source.name
+        target.write_bytes(b"x" * self.source.stat().st_size)
+        with patch.object(hook.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "Destination collision"):
+            self.copy_routed()
+        run.assert_not_called()
+        self.assertEqual(target.read_bytes(), b"x" * self.source.stat().st_size)
+        self.assertFalse((self.state / "complete.json").exists())
+
+    def test_existing_payload_hardlink_alias_is_rejected(self):
+        os.link(self.source, self.destination / self.source.name)
+        with patch.object(hook.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "aliases the source"):
+            self.copy_routed()
+        run.assert_not_called()
+
+    def test_lock_symlink_and_special_file_are_rejected_without_touching_source(self):
+        self.state.mkdir(parents=True)
+        lock = self.state / "copy.lock"
+        lock.symlink_to(self.source)
+        with self.assertRaisesRegex(RuntimeError, "Symbolic links"):
+            self.copy_routed()
+        lock.unlink()
+        os.mkfifo(lock)
+        with self.assertRaisesRegex(RuntimeError, "regular file"):
+            self.copy_routed()
+        self.assertEqual(self.source.read_bytes(), b"scanned payload")
+
+    def test_completion_symlink_is_rejected_even_when_payload_is_absent(self):
+        self.state.mkdir(parents=True)
+        (self.state / "complete.json").symlink_to(self.source)
+        with patch.object(hook.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "Symbolic links"):
+            self.copy_routed()
+        run.assert_not_called()
+        self.assertEqual(self.source.read_bytes(), b"scanned payload")
+
+    def test_parallel_same_job_and_unavailable_locks_fail_without_payload_writes(self):
+        self.state.mkdir(parents=True)
+        with hook._job_lock(self.state), patch.object(hook.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                self.copy_routed()
+        run.assert_not_called()
+        with patch.object(hook.fcntl, "flock", side_effect=OSError("not supported")):
+            with self.assertRaisesRegex(RuntimeError, "lock is unavailable"):
+                self.copy_routed()
+        self.assertFalse((self.destination / self.source.name).exists())
+
+    def test_source_or_target_mutation_during_existing_content_comparison_fails(self):
+        target = self.destination / self.source.name
+        actual_compare = hook._same_file_bytes
+        for modified in (self.source, target):
+            self.source.write_bytes(b"scanned payload")
+            target.write_bytes(b"scanned payload")
+
+            def compare_then_mutate(*args):
+                result = actual_compare(*args)
+                modified.write_bytes(b"changed payload")
+                return result
+
+            with self.subTest(modified=modified), patch.object(hook, "_same_file_bytes", side_effect=compare_then_mutate):
+                with self.assertRaisesRegex(RuntimeError, "changed during content comparison"):
+                    self.copy_routed()
+            self.assertFalse((self.state / "complete.json").exists())
+
+    def test_marker_change_during_existing_content_comparison_fails(self):
+        target = self.destination / self.source.name
+        target.write_bytes(self.source.read_bytes())
+        actual_compare = hook._same_file_bytes
+
+        def compare_then_change_marker(*args):
+            result = actual_compare(*args)
+            (self.destination / hook.MOUNT_MARKER).write_text("replaced")
+            return result
+
+        with patch.object(hook, "_same_file_bytes", side_effect=compare_then_change_marker):
+            with self.assertRaisesRegex(RuntimeError, "marker changed"):
+                self.copy_routed()
+        self.assertFalse((self.state / "complete.json").exists())
+
 
 @unittest.skipUnless(shutil.which("rsync"), "rsync is not installed; real-copy integration checks skipped")
 class RoutedCopyRsyncTests(RoutedCopyBase):
@@ -449,7 +527,7 @@ class RoutedCopyRsyncTests(RoutedCopyBase):
         copied = self.copy_routed(source)
         self.assertEqual(copied, self.destination / source.relative_to(self.library))
         self.assertEqual(copied.read_bytes(), b"video")
-        self.assertEqual(list((self.state / "payload").iterdir()), [])
+        self.assertEqual(list(next(self.state.glob("attempt-*/payload")).iterdir()), [])
         self.assertTrue(source.exists())
         with patch.object(hook.subprocess, "run") as run:
             self.assertEqual(self.copy_routed(source), copied)
@@ -510,7 +588,8 @@ class RoutedCopyRsyncTests(RoutedCopyBase):
                 self.copy_routed()
         self.assertFalse((self.destination / self.source.name).exists())
         self.assertFalse((self.state / "complete.json").exists())
-        self.assertEqual((self.state / "payload" / self.source.name).read_bytes(), self.source.read_bytes())
+        staged = next(self.state.glob("attempt-*/payload")) / self.source.name
+        self.assertEqual(staged.read_bytes(), self.source.read_bytes())
 
     def test_manual_retry_after_both_partial_payload_and_state_are_moved_aside(self):
         copied = self.destination / self.source.name
@@ -522,6 +601,190 @@ class RoutedCopyRsyncTests(RoutedCopyBase):
         self.assertEqual(self.copy_routed(), copied)
         self.assertEqual(copied.read_bytes(), b"scanned payload")
         self.assertEqual((self.destination / "operator-held-partial").read_bytes(), b"partial")
+
+    def test_delete_both_payloads_then_readd_same_and_new_job(self):
+        copied = self.copy_routed()
+        receipt = (self.state / "complete.json").read_bytes()
+        self.source.unlink()
+        copied.unlink()
+        self.source.write_bytes(b"scanned payload")
+        self.assertEqual(self.copy_routed(), copied)
+        self.assertEqual(copied.read_bytes(), b"scanned payload")
+        self.assertIn(receipt, [path.read_bytes() for path in self.state.glob("attempt-*/previous-complete.json")])
+        self.assertEqual(len(list(self.state.glob("attempt-*"))), 2)
+        self.source.unlink()
+        copied.unlink()
+        self.source.write_bytes(b"scanned payload")
+        self.assertEqual(self.copy_routed(job_id="readded-job"), copied)
+        self.assertEqual(copied.read_bytes(), b"scanned payload")
+        self.assertTrue((self.state.parent / "readded-job" / "complete.json").exists())
+
+    def test_existing_identical_target_from_other_job_is_reused_without_media_writes(self):
+        copied = self.copy_routed()
+        original = hook.snapshot(copied)
+        with patch.object(hook.subprocess, "run") as run, patch.object(hook, "_same_file_bytes", wraps=hook._same_file_bytes) as compare:
+            self.assertEqual(self.copy_routed(job_id="another-job"), copied)
+        run.assert_not_called()
+        compare.assert_called_once()
+        self.assertEqual(hook.snapshot(copied), original)
+        self.assertTrue((self.state.parent / "another-job" / "complete.json").exists())
+
+    def test_identical_nested_directory_is_reused_but_extra_files_are_not_merged(self):
+        source = self.library / "Series"
+        (source / "Season 1").mkdir(parents=True)
+        (source / "empty").mkdir()
+        (source / "Season 1" / "episode.mkv").write_bytes(b"episode")
+        copied = self.copy_routed(source)
+        original = hook.snapshot(copied)
+        with patch.object(hook.subprocess, "run") as run:
+            self.assertEqual(self.copy_routed(source, job_id="directory-readd"), copied)
+        run.assert_not_called()
+        self.assertEqual(hook.snapshot(copied), original)
+        extra = copied / "user-notes.txt"
+        extra.write_text("keep this")
+        with patch.object(hook.subprocess, "run") as run, self.assertRaisesRegex(RuntimeError, "Destination collision"):
+            self.copy_routed(source, job_id="directory-extra")
+        run.assert_not_called()
+        self.assertEqual(extra.read_text(), "keep this")
+
+    def test_legacy_pending_only_journal_does_not_block_absent_payload(self):
+        self.state.mkdir(parents=True)
+        (self.state / "request.json").write_text("{old request}")
+        (self.state / "complete.pending").write_text("unfinished old metadata")
+        work = self.state / "payload"
+        work.mkdir()
+        (work / self.source.name).write_bytes(b"partial")
+        copied = self.copy_routed()
+        self.assertEqual(copied.read_bytes(), self.source.read_bytes())
+        self.assertEqual((work / self.source.name).read_bytes(), b"partial")
+        self.assertEqual((self.state / "complete.pending").read_text(), "unfinished old metadata")
+
+    def test_changed_stat_but_identical_bytes_revalidates_and_preserves_old_receipt(self):
+        copied = self.copy_routed()
+        old_receipt = (self.state / "complete.json").read_bytes()
+        self.source.rename(self.library / "old-file")
+        self.source.write_bytes(b"scanned payload")
+        target_before = hook.snapshot(copied)
+        with patch.object(hook.subprocess, "run") as run, patch.object(hook, "_same_file_bytes", wraps=hook._same_file_bytes) as compare:
+            self.assertEqual(self.copy_routed(), copied)
+        run.assert_not_called()
+        compare.assert_called_once()
+        self.assertEqual(hook.snapshot(copied), target_before)
+        self.assertIn(old_receipt, [path.read_bytes() for path in self.state.glob("attempt-*/previous-complete.json")])
+
+    def test_failed_collision_can_retry_after_only_colliding_payload_removed(self):
+        copied = self.destination / self.source.name
+        copied.write_bytes(b"other payload")
+        with self.assertRaisesRegex(RuntimeError, "Destination collision"):
+            self.copy_routed()
+        copied.unlink()
+        self.assertEqual(self.copy_routed(), copied)
+        self.assertEqual(copied.read_bytes(), self.source.read_bytes())
+
+    def test_failed_private_staging_is_retained_and_never_reused(self):
+        def fail_copy(argv, **kwargs):
+            (Path(argv[-1]) / self.source.name).write_bytes(b"partial")
+            raise subprocess.CalledProcessError(23, argv)
+
+        with patch.object(hook.subprocess, "run", side_effect=fail_copy), self.assertRaises(subprocess.CalledProcessError):
+            self.copy_routed()
+        old_payload = next(self.state.glob("attempt-*/payload")) / self.source.name
+        self.assertFalse((self.destination / self.source.name).exists())
+        copied = self.copy_routed()
+        self.assertEqual(copied.read_bytes(), self.source.read_bytes())
+        self.assertEqual(old_payload.read_bytes(), b"partial")
+        self.assertEqual(len(list(self.state.glob("attempt-*"))), 2)
+
+    def test_removed_partial_directory_can_retry_without_removing_journal(self):
+        source = self.library / "Series"
+        source.mkdir()
+        (source / "episode.mkv").write_bytes(b"full video")
+
+        def fail_copy(argv, **kwargs):
+            (Path(argv[-1]) / "episode.mkv").write_bytes(b"partial")
+            raise subprocess.CalledProcessError(23, argv)
+
+        with patch.object(hook.subprocess, "run", side_effect=fail_copy), self.assertRaises(subprocess.CalledProcessError):
+            self.copy_routed(source)
+        copied = self.destination / source.name
+        copied.rename(self.destination / "operator-held-partial")
+        self.assertEqual(self.copy_routed(source), copied)
+        self.assertEqual((copied / "episode.mkv").read_bytes(), b"full video")
+        self.assertEqual((self.destination / "operator-held-partial" / "episode.mkv").read_bytes(), b"partial")
+        self.assertEqual(len(list(self.state.glob("attempt-*"))), 2)
+
+    def test_old_format_receipt_and_staging_are_compatible_and_preserved(self):
+        copied = self.destination / self.source.name
+        copied.write_bytes(self.source.read_bytes())
+        self.state.mkdir(parents=True)
+        request = {"source": str(self.source), "source_root": str(self.library),
+                   "relative_path": self.source.name, "destination": str(self.destination),
+                   "torrent_hash": "a" * 40, "torrent_name": "Movie", "job_id": "safe-job"}
+        record = {"request": request, "source_snapshot": hook.snapshot(self.source),
+                  "destination_snapshot": hook.snapshot(copied)}
+        (self.state / "complete.json").write_text(json.dumps(record))
+        (self.state / "request.json").write_text(json.dumps(request))
+        (self.state / "complete.pending").write_text("old pending receipt")
+        old_work = self.state / "payload"
+        old_work.mkdir()
+        (old_work / self.source.name).write_bytes(b"stale private payload")
+        with patch.object(hook.subprocess, "run") as run, patch.object(hook, "_same_file_bytes") as compare:
+            self.assertEqual(self.copy_routed(), copied)
+        run.assert_not_called()
+        compare.assert_not_called()
+        copied.unlink()
+        self.assertEqual(self.copy_routed(), copied)
+        self.assertEqual((old_work / self.source.name).read_bytes(), b"stale private payload")
+        self.assertEqual((self.state / "complete.pending").read_text(), "old pending receipt")
+        self.assertEqual(copied.read_bytes(), self.source.read_bytes())
+        archived = next(self.state.glob("attempt-*/previous-complete.json"))
+        self.assertEqual(json.loads(archived.read_text()), record)
+
+    def test_swapping_mapped_roots_and_back_reuses_identical_payloads(self):
+        # Directory renames simulate Docker repointing stable container paths to
+        # opposite host directories, without requiring privileged bind mounts.
+        (self.library / hook.MOUNT_MARKER).touch()
+        self.copy_routed()
+
+        def swap_roots():
+            temporary = self.root / "swap-holding"
+            self.library.rename(temporary)
+            self.destination.rename(self.library)
+            temporary.rename(self.destination)
+
+        for _ in range(2):
+            swap_roots()
+            target_before = hook.snapshot(self.destination / self.source.name)
+            with patch.object(hook.subprocess, "run") as run:
+                copied = self.copy_routed()
+            run.assert_not_called()
+            self.assertEqual(hook.snapshot(copied), target_before)
+            self.assertEqual(copied.read_bytes(), self.source.read_bytes())
+
+    def test_source_and_destination_root_change_during_copy_prevents_completion(self):
+        actual_run, actual_checked = hook.subprocess.run, hook.checked_path
+        substitute = self.root / "different-mount"
+        substitute.mkdir()
+        changed = False
+
+        def run_then_remount(*args, **kwargs):
+            nonlocal changed
+            result = actual_run(*args, **kwargs)
+            changed = True
+            return result
+
+        for index, switched_root in enumerate((self.library, self.destination)):
+            changed = False
+
+            def remounted_stat(path):
+                return actual_checked(substitute if changed and path == switched_root else path)
+
+            with self.subTest(root=switched_root), patch.object(hook.subprocess, "run", side_effect=run_then_remount), \
+                    patch.object(hook, "checked_path", side_effect=remounted_stat):
+                with self.assertRaisesRegex(RuntimeError, "mount changed"):
+                    self.copy_routed(job_id=f"remount-{index}")
+            self.assertFalse((self.destination / self.source.name).exists())
+            self.assertFalse((self.state.parent / f"remount-{index}" / "complete.json").exists())
 
 
 if __name__ == "__main__":

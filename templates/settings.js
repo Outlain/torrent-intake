@@ -188,7 +188,7 @@ window.TISettings = (() => {
     el('controller-state').textContent = controller.paused
       ? `Intake paused · ${controller.drained ? 'drained, ready for maintenance' : 'waiting for workers to stop'}. ${controller.reason || ''}`
       : 'Intake is running. Editing fields does not change active settings until you save and restart.';
-    document.querySelectorAll('[data-retry-hook]').forEach(button => { button.hidden = !token; button.disabled = locked || !controller.paused || !controller.drained; });
+    document.querySelectorAll('[data-retry-hook], [data-cancel-copy]').forEach(button => { button.hidden = !token; button.disabled = locked || !controller.paused || !controller.drained; });
   }
 
   function clearErrors() {
@@ -421,6 +421,10 @@ window.TISettings = (() => {
     retryHook: async jobId => {
       if (!token) throw new Error('Unlock administration in Settings before retrying a post-promotion action.');
       return post(`/admin/jobs/${encodeURIComponent(jobId)}/retry-hook`);
+    },
+    cancelCopy: async jobId => {
+      if (!token) throw new Error('Unlock administration in Settings before cancelling a copy.');
+      return post(`/admin/jobs/${encodeURIComponent(jobId)}/cancel-copy`);
     },
   };
 })();

@@ -418,7 +418,11 @@ class JobService:
         ))
         if result.rowcount != 1:
             db.rollback()
-            raise ValueError("Cannot remove a job with a queued or running post-promotion copy/script. Wait for it to finish; pause Intake to interrupt a running action.")
+            raise ValueError(
+                "Cannot remove a job with a queued or running post-promotion copy/script. "
+                "Wait for it to finish; pause Intake to interrupt a running action. "
+                "For an unwanted built-in copy, pause/drain Intake and use Cancel copy in its job details."
+            )
         self.scan_coordinator.delete_scan_data(db, job.id)
         db.commit()
 
@@ -827,12 +831,40 @@ class JobService:
                                 unique_tag: str | None, tags: str | None, torrent_name: str | None,
                                 content_path: str | None, root_path: str | None,
                                 save_path: str | None, size_bytes: int | None) -> Job | None:
-        unique_tag = unique_tag or self._extract_unique_tag(tags)
+        qbt_hash = qbt_hash.strip().lower() if qbt_hash else None
+        job_tags = {tag.strip() for tag in (tags or "").split(",") if tag.strip().startswith("ti_job_")}
+        if unique_tag:
+            job_tags.add(unique_tag.strip())
+        if len(job_tags) > 1:
+            self.logger.warning("Completion event ignored: conflicting Intake job tags")
+            return None
+        unique_tag = next(iter(job_tags), None)
         job = None
-        if qbt_hash:
-            job = db.scalar(select(Job).where(Job.qbt_hash == qbt_hash))
-        if not job and unique_tag:
+        if unique_tag:
+            # A re-added torrent keeps its hash but receives a new job tag. A
+            # delayed callback for the old tag must never update the new job,
+            # even when its historical Intake row has already been removed.
             job = db.scalar(select(Job).where(Job.unique_tag == unique_tag))
+            if job and qbt_hash and (job.qbt_hash or "").lower() != qbt_hash:
+                conflicting_job = db.scalar(select(Job.id).where(
+                    Job.id != job.id, Job.is_terminal == False,
+                    func.lower(Job.qbt_hash) == qbt_hash,
+                ).limit(1))
+                if conflicting_job is not None:
+                    self.logger.warning("Completion event ignored: job tag and tracked torrent hash disagree")
+                    return None
+        elif qbt_hash:
+            # Older callbacks may omit tags. Terminal history is not ownership:
+            # use the sole current job, never an arbitrary first hash match.
+            current_jobs = list(db.scalars(select(Job).where(
+                func.lower(Job.qbt_hash) == qbt_hash, Job.is_terminal == False,
+            ).limit(2)))
+            if len(current_jobs) > 1:
+                self.logger.warning("Completion event ignored: multiple active jobs match torrent hash")
+                return None
+            job = current_jobs[0] if current_jobs else db.scalar(select(Job).where(
+                func.lower(Job.qbt_hash) == qbt_hash,
+            ).order_by(Job.created_at.desc(), Job.id).limit(1))
         if not job:
             self.logger.warning(
                 "Completion event ignored: no matching job found qbt_hash=%s qbt_hash_v2=%s unique_tag=%s tags=%s torrent_name=%s",

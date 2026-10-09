@@ -34,7 +34,7 @@ let container, browser;
     browser = await puppeteer.launch({headless: true, args: ['--no-sandbox'],
       ...(process.env.CHROME_PATH ? {executablePath: process.env.CHROME_PATH} : {})});
     const page = await browser.newPage();
-    const errors = [], submitted = [], moves = [], hookRetries = [], finalDestinationEdits = [], scanResumes = [];
+    const errors = [], submitted = [], moves = [], hookRetries = [], copyCancellations = [], dialogs = [], finalDestinationEdits = [], scanResumes = [];
     const queuedJob = {id: 'queued-test', state: 'waiting_for_local_space', staging_actual: 'local',
       final_parent: '/downloads/Original', torrent_name: '<img src=x onerror=alert(1)> series', can_edit_final_destination: true,
       nas_staging_id: 'main', nas_staging_label: 'Main NAS', nas_staging_path: '/nas/main/intake'};
@@ -53,10 +53,10 @@ let container, browser;
       scan_pause_requested: true, scan_current_file: null, final_category: 'TV',
       scan_completed_files: 2, scan_total_files: 5, scan_completed_bytes: 400, scan_total_bytes: 1000,
       scan_progress_percent: 40};
-    let finalDestinationPaused = false, knownPathRequests = 0;
+    let finalDestinationPaused = false, knownPathRequests = 0, controllerStatusOverride = null, acceptDialogs = true;
     let failOnce = true, inFlight = 0, peak = 0;
     page.on('pageerror', error => errors.push(error.message));
-    page.on('dialog', dialog => dialog.accept());
+    page.on('dialog', dialog => { dialogs.push(dialog.message()); return acceptDialogs ? dialog.accept() : dialog.dismiss(); });
     await page.setRequestInterception(true);
     page.on('request', async request => {
       const path = new URL(request.url()).pathname;
@@ -95,6 +95,12 @@ let container, browser;
         return respond({moved: 1, failed: 0, errors: {}, processed_ids: payload.job_ids});
       }
       if (['/admin/jobs/hook-test/retry-hook', '/admin/jobs/copy-test/retry-hook'].includes(path)) { hookRetries.push({path, headers: request.headers()}); return respond({hook_status: 'pending'}); }
+      if (path === '/admin/jobs/copy-test/cancel-copy') {
+        copyCancellations.push({path, headers: request.headers()});
+        copiedJob.hook_status = 'cancelled';
+        return respond({hook_status: 'cancelled', message: 'Copy cancelled. No files were removed.'});
+      }
+      if (path === '/controller/status' && controllerStatusOverride) return respond(controllerStatusOverride);
       if (path === '/jobs') return respond([queuedJob, unavailableFallbackJob, unavailableNasJob, hookedJob, copiedJob, scanningJob, pendingPauseJob, pausedJob]);
       if (path === '/qbt/final-path-suggestions') { knownPathRequests++; return respond({paths: ['/downloads/Shows']}); }
       if (path === '/fs/final-path-suggestions') return respond({paths: ['/downloads/Movies', '/downloads/TV']});
@@ -227,6 +233,8 @@ let container, browser;
       assert.match(await page.$eval('.job-hook-result[data-job-id="copy-test"]', node => node.textContent), /Copy status: interrupted.*Copy destination: \/copy-target\/Movies\/Action\/Film.*Saved copy rule: \/downloads\/Movies → \/copy-target\/Movies.*Copy output:.*Retry copy/s);
       assert.equal(await page.$('.job-hook-result[data-job-id="copy-test"] img'), null, 'copy output must also be text, never HTML');
       assert(await page.$eval('[data-retry-hook]', node => node.hidden), 'hook retry must be administration-only');
+      assert(await page.$eval('[data-cancel-copy="copy-test"]', node => node.hidden), 'copy cancellation must be administration-only');
+      assert.equal(await page.$('[data-cancel-copy="hook-test"]'), null, 'script requests cannot be cancelled as copies');
       assert.equal(await page.$eval('[data-state="waiting_for_nas"]', node => node.textContent), 'Waiting for NAS mount');
       assert(await page.evaluate(() => {
         const queued = getComputedStyle(document.querySelector('[data-state="waiting_for_local_space"]'));
@@ -327,8 +335,10 @@ let container, browser;
     assert.equal(await page.$eval('.copy-rule-source', node => node.value), '/downloads/<img src=x onerror=alert(1)>');
     assert(await page.$$eval('.nas-location-row input', inputs => inputs.every(input => input.disabled)));
     assert(!(await page.$eval('[data-retry-hook]', node => node.hidden)));
+    assert(!(await page.$eval('[data-cancel-copy]', node => node.hidden)));
     const controllerState = await (await fetch(`${origin}/controller/status`)).json();
     assert.equal(await page.$eval('[data-retry-hook]', node => node.disabled), !controllerState.paused || !controllerState.drained || controllerState.restart_required, 'hook retry requires a drained pause');
+    assert.equal(await page.$eval('[data-cancel-copy]', node => node.disabled), !controllerState.paused || !controllerState.drained || controllerState.restart_required, 'copy cancellation requires a drained pause');
     if (!controllerState.paused) await click('#controller-pause');
     await page.waitForFunction(() => !document.querySelector('[data-retry-hook]').disabled);
     await click('#settings-close-button');
@@ -340,9 +350,52 @@ let container, browser;
     const copyRetried = page.waitForResponse(response => response.url().endsWith('/admin/jobs/copy-test/retry-hook'));
     await click('[data-retry-hook="copy-test"]'); await copyRetried;
     assert(hookRetries.at(-1).headers['x-ti-admin-token'] === token, 'copy retry must use the unlocked administrator token');
+    for (const width of [1440, 390]) {
+      await page.setViewport({width, height: 900});
+      const selector = '[data-cancel-copy="copy-test"]';
+      for (const blockedState of [
+        {paused: false, drained: false, restart_required: false},
+        {paused: true, drained: false, restart_required: false},
+        {paused: true, drained: true, restart_required: true},
+      ]) {
+        controllerStatusOverride = blockedState;
+        await page.evaluate(() => window.TISettings.onOpen());
+        assert(await page.$eval(selector, node => node.disabled), 'cancel requires pause, drained workers and no pending restart');
+      }
+      controllerStatusOverride = {paused: true, drained: true, restart_required: false};
+      await page.evaluate(() => window.TISettings.onOpen());
+      assert(!(await page.$eval(selector, node => node.disabled)));
+      for (const status of ['pending', 'failed', 'interrupted']) {
+        copiedJob.hook_status = status;
+        await page.evaluate(() => loadJobs({silent: true}));
+        await page.$eval('.job-hook-result[data-job-id="copy-test"]', node => { node.open = true; });
+        const before = copyCancellations.length;
+        acceptDialogs = false;
+        await click(selector);
+        assert.equal(copyCancellations.length, before, 'dismissing the confirmation leaves the request unchanged');
+        acceptDialogs = true;
+        const cancelled = page.waitForResponse(response => response.url().endsWith('/admin/jobs/copy-test/cancel-copy'));
+        await click(selector); await cancelled;
+        await page.waitForFunction(() => document.querySelector('.job-hook-result[data-job-id="copy-test"] summary').textContent.includes('cancelled'));
+        assert.match(dialogs.at(-1), /No files will be removed, including any partial copy/);
+        assert.match(dialogs.at(-1), /cannot be retried/);
+        assert.equal(copyCancellations.length, before + 1);
+        assert.equal(copyCancellations.at(-1).headers['x-ti-admin-token'], token);
+        assert.equal(await page.$(selector), null);
+        assert.equal(await page.$('[data-retry-hook="copy-test"]'), null, 'cancelled copies have no retry action');
+      }
+      for (const status of ['running', 'succeeded', 'cancelled', null]) {
+        copiedJob.hook_status = status;
+        await page.evaluate(() => loadJobs({silent: true}));
+        assert.equal(await page.$(selector), null, `copy status ${status} cannot be cancelled`);
+      }
+      copiedJob.hook_status = 'interrupted';
+      await page.evaluate(() => loadJobs({silent: true}));
+    }
+    controllerStatusOverride = null;
     assert.equal(peak, 1, 'mixed bulk requests must be sequential');
     assert.deepEqual(errors, []);
-    console.log('PASS desktop/mobile final-destination editing/cancel/stale/scan-start/maintenance errors, paused checkpoint preservation/explicit resume/stale resume draft, escaping, mixed intake, named NAS/default selection, manual NAS moves, per-row retry, environment locks, escaped copy/script output, authenticated copy/script retry, tags and selection limits');
+    console.log('PASS desktop/mobile final-destination editing/cancel/stale/scan-start/maintenance errors, paused checkpoint preservation/explicit resume/stale resume draft, escaping, mixed intake, named NAS/default selection, manual NAS moves, per-row retry, environment locks, escaped copy/script output, authenticated copy/script retry, authenticated drained copy cancellation/confirmation/eligible states, tags and selection limits');
   } finally {
     if (browser) await browser.close();
     if (container) docker('rm', '-f', container);

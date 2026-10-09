@@ -10,11 +10,12 @@ import sqlite3
 import zipfile
 from urllib.parse import urlsplit
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 from cryptography.exceptions import InvalidTag
@@ -339,6 +340,31 @@ async def retry_promotion_hook(job_id: str):
                     raise ValueError("This job has not completed clean promotion")
                 db.commit()
             return {"queued": True, "message": "Action queued. Verify and resume Intake to run it; the torrent will not be scanned or moved again."}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/admin/jobs/{job_id}/cancel-copy")
+async def cancel_promotion_copy(job_id: str):
+    async with controller.operation_lock:
+        try:
+            controller.require_drained()
+            with SessionLocal() as db:
+                # Match the live database state, not a previously loaded job.
+                # This never interrupts a process or removes any media files.
+                result = db.execute(update(Job).where(
+                    Job.id == job_id,
+                    Job.hook_kind == "copy",
+                    Job.hook_status.in_(("pending", "failed", "interrupted")),
+                ).values(
+                    hook_status="cancelled",
+                    hook_finished_at=datetime.utcnow(),
+                    hook_error="Copy cancelled by administrator. No files were removed; any existing or partial copy remains. This request cannot be retried.",
+                ).execution_options(synchronize_session=False))
+                if result.rowcount != 1:
+                    raise ValueError("Only a pending, failed or interrupted built-in copy can be cancelled; refresh the job status")
+                db.commit()
+            return {"hook_status": "cancelled", "message": "Copy cancelled. No files were removed, including partial copies. This old request cannot be retried; its Intake history can now be cleared after resuming."}
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 

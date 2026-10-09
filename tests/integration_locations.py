@@ -320,6 +320,89 @@ def main() -> None:
                     assert runner.claim_next() is None, "Finished hooks must never replay automatically"
                     assert source.read_bytes() == b"test data", "The hook must retain the seeding source"
                     assert Path(service.qbt.get_torrent(torrent_hash).save_path) == final_parent
+                    if identifier == "two":
+                        # Keep completed history and its receipt while deleting
+                        # only the real qB entry, then re-add the same torrent.
+                        copied = target / "nested" / name
+                        copied_before = copied.stat()
+                        old_receipt = target / ".intake-copy-state" / job.id / "complete.json"
+                        receipt_before = old_receipt.read_bytes()
+                        client.torrents_delete(torrent_hashes=torrent_hash, delete_files=False)
+                        wait_for(lambda: service.qbt.get_torrent(torrent_hash) is None,
+                                 "removed qB torrent before re-add")
+                        assert source.read_bytes() == copied.read_bytes() == b"test data"
+                        assert job.state == "done" and job.hook_status == "succeeded"
+                        # Reuse the disposable seed without downloading from
+                        # peers or leaving a preexisting qB promotion target.
+                        source.rename(staged_source)
+                        new_job = service.submit_job(
+                            db, torrent_file_data=torrent(v1_info(name=name.encode())),
+                            torrent_file_name="readded-two.torrent", final_parent=str(final_parent),
+                            final_category=None, staging_preference="nas", nas_staging_id=location["id"],
+                        )
+                        assert new_job.id != job.id and new_job.unique_tag != job.unique_tag
+
+                        def readded_hash():
+                            if not new_job.qbt_hash:
+                                service._resolve_hash_for_job(db, new_job)
+                            return new_job.qbt_hash
+
+                        assert wait_for(readded_hash, "re-added canonical hash") == torrent_hash
+                        service.qbt.pause(torrent_hash)
+                        wait_for(lambda: runner.guard.is_paused(service.qbt.get_torrent(torrent_hash)),
+                                 "re-added torrent pause before local recheck")
+                        client.torrents_recheck(torrent_hashes=torrent_hash)
+                        try:
+                            live = wait_for(complete, "re-added local payload verification")
+                        except AssertionError as exc:
+                            live = service.qbt.get_torrent(torrent_hash)
+                            raise AssertionError(f"{exc}; state={live.state}, progress={live.progress}, "
+                                                 f"content_path={live.content_path}, staging_exists={staged_source.exists()}") from exc
+                        assert new_job.unique_tag in runner.guard.tags(live)
+                        assert job.unique_tag not in runner.guard.tags(live)
+                        callback_job = service.ingest_completion_event(
+                            db, qbt_hash=torrent_hash, qbt_hash_v2=None,
+                            unique_tag=new_job.unique_tag, tags=live.tags, torrent_name=name,
+                            content_path=str(staged_source), root_path=None,
+                            save_path=location["path"], size_bytes=9,
+                        )
+                        assert callback_job.id == new_job.id, "Old done history must not steal the new completion callback"
+                        assert new_job.state == "completion_event_received"
+                        service.qbt.pause(torrent_hash)
+                        wait_for(paused_complete, "re-added paused completed torrent")
+                        new_job.state, new_job.is_terminal = "scan_clean", False
+                        new_job.download_complete_at = new_job.scan_completed_at = datetime.utcnow()
+                        fingerprint = staged_source.stat()
+                        db.add(ScanFile(
+                            job_id=new_job.id, relative_path=".", size_bytes=9,
+                            mtime_ns=fingerprint.st_mtime_ns, ctime_ns=fingerprint.st_ctime_ns,
+                            device=fingerprint.st_dev, inode=fingerprint.st_ino, status="clean",
+                            attempts=1, scanned_at=datetime.utcnow(), scanner_version=identity.raw_version,
+                            engine_version=identity.engine_version, database_version=identity.database_version,
+                            database_updated_at=identity.database_updated_at, policy_version=identity.policy_version,
+                            scan_method="integration-supplied-clean-checkpoint",
+                        ))
+                        db.commit()
+                        wait_for(lambda: service._reconcile_clean_promotion(db, new_job),
+                                 "re-added real qB final move reconciliation")
+                        db.refresh(new_job)
+                        assert new_job.state == "done" and new_job.hook_status == "pending"
+                        claim = wait_for(runner.claim_next, "re-added copy readiness")
+                        assert claim.job_id == new_job.id and claim.torrent_hash == torrent_hash
+                        asyncio.run(runner.run_claim(claim, asyncio.Event()))
+                        db.refresh(new_job)
+                        db.refresh(job)
+                        assert new_job.hook_status == "succeeded", (new_job.hook_error, new_job.hook_output)
+                        assert "byte-for-byte identical" in new_job.hook_output
+                        copied_after = copied.stat()
+                        for attribute in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"):
+                            assert getattr(copied_after, attribute) == getattr(copied_before, attribute), attribute
+                        assert copied.read_bytes() == source.read_bytes() == b"test data"
+                        assert old_receipt.read_bytes() == receipt_before, "Re-add must preserve the previous copy receipt"
+                        assert (target / ".intake-copy-state" / new_job.id / "complete.json").is_file()
+                        assert job.hook_status == "succeeded" and job.hook_attempts == 1
+                        assert new_job.hook_attempts == 1 and runner.claim_next() is None
+                        assert Path(service.qbt.get_torrent(torrent_hash).save_path) == final_parent
 
             invocations = [json.loads(line) for line in recorded.read_text().splitlines()]
             assert len(invocations) == 1
@@ -327,7 +410,9 @@ def main() -> None:
                 f"PASS real qBittorrent {version}: two pinned NAS locations, complete/paused local payloads, "
                 "download and paused destination edits used for real moves into absent final subdirectories, "
                 "checkpoint-preserving resume with the final manifest gate, no early hooks, literal path/name arguments, "
-                "one script and one routed copy with preserved nested paths, unmatched final location skipped, retained seeding originals"
+                "one script and one routed copy with preserved nested paths, unmatched final location skipped, "
+                "real qB delete/re-add routes its callback to the new job and reuses byte-identical copied data "
+                "without overwriting files or historical receipts, retained seeding originals"
             )
         finally:
             process.terminate()

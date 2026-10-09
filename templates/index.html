@@ -424,7 +424,7 @@
       grid-column: 1 / -1;
     }
 
-    #nas-staging-field[hidden], .bulk-row-field[hidden], [data-retry-hook][hidden] { display: none; }
+    #nas-staging-field[hidden], .bulk-row-field[hidden], [data-retry-hook][hidden], [data-cancel-copy][hidden] { display: none; }
     .nas-move-field { min-width: 0; max-width: 100%; }
     .nas-move-field select { min-width: 0; max-width: 420px; }
 
@@ -2888,6 +2888,24 @@
         details.append(retry);
         const hint = document.createElement('p'); hint.textContent = 'To retry, unlock administration and pause Intake in Settings, then wait for drained. '
           + (isCopy ? 'Inspect any partial copy first; it will not be overwritten automatically.' : 'A retry may repeat effects of an earlier attempt.'); details.append(hint);
+      }
+      if (isCopy && ['pending', 'failed', 'interrupted'].includes(job.hook_status)) {
+        const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'button-secondary';
+        cancel.dataset.cancelCopy = job.id; cancel.textContent = 'Cancel copy';
+        cancel.hidden = !window.TISettings.isAdmin(); cancel.disabled = !window.TISettings.canRetryHook();
+        cancel.addEventListener('click', async () => {
+          if (!confirm('Cancel this old copy request permanently? No files will be removed, including any partial copy. The torrent, scan result and completed promotion remain unchanged. This request cannot be retried after cancellation.')) return;
+          cancel.disabled = true;
+          try {
+            const response = await window.TISettings.cancelCopy(job.id); await loadJobs();
+            flashJobsToolbarStatus(response.message || 'Copy cancelled. No files were removed.');
+          }
+          catch (error) { result.textContent = String(error); cancel.disabled = !window.TISettings.canRetryHook(); }
+        });
+        details.append(cancel);
+        const hint = document.createElement('p');
+        hint.textContent = 'To abandon an old copy request, unlock administration and pause Intake in Settings, then wait for drained. Cancel copy leaves all files untouched; resume Intake before clearing its history.';
+        details.append(hint);
       }
       return details;
     }

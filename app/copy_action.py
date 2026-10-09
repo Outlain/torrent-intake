@@ -3,15 +3,18 @@
 Legacy copies use an intake-job-* wrapper and its completion marker. Routed
 copies preserve the relative payload path and keep records separately under
 .intake-copy-state. A reserved directory can be visible before copying finishes;
-consumers must wait for successful copy status. Incomplete copies are never
-resumed, overwritten, or removed; review and move them and their state aside
-before explicitly retrying the action in Intake.
+consumers must wait for successful copy status. Existing payloads are accepted
+only when unchanged receipts or a full byte comparison prove they match. Partial
+or different payloads are never resumed, overwritten, or removed. Explicit
+retries use fresh private attempts and retain older records and staged data.
 This is not a backup engine or a sandbox against concurrent hostile filesystem
 writers. Keep the source and private destination unchanged during the copy.
 """
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -19,6 +22,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 
 
 COPY_ROOT = Path("/copy-target")
@@ -114,6 +118,86 @@ def _ensure_directory(path: Path) -> os.stat_result:
     return info
 
 
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
+@contextmanager
+def _job_lock(state: Path):
+    """Never wait for, remove, or replace another invocation's lock."""
+    path = state / "copy.lock"
+    try:
+        info = checked_path(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"Copy lock must be a regular file: {path}")
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or _identity(info) != _identity(checked_path(path)):
+            raise RuntimeError("Copy lock changed during acquisition")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError(f"Copy job is already running or its filesystem lock is unavailable: {state}") from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _same_file_bytes(source: Path, target: Path, source_info: list, target_info: list) -> bool:
+    """Compare actual bytes, without following links or trusting size/mtime alone."""
+    def verified(info: os.stat_result, expected: list) -> bool:
+        return (stat.S_ISREG(info.st_mode) and
+                ["file", info.st_size, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns] == expected)
+
+    checked_path(source)
+    checked_path(target)
+    with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as left:
+        with os.fdopen(os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as right:
+            if not verified(os.fstat(left.fileno()), source_info) or not verified(os.fstat(right.fileno()), target_info):
+                raise RuntimeError("Source or destination changed during content comparison")
+            while True:
+                chunk = left.read(1024 * 1024)
+                other = right.read(1024 * 1024)
+                if chunk != other:
+                    return False
+                if not chunk:
+                    break
+            if not verified(os.fstat(left.fileno()), source_info) or not verified(os.fstat(right.fileno()), target_info):
+                raise RuntimeError("Source or destination changed during content comparison")
+    return True
+
+
+def _same_contents(source: Path, target: Path, before: dict, existing: dict) -> bool:
+    if layout(before) != layout(existing):
+        return False
+    return all(_same_file_bytes(source / name, target / name, info, existing[name])
+               for name, info in before.items() if info[0] == "file")
+
+
+def _publish_routed_record(state: Path, attempt: Path, record: dict) -> None:
+    """Publish only private metadata; retain both new and superseded receipts."""
+    complete = state / "complete.json"
+    receipt = attempt / "complete.json"
+    _write_record(receipt, record)
+    try:
+        previous = checked_path(complete)
+    except FileNotFoundError:
+        os.link(receipt, complete, follow_symlinks=False)
+        return
+    if not stat.S_ISREG(previous.st_mode):
+        raise RuntimeError(f"Completion marker is not a regular file: {complete}")
+    os.link(complete, attempt / "previous-complete.json", follow_symlinks=False)
+    pending = attempt / "complete.pending"
+    os.link(receipt, pending, follow_symlinks=False)
+    # Ordinary atomic rename is supported on NFS. This replaces metadata only,
+    # never a payload name, and the old receipt remains linked in this attempt.
+    os.replace(pending, complete)
+
+
 def _copy_routed(source: Path, torrent_hash: str, torrent_name: str, job_id: str, *,
                  destination: Path, source_root: Path, relative_path: Path) -> Path:
     """Copy one payload to its mapped relative path without merging or replacing."""
@@ -135,9 +219,28 @@ def _copy_routed(source: Path, torrent_hash: str, torrent_name: str, job_id: str
         if (info.st_dev, info.st_ino) in source_directories:
             raise RuntimeError("Copy destination aliases the source or a directory inside it; choose a separate target")
 
-    reject_alias(checked_path(destination))
+    destination_info = checked_path(destination)
+    reject_alias(destination_info)
     marker = destination / MOUNT_MARKER
     marker_before = checked_path(marker)
+    watched = {source_root: _identity(root_info), destination: _identity(destination_info)}
+
+    def watch_directory(path: Path) -> None:
+        info = _ensure_directory(path)
+        reject_alias(info)
+        watched[path] = _identity(info)
+
+    def unchanged_mounts() -> None:
+        for path, identity in watched.items():
+            info = checked_path(path)
+            if not stat.S_ISDIR(info.st_mode) or _identity(info) != identity:
+                raise RuntimeError(f"Source/destination directory or mount changed during copy: {path}")
+        marker_after = checked_path(marker)
+        if (not stat.S_ISREG(marker_after.st_mode)
+                or (_identity(marker_before), marker_before.st_ctime_ns)
+                != (_identity(marker_after), marker_after.st_ctime_ns)):
+            raise RuntimeError("Destination mount marker changed during copy")
+
     copied = destination / relative_path
     request = {
         "source": str(source), "source_root": str(source_root),
@@ -145,79 +248,98 @@ def _copy_routed(source: Path, torrent_hash: str, torrent_name: str, job_id: str
         "torrent_hash": torrent_hash, "torrent_name": torrent_name, "job_id": job_id,
     }
     state_root = destination / STATE_DIRECTORY
-    reject_alias(_ensure_directory(state_root))
+    watch_directory(state_root)
     state = state_root / job_id
+    watch_directory(state)
     complete = state / "complete.json"
-    try:
-        state.mkdir(mode=0o700)  # Exclusive per-job reservation, not exist_ok.
-    except FileExistsError:
+    with _job_lock(state):
+        unchanged_mounts()
+        # Parent directories may be shared, but never merge a torrent payload.
+        parent = destination
+        for part in relative_path.parts[:-1]:
+            parent /= part
+            watch_directory(parent)
+        unchanged_mounts()
         try:
-            record = read_completion(complete)
-            matches = (record.get("request") == request
-                       and record.get("source_snapshot") == before
-                       and record.get("destination_snapshot") == snapshot(copied))
-        except (OSError, ValueError, RuntimeError):
-            matches = False
-        if not matches:
-            raise RuntimeError(
-                f"Incomplete/colliding copy: inspect {copied} and {state}; move incomplete "
-                "data and its state aside before a manual retry. No files were changed."
-            ) from None
-        print(f"Already complete; no copy needed: {copied}", flush=True)
+            complete_info = checked_path(complete)
+        except FileNotFoundError:
+            previous = None
+        else:
+            if not stat.S_ISREG(complete_info.st_mode):
+                raise RuntimeError("Completion marker is not a regular file")
+            try:
+                previous = read_completion(complete)
+            except (ValueError, RuntimeError):
+                previous = None  # Keep malformed historical metadata, never trust it.
+        try:
+            checked_path(copied)
+        except FileNotFoundError:
+            target = None
+        else:
+            reject_alias(checked_path(copied))
+            target = snapshot(copied)
+            source_identities = {tuple(info[2:4]) for info in before.values()}
+            if any(tuple(info[2:4]) in source_identities for info in target.values()):
+                raise RuntimeError("Copy destination aliases the source payload; choose a separate target")
+            matches_receipt = (previous is not None and previous.get("request") == request
+                               and previous.get("source_snapshot") == before
+                               and previous.get("destination_snapshot") == target)
+            if not matches_receipt:
+                print(f"Verifying existing destination content: {copied}", flush=True)
+                if not _same_contents(source, copied, before, target):
+                    raise RuntimeError(
+                        f"Destination collision: partial or different content at {copied}; "
+                        "inspect and move it aside before a manual retry. No payload files were changed."
+                    )
+            if before != snapshot(source) or target != snapshot(copied):
+                raise RuntimeError("Source or destination changed during content comparison")
+            unchanged_mounts()
+            if matches_receipt:
+                print(f"Already complete; no copy needed: {copied}", flush=True)
+                return copied
+
+        # A journal is a receipt, not a permanent reservation of a payload name.
+        # Retain every old attempt; an absent target always gets new private work.
+        attempt = Path(tempfile.mkdtemp(prefix="attempt-", dir=state))
+        watched[attempt] = _identity(checked_path(attempt))
+        _write_record(attempt / "request.json", request)
+        if target is None:
+            unchanged_mounts()
+            if before != snapshot(source):
+                raise RuntimeError("Source changed before copy")
+            is_directory = before["."][0] == "directory"
+            if is_directory:
+                copied.mkdir(mode=0o700)  # Atomic no-replace; supported on NFS.
+                watched[copied] = _identity(checked_path(copied))
+                rsync_source, rsync_destination = str(source) + "/", str(copied) + "/"
+            else:
+                work = attempt / "payload"
+                watch_directory(work)
+                rsync_source, rsync_destination = str(source), str(work) + "/"
+            unchanged_mounts()
+            print(f"Copy reservation: {copied}; wait for successful copy status before use", flush=True)
+            subprocess.run([
+                RSYNC, "--recursive", "--times", "--fsync", "--ignore-existing", "--no-links",
+                "--no-devices", "--no-specials", "--", rsync_source, rsync_destination,
+            ], check=True)
+            staged = copied if is_directory else work / source.name
+            target = snapshot(staged)
+            if before != snapshot(source) or layout(before) != layout(target):
+                raise RuntimeError(f"Source changed or copy is incomplete; inspect {copied} and {attempt}")
+            unchanged_mounts()
+            if not is_directory:
+                os.link(staged, copied, follow_symlinks=False)  # No-replace payload publication.
+                staged.unlink()  # Only our own private staging link.
+                target = snapshot(copied)
+        else:
+            print(f"Existing destination is byte-for-byte identical; no copy needed: {copied}", flush=True)
+        if before != snapshot(source) or target != snapshot(copied):
+            raise RuntimeError("Source or destination changed before completion")
+        unchanged_mounts()
+        record = {"request": request, "source_snapshot": before, "destination_snapshot": target}
+        _publish_routed_record(state, attempt, record)
+        print(f"Copy complete: {copied}", flush=True)
         return copied
-
-    _write_record(state / "request.json", request)
-    # Existing category/subcategory parents are allowed, but the torrent itself
-    # is always an exclusive new name: never merge two torrents or clobber one.
-    parent = destination
-    for part in relative_path.parts[:-1]:
-        parent /= part
-        reject_alias(_ensure_directory(parent))
-    try:
-        checked_path(copied)
-    except FileNotFoundError:
-        pass
-    else:
-        raise RuntimeError(f"Destination collision; no files were changed: {copied}")
-
-    is_directory = before["."][0] == "directory"
-    if is_directory:
-        copied.mkdir(mode=0o700)  # Atomic no-replace reservation works on NFS too.
-        rsync_source, rsync_destination = str(source) + "/", str(copied) + "/"
-    else:
-        # Stage a single file privately, then hard-link it into the destination.
-        # A link is no-replace and stays on this filesystem; unlike renameat2 it
-        # works on NFS without requiring RENAME_NOREPLACE support.
-        work = state / "payload"
-        work.mkdir(mode=0o700)
-        rsync_source, rsync_destination = str(source), str(work) + "/"
-
-    print(f"Copy reservation: {copied}; wait for successful copy status before use", flush=True)
-    subprocess.run([
-        RSYNC, "--recursive", "--times", "--fsync", "--ignore-existing", "--no-links",
-        "--no-devices", "--no-specials", "--", rsync_source, rsync_destination,
-    ], check=True)
-    staged = copied if is_directory else work / source.name
-    after = snapshot(source)
-    target = snapshot(staged)
-    if before != after or layout(before) != layout(target):
-        raise RuntimeError(f"Source changed or copy is incomplete; inspect {copied} and {state}")
-    marker_after = checked_path(marker)
-    if (not stat.S_ISREG(marker_after.st_mode)
-            or (marker_before.st_dev, marker_before.st_ino, marker_before.st_ctime_ns)
-            != (marker_after.st_dev, marker_after.st_ino, marker_after.st_ctime_ns)):
-        raise RuntimeError("Destination mount marker changed during copy")
-    if not is_directory:
-        os.link(staged, copied, follow_symlinks=False)  # Raises if the name was taken.
-        staged.unlink()  # Only our private staging link; never the source payload.
-        target = snapshot(copied)
-    record = {"request": request, "source_snapshot": before, "destination_snapshot": target}
-    pending = state / "complete.pending"
-    _write_record(pending, record)
-    os.link(pending, complete, follow_symlinks=False)
-    pending.unlink()
-    print(f"Copy complete: {copied}", flush=True)
-    return copied
 
 
 def copy_promoted(source: Path, torrent_hash: str, torrent_name: str, job_id: str, *,
